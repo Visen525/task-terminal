@@ -1,0 +1,37 @@
+# 复制为 config.yaml 后按需修改。config.yaml 不入库（见 .gitignore）。
+# 密钥只走环境变量，不写在这里。
+
+server:
+  host: 127.0.0.1
+  port: 4317
+
+model:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  chat_model: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+  connect_timeout_ms: 10000
+  request_timeout_ms: 120000
+  first_token_timeout_ms: 30000
+
+# 每百万 token 单价（人民币），按官网价格表更新
+prices:
+  input_per_m: 2.0
+  cached_input_per_m: 0.5
+  output_per_m: 8.0
+
+workspace:
+  roots:
+    - ./workspace
+
+limits:
+  max_steps_per_task: 30
+  max_tokens_per_task: 120000
+  max_wall_ms_per_task: 1200000
+  max_concurrent_tasks: 1
+  daily_token_budget: 2000000
+  lease_seconds: 60
+  lease_renew_seconds: 15
+
+data:
+  dir: ./data

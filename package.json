@@ -1,0 +1,22 @@
+{
+  "name": "task-terminal",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "本地优先的个人 AI 任务台",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "verify": "pnpm run typecheck && node --test scripts/verify/m0.test.ts",
+    "verify:m0": "node --test scripts/verify/m0.test.ts",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "prettier": "^3.3.0",
+    "typescript": "^5.8.0"
+  }
+}

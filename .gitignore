@@ -1,0 +1,29 @@
+# ── 依赖与构建产物 ─────────────────────────
+node_modules/
+dist/
+
+# ── 运行时数据（个人数据，绝不入库）──────────
+data/
+workspace/
+/config.yaml
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# ── 密钥 ───────────────────────────────────
+.env
+.env.local
+
+# ── 系统与编辑器 ───────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ── 作者本地素材（不随仓库发布）─────────────
+/research/
+/tools/
+/assets/
+*.docx
+.dsh-office-*
