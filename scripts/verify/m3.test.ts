@@ -17,7 +17,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { ContractError, ERROR_CODES, type ErrorCode } from "../../src/core/errors.ts";
 import { foldEvents } from "../../src/core/fold.ts";
-import type { LlmToolCall, TaskEvent } from "../../src/core/types.ts";
+import type { LlmToolCall, TaskEvent, TokenUsage } from "../../src/core/types.ts";
 import {
   TOOL_SPECS,
   createToolContext,
@@ -41,7 +41,18 @@ import {
 } from "../../src/agent/result-validator.ts";
 import { FakeProvider, type FakeStep } from "../../src/providers/fake.ts";
 import { appendEvent, listEvents } from "../../src/store/events.ts";
+import { getDailyUsage, insertLlmCall } from "../../src/store/llm-calls.ts";
 import { openDatabase } from "../../src/store/migrate.ts";
+import type { LoopOutcome } from "../../src/agent/loop.ts";
+import {
+  DAILY_WARNING_RATIO,
+  DEFAULT_DAILY_BUDGET_TOKENS,
+  canStartTask,
+  getLocalDayRange,
+  runGuardedLoop,
+  type GuardedLoopTask,
+  type RunGuardedLoopOptions,
+} from "../../src/runtime/watchdog.ts";
 
 // ── 临时工作区夹具 ───────────────────────────────────────────────
 
@@ -1643,5 +1654,343 @@ test("M3-03 executeTool 抛 ContractError 时只作为失败工具结果回喂�
 
     assert.equal(countType(events, "task.failed"), 0);
     assert.equal(foldEvents(events).status, "completed");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════
+// M3-04 看门狗与预算：llm_calls 记账、任务预算、日预算
+// ════════════════════════════════════════════════════════════════
+
+interface LlmCallDbRow {
+  id: string;
+  task_id: string | null;
+  run_id: string | null;
+  purpose: string;
+  model: string;
+  input_tokens: number;
+  cached_tokens: number;
+  output_tokens: number;
+  latency_ms: number | null;
+  estimated: number;
+  ts: number;
+}
+
+function llmCallRows(db: DatabaseSync): LlmCallDbRow[] {
+  return db
+    .prepare("SELECT * FROM llm_calls ORDER BY ts ASC, id ASC")
+    .all() as unknown as LlmCallDbRow[];
+}
+
+function makeGuardedTask(
+  fixture: Fixture,
+  id: string,
+  budgetTokens: number = 120_000,
+): GuardedLoopTask {
+  return { ...makeLoopTask(fixture, id), budgetTokens };
+}
+
+/** 本地日历日的正午，避免测试在午夜/夏令时边界抖动。 */
+function fixedNoonMs(): number {
+  const range = getLocalDayRange(Date.UTC(2026, 0, 15, 12, 0, 0));
+  return range.startMs + 12 * 60 * 60 * 1000;
+}
+
+function testUsage(
+  inputTokens: number,
+  cachedTokens: number,
+  outputTokens: number,
+): TokenUsage {
+  return { inputTokens, cachedTokens, outputTokens, estimated: false };
+}
+
+function submitStep(usage: TokenUsage, callId: string, summary = "完成"): FakeStep {
+  return {
+    toolCalls: [
+      loopCall(callId, "submit_result", { summary, findings: [], artifacts: [] }),
+    ],
+    usage,
+  };
+}
+
+function budgetWarnings(fixture: Fixture): TaskEvent[] {
+  return listEvents(fixture.db, { limit: 1_000 }).filter(
+    (event) => event.type === "budget.warning",
+  );
+}
+
+test("M3-04 超步数：runGuardedLoop 注入 maxSteps=3 → 恰好一条 task.failed{max_steps}", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeGuardedTask(fixture, "t_guard_max_steps");
+    const provider = new FakeProvider(
+      Array.from(
+        { length: 6 },
+        (_, index): FakeStep => ({ content: `第 ${index + 1} 步闲聊` }),
+      ),
+    );
+
+    const outcome = await runGuardedLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_guard_steps",
+      limits: { maxSteps: 3 },
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "failed", `期望 failed，实际 ${outcome.status}`);
+    if (outcome.status !== "failed") return;
+    assert.equal(outcome.reason, "max_steps");
+    assert.equal(outcome.steps, 3);
+    assert.equal(provider.calls.length, 3, "步数上限后不得再调用 provider");
+
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "task.failed"), 1);
+    const failedEvent = events.find((event) => event.type === "task.failed");
+    assert.ok(failedEvent !== undefined);
+    assert.equal(payloadOf(failedEvent).reason, "max_steps");
+    assert.equal(foldEvents(events).status, "failed");
+  });
+});
+
+test("M3-04 超 token：budgetTokens=200 接线 maxTokens，终态与 llm_calls 汇总行一致", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeGuardedTask(fixture, "t_guard_max_tokens", 200);
+    const provider = new FakeProvider([
+      {
+        content: "一次很贵的调用",
+        usage: testUsage(150, 20, 100),
+      },
+    ]);
+
+    const outcome = await runGuardedLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_guard_tokens",
+      limits: { maxSteps: 10 },
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "failed", `期望 failed，实际 ${outcome.status}`);
+    if (outcome.status !== "failed") return;
+    assert.equal(outcome.reason, "max_tokens");
+    assert.equal(outcome.usage.totalTokens, 250);
+    assert.equal(provider.calls.length, 1);
+
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "task.failed"), 1);
+    assert.equal(payloadOf(events.find((event) => event.type === "task.failed")).reason, "max_tokens");
+    assert.equal(foldEvents(events).status, "failed");
+
+    const rows = llmCallRows(fixture.db);
+    assert.equal(rows.length, 1, "一次 runGuardedLoop 只写一条汇总行");
+    const row = rows[0];
+    assert.ok(row !== undefined);
+    assert.equal(row.task_id, task.id);
+    assert.equal(row.run_id, "r_guard_tokens");
+    assert.equal(row.purpose, "agent");
+    assert.equal(row.model, "deepseek-chat");
+    assert.equal(row.input_tokens, 150);
+    assert.equal(row.cached_tokens, 20);
+    assert.equal(row.output_tokens, 100);
+    assert.equal(row.latency_ms, outcome.elapsedMs);
+    assert.equal(row.estimated, 0);
+    assert.equal(typeof row.ts, "number");
+  });
+});
+
+test("M3-04 日预算 80% 告警恰好一次，第二个任务同一天不再告警", async () => {
+  await withSandbox(async (fixture) => {
+    const now = fixedNoonMs();
+    const day = getLocalDayRange(now);
+    insertLlmCall(fixture.db, {
+      purpose: "agent",
+      model: "deepseek-chat",
+      inputTokens: 1_600_000,
+      outputTokens: 0,
+      ts: day.startMs + 1,
+    });
+
+    const firstTask = makeGuardedTask(fixture, "t_guard_warn_1");
+    const first = await runGuardedLoop({
+      task: firstTask,
+      db: fixture.db,
+      provider: new FakeProvider([
+        submitStep(testUsage(700, 0, 300), "call_submit_warn_1"),
+      ]),
+      runId: "r_guard_warn_1",
+      now: () => now,
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+    assert.ok(first.status === "completed", `期望 completed，实际 ${first.status}`);
+    assert.equal(getDailyUsage(fixture.db, day.startMs, day.endMs), 1_601_000);
+
+    let warnings = budgetWarnings(fixture);
+    assert.equal(warnings.length, 1, "跨过 80% 应恰好发一条 budget.warning");
+    const warning = warnings[0];
+    assert.ok(warning !== undefined);
+    assert.equal(payloadOf(warning).spent, 1_601_000);
+    assert.equal(payloadOf(warning).budget, DEFAULT_DAILY_BUDGET_TOKENS);
+    assert.equal(warning.actor, "system");
+    assert.equal(warning.taskId, null, "budget.warning 是全局事件，不挂 task_id");
+    assert.equal(DAILY_WARNING_RATIO, 0.8);
+
+    const secondTask = makeGuardedTask(fixture, "t_guard_warn_2");
+    const second = await runGuardedLoop({
+      task: secondTask,
+      db: fixture.db,
+      provider: new FakeProvider([
+        submitStep(testUsage(700, 0, 300), "call_submit_warn_2"),
+      ]),
+      runId: "r_guard_warn_2",
+      now: () => now,
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+    assert.ok(second.status === "completed", `期望 completed，实际 ${second.status}`);
+    assert.equal(getDailyUsage(fixture.db, day.startMs, day.endMs), 1_602_000);
+
+    warnings = budgetWarnings(fixture);
+    assert.equal(warnings.length, 1, "当日已有 budget.warning 时不得重复发");
+  });
+});
+
+test("M3-04 日预算 100%：canStartTask 拒绝且含 spent/budget，已放行的任务正常收尾", async () => {
+  await withSandbox(async (fixture) => {
+    const now = fixedNoonMs();
+    insertLlmCall(fixture.db, {
+      purpose: "agent",
+      model: "deepseek-chat",
+      inputTokens: 2_000_000,
+      outputTokens: 0,
+      ts: now,
+    });
+
+    const gate = canStartTask(fixture.db, now, DEFAULT_DAILY_BUDGET_TOKENS);
+    assert.deepEqual(gate, {
+      allowed: false,
+      spent: 2_000_000,
+      budget: DEFAULT_DAILY_BUDGET_TOKENS,
+    });
+
+    // 模拟 gate 通过后才开始、现在正在跑的任务：预算用尽不能打断它。
+    const task = makeGuardedTask(fixture, "t_guard_gate_running");
+    const outcome = await runGuardedLoop({
+      task,
+      db: fixture.db,
+      provider: new FakeProvider([
+        submitStep(testUsage(500, 0, 100), "call_submit_gate"),
+      ]),
+      runId: "r_guard_gate",
+      now: () => now,
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "completed", `期望 completed，实际 ${outcome.status}`);
+    if (outcome.status !== "completed") return;
+    assert.equal(outcome.result.summary, "完成");
+    assert.equal(foldEvents(taskEvents(fixture, task)).status, "completed");
+
+    // 在用尽之后仍不改变 gate 的只读判断。
+    assert.equal(canStartTask(fixture.db, now, DEFAULT_DAILY_BUDGET_TOKENS).allowed, false);
+  });
+});
+
+test("M3-04 正常完成：写汇总行、无告警、事件可折出 completed", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeGuardedTask(fixture, "t_guard_completed");
+    const outcome = await runGuardedLoop({
+      task,
+      db: fixture.db,
+      provider: new FakeProvider([
+        submitStep(testUsage(500, 10, 100), "call_submit_ok"),
+      ]),
+      runId: "r_guard_ok",
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "completed", `期望 completed，实际 ${outcome.status}`);
+    if (outcome.status !== "completed") return;
+    assert.equal(outcome.usage.totalTokens, 600);
+
+    const rows = llmCallRows(fixture.db);
+    assert.equal(rows.length, 1);
+    const row = rows[0];
+    assert.ok(row !== undefined);
+    assert.equal(row.task_id, task.id);
+    assert.equal(row.run_id, "r_guard_ok");
+    assert.equal(row.purpose, "agent");
+    assert.equal(row.input_tokens, 500);
+    assert.equal(row.cached_tokens, 10);
+    assert.equal(row.output_tokens, 100);
+    assert.equal(row.estimated, 0);
+    assert.ok(row.id.startsWith("l_"), `LLM 调用 ID 应带 l_ 前缀，实际 ${row.id}`);
+
+    assert.equal(budgetWarnings(fixture).length, 0, "用量远低于 80% 不应告警");
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "task.completed"), 1);
+    assert.equal(countType(events, "task.failed"), 0);
+    const folded = foldEvents(events);
+    assert.equal(folded.status, "completed");
+    assert.deepEqual(JSON.parse(folded.resultJson ?? "null"), JSON.parse(outcome.resultJson));
+  });
+});
+
+test("M3-04 llm_calls 字段映射与按日 SUM（半开区间，cached 不重复计入）", async () => {
+  await withSandbox(async (fixture) => {
+    const now = fixedNoonMs();
+    const day = getLocalDayRange(now);
+    const records = [
+      insertLlmCall(fixture.db, {
+        purpose: "main",
+        model: "deepseek-chat",
+        inputTokens: 999,
+        outputTokens: 1,
+        ts: day.startMs - 1,
+      }),
+      insertLlmCall(fixture.db, {
+        taskId: "t_store",
+        runId: "r_store",
+        purpose: "agent",
+        model: "deepseek-chat",
+        inputTokens: 10,
+        cachedTokens: 3,
+        outputTokens: 5,
+        latencyMs: 12,
+        estimated: true,
+        ts: day.startMs,
+      }),
+      insertLlmCall(fixture.db, {
+        purpose: "title",
+        model: "deepseek-chat",
+        inputTokens: 20,
+        outputTokens: 7,
+        ts: day.endMs - 1,
+      }),
+      insertLlmCall(fixture.db, {
+        purpose: "agent",
+        model: "deepseek-chat",
+        inputTokens: 100,
+        outputTokens: 100,
+        ts: day.endMs,
+      }),
+    ];
+
+    for (const record of records) {
+      assert.ok(record.id.startsWith("l_"), `LLM 调用 ID 应带 l_ 前缀，实际 ${record.id}`);
+    }
+
+    // 只有 [startMs, endMs) 内的两条计入：15 + 27 = 42。
+    assert.equal(getDailyUsage(fixture.db, day.startMs, day.endMs), 42);
+
+    const rows = llmCallRows(fixture.db);
+    assert.equal(rows.length, 4);
+    const estimatedRow = rows.find((row) => row.id === records[1]?.id);
+    assert.ok(estimatedRow !== undefined);
+    assert.equal(estimatedRow.task_id, "t_store");
+    assert.equal(estimatedRow.run_id, "r_store");
+    assert.equal(estimatedRow.purpose, "agent");
+    assert.equal(estimatedRow.cached_tokens, 3);
+    assert.equal(estimatedRow.latency_ms, 12);
+    assert.equal(estimatedRow.estimated, 1);
   });
 });

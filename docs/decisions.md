@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M3-04 看门狗与预算（2026-10-24）
+
+- **`llm_calls` 按“一次 run 一条汇总行”记账，而不是逐次 LLM 调用**：M3-03 的 loop 已经在事件流里逐步写了 `llm.call`（含每次调用的 in/cached/out/ms），表里再逐调用写一份会形成两份容易漂移的账；而 `LoopOutcome` 只返回本次运行的累计 usage，逐调用记账必须改 `loop.ts`（本卡禁止）。汇总行以 `purpose='agent'`、`latency_ms=elapsedMs` 落库，日预算按 `input+output` 聚合；`insertLlmCall` 仍保留 `estimated` 入参并原样落 0/1，供后续主线（M5-01）逐调用记账使用。局限：loop 的聚合 usage 不暴露 `estimated`，所以汇总行固定记 0。
+- **`budget.warning` 写成不挂 `task_id` 的全局事件**：告警发生在 loop 返回之后，此时该任务已写入 `task.completed` / `task.failed`；若把告警挂到该任务，`foldEvents` 会因“终态后出现活动事件”抛 `E_INVALID_TRANSITION`。全局事件既保留在总事件流中供 UI 展示，也不污染单任务折叠。
+- **80% 告警的“恰好一次”靠“当日同类型事件存在性查询 + 同步追加”**：写完 `llm_calls` 后按本地日历日查 `events` 中是否已有 `budget.warning`，没有才追加；查询、判断、插入都在同一个同步块内完成（中间无 `await`），单进程单写者下并发 run 也不会重复发。告警阈值判断包含 100% 以上（跨过 80% 就发），100% 本身只由 gate 拦截新任务。
+- **日边界用本地日历日 `[00:00, 次日 00:00)`，而不是固定 24 小时**：`getLocalDayRange` 用 `Date` 构造器计算，兼容夏令时；`getDailyUsage` 的 SQL 用 `ts >= start AND ts < end` 半开区间，避免边界记录被相邻两天重复统计。
+- **gate 与执行解耦**：`canStartTask(db, now, budget)` 只读地返回 `{allowed, spent, budget}`，供 M4 调度器派新任务前调用；`runGuardedLoop` 自己不调用 gate，因此已通过 gate 的在跑任务不会因日预算中途到 100% 被打断。任务级预算则通过 `limits.maxTokens = task.budgetTokens` 接线，仍复用 loop 既有的 `failed{max_tokens}` 终态。LLM 调用 ID 用 `l_<ulid>`，与 `t_` / `r_` 同族。
+
 ## M3-03 agent loop + 假 provider（2026-10-24）
 
 - **`submit_result` 与 `ask_user` 都作为控制流工具处理，不经 `executeTool`**：前者无任何副作用，只是一次结构校验与循环出口；后者在 `foldEvents` 里靠 `agent.tool_call{tool:'ask_user'}` 进入 `waiting_input`，而 `executeTool` 会强制紧跟一条 `agent.tool_result`，折到 `waiting_input` 后会被状态机拒绝（活动事件只允许 running）。因此 loop 只给 `ask_user` 写 `tool_call`、不写 `tool_result`，给 `submit_result` 手写成对的事件；真正的文件/命令副作用仍只走 `executeTool`。
