@@ -19,6 +19,8 @@ export interface RoleModelSettings {
 
 export interface AppSettings {
   workspaceDir: string | null;
+  /** null = 使用后端内置主线提示词；非 null 为用户自定义全文。 */
+  mainSystemPrompt: string | null;
   main: RoleModelSettings;
   subagent: RoleModelSettings;
   mainTaskDefaultPermission: PermissionMode;
@@ -28,6 +30,7 @@ export interface AppSettings {
 
 export interface SettingsPatch {
   workspaceDir?: string | null;
+  mainSystemPrompt?: string | null;
   main?: Partial<RoleModelSettings>;
   subagent?: Partial<RoleModelSettings>;
   mainTaskDefaultPermission?: PermissionMode;
@@ -93,6 +96,7 @@ function isAppSettings(value: unknown): value is AppSettings {
   return (
     isRecord(value) &&
     (value.workspaceDir === null || typeof value.workspaceDir === "string") &&
+    (value.mainSystemPrompt === null || typeof value.mainSystemPrompt === "string") &&
     isRoleModelSettings(value.main) &&
     isRoleModelSettings(value.subagent) &&
     isPermissionMode(value.mainTaskDefaultPermission) &&
@@ -187,7 +191,7 @@ export async function browseDirectory(path?: string): Promise<BrowseResult> {
  * 只识别设置页真实存在的字段，避免把任意路径/文本误当字段。
  */
 const SETTINGS_FIELD_PATTERN =
-  /^(main\.(?:model|thinkingLevel|temperature|topP|maxTokens)|subagent\.(?:model|thinkingLevel|temperature|topP|maxTokens)|workspaceDir|mainTaskDefaultPermission|subagentPermissionCap|dailyBudgetTokens)\b/u;
+  /^(main\.(?:model|thinkingLevel|temperature|topP|maxTokens)|subagent\.(?:model|thinkingLevel|temperature|topP|maxTokens)|workspaceDir|mainSystemPrompt|mainTaskDefaultPermission|subagentPermissionCap|dailyBudgetTokens)\b/u;
 
 export interface ParsedSettingsError {
   fieldErrors: Record<string, string>;

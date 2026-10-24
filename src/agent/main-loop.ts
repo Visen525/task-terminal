@@ -117,6 +117,11 @@ export interface RunMainTurnOptions {
   userText?: string;
   /** 当前轮附件元数据；只落库，不进入 provider 上下文。 */
   userAttachments?: readonly MessageAttachment[];
+  /**
+   * 本轮系统提示词；缺省取设置 mainSystemPrompt，再缺省用内置 MAIN_SYSTEM_PROMPT。
+   * 调用方显式传入时优先，便于特殊轮次覆盖（M10-05）。
+   */
+  systemPrompt?: string;
   /** 最近历史轮数（user+assistant 为一轮）；默认 12。 */
   historyLimit?: number;
   /** 工具调用轮上限；默认 10，防止失控。 */
@@ -256,7 +261,8 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
   const { db, provider } = options;
   const clock = options.now ?? Date.now;
   // 每轮对话读一次设置：运行中修改设置后，下一轮立即生效（无需重启）。
-  const roleSettings = getSettings(db).main;
+  const settings = getSettings(db);
+  const roleSettings = settings.main;
   const model = options.model ?? roleSettings.model;
   const reasoningEffort =
     options.reasoningEffort ??
@@ -266,6 +272,8 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
   const maxTokens = options.maxTokens ?? roleSettings.maxTokens;
   const maxToolRounds = normalizeMaxToolRounds(options.maxToolRounds);
   const historyTurns = normalizeHistoryTurns(options.historyLimit);
+  // 提示词同样每轮读取：设置里自定义后下一轮立即生效；显式入参仍优先。
+  const systemPrompt = options.systemPrompt ?? settings.mainSystemPrompt ?? MAIN_SYSTEM_PROMPT;
 
   // userMessage / userContent 严格二选一：调用方拼错参数时不能静默选一个。
   const hasUserMessage = options.userMessage !== undefined;
@@ -309,7 +317,7 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
   });
   const messages: LlmMessage[] = buildMainContext(db, {
     ...gathered,
-    systemPrompt: MAIN_SYSTEM_PROMPT,
+    systemPrompt,
   });
 
   // 历史只保留纯文本：非当前轮即使存了图片分片也不再重发（控 token）。

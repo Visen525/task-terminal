@@ -97,11 +97,37 @@ interface SettingsProps {
 
 const CUSTOM_MODEL = "__custom__";
 const MODEL_OPTIONS = [
-  { value: "deepseek-chat", label: "deepseek-chat" },
-  { value: "deepseek-reasoner", label: "deepseek-reasoner" },
-  { value: CUSTOM_MODEL, label: "自定义…" },
+  { value: "deepseek-chat", label: "deepseek-chat", title: "均衡默认" },
+  { value: "deepseek-flash", label: "deepseek-flash", title: "快速经济" },
+  {
+    value: "deepseek-reasoner",
+    label: "deepseek-reasoner",
+    title: "深度思考更耗 token",
+  },
+  { value: CUSTOM_MODEL, label: "自定义…", title: "手动输入模型名" },
 ];
-const KNOWN_MODELS = new Set(["deepseek-chat", "deepseek-reasoner"]);
+const KNOWN_MODELS = new Set(["deepseek-chat", "deepseek-flash", "deepseek-reasoner"]);
+
+/**
+ * 与后端 src/agent/main-loop.ts 的 MAIN_SYSTEM_PROMPT 保持逐字一致（M10-05）。
+ * 未自定义时用它预填，让用户能直接看到内置规则；保存仍提交 null。
+ */
+const BUILTIN_MAIN_SYSTEM_PROMPT = [
+  "你是用户的任务台主控。你的职责是理解需求、决定是否建任务、汇报结果。",
+  "规则：",
+  "1. 需要实际动手（读写文件、运行命令、分析数据）时，必须调用 create_task，不要自己执行。",
+  "2. 汇报任务结果时只引用【产物摘要】；需要细节时先 search_artifacts 再 read_artifact。",
+  "3. 摘要不等于事实。未经 read_artifact 确认的结论，要说明是\"根据摘要\"。",
+  "4. 不确定用户的意图时，先 ask_user，不要猜。",
+  "5. 回答用中文，简洁。",
+  "6. 引用任何产物结论时，必须同时给出它的来源任务 ID（source_task_id）；未经 read_artifact 核对的，注明\"根据摘要\"。",
+  "7. 对话历史里的 [图片 …] / [附件 …] 标记表示该内容在当轮已真实送达并被你查看过（历史回放不重发本体）；基于它的当时回答是有效的，不要因为现在看不到原图就否认或撤回当时的结论。",
+  "8. 用户询问任务进展/进度/执行到哪了时，调用 get_task 并向用户转述 progress（第几步/共几步、正在执行的工具、已耗时、token 消耗占预算），不要编造未在 progress 里的细节。",
+].join("\n");
+
+const MAIN_SYSTEM_PROMPT_HELP =
+  "提示词决定主 AI 的行为规则；清空并保存即恢复内置默认。删掉关键规则（如必须 create_task、引用来源）可能让它越权或失忆，改动请谨慎。";
+
 const THINKING_OPTIONS: Array<{ label: string; value: ThinkingLevel }> = [
   { label: "关闭", value: "off" },
   { label: "低", value: "low" },
@@ -624,6 +650,11 @@ export default function Settings({ onOpenTask }: SettingsProps) {
     mutationFn: (settings: AppSettings) =>
       putSettings({
         workspaceDir: settings.workspaceDir,
+        // 清空 textarea 也等于恢复内置默认：后端只接受 null 或非空字符串。
+        mainSystemPrompt:
+          settings.mainSystemPrompt === null || settings.mainSystemPrompt.trim().length === 0
+            ? null
+            : settings.mainSystemPrompt,
         main: settings.main,
         subagent: settings.subagent,
         mainTaskDefaultPermission: settings.mainTaskDefaultPermission,
@@ -686,6 +717,7 @@ export default function Settings({ onOpenTask }: SettingsProps) {
       ? 0
       : Math.min(100, Math.round((usage.total / overview.dailyBudgetTokens) * 1000) / 10);
   const budgetColor = dailyPercent >= 90 ? "#DC2626" : dailyPercent >= 80 ? "#D97706" : "#4F46E5";
+  const customPrompt = draft !== null && draft.mainSystemPrompt !== null;
 
   return (
     <>
@@ -808,6 +840,52 @@ export default function Settings({ onOpenTask }: SettingsProps) {
                   updateRole("subagent", patch);
                 }}
               />
+            </div>
+          </section>
+
+          <section style={{ marginBottom: 28 }}>
+            <div className="section-heading">
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                <h2 className="section-title">系统提示词</h2>
+                <Tag className="soft-tag">{customPrompt ? "已自定义" : "内置默认 · 未修改"}</Tag>
+              </span>
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                disabled={!customPrompt}
+                onClick={() => {
+                  updateDraft({ mainSystemPrompt: null });
+                  message.success("已恢复内置默认，点击「保存设置」生效");
+                }}
+              >
+                恢复默认
+              </Button>
+            </div>
+            <div className="info-panel">
+              <div className="settings-field" style={{ marginBottom: 0 }}>
+                <div className="settings-field-head">
+                  <span className="settings-field-label">主线提示词</span>
+                  <span className="settings-field-value">
+                    {draft.mainSystemPrompt === null
+                      ? "内置默认"
+                      : `${draft.mainSystemPrompt.length} / 8000`}
+                  </span>
+                </div>
+                <Input.TextArea
+                  rows={8}
+                  maxLength={8000}
+                  value={draft.mainSystemPrompt ?? BUILTIN_MAIN_SYSTEM_PROMPT}
+                  aria-label="主线系统提示词"
+                  onChange={(event) => {
+                    updateDraft({ mainSystemPrompt: event.target.value });
+                  }}
+                  style={{ fontFamily: "var(--tt-mono)", fontSize: 12.5, lineHeight: 1.7 }}
+                />
+                <span className="settings-field-help">{MAIN_SYSTEM_PROMPT_HELP}</span>
+                {fieldErrors.mainSystemPrompt === undefined ? null : (
+                  <span className="settings-field-error">{fieldErrors.mainSystemPrompt}</span>
+                )}
+              </div>
             </div>
           </section>
 

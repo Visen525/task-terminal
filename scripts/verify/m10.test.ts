@@ -1394,3 +1394,207 @@ test("M10-04 主线提示：规则 8 要求询问进度时调用 get_task 并转
     assert.ok(MAIN_SYSTEM_PROMPT.includes(marker), `预期规则 8 包含 ${marker}`);
   }
 });
+
+// ════════════════════════════════════════════════════════════════
+// 验收 14：M10-05 主线提示词设置（存取/深合并/默认/400）
+// ════════════════════════════════════════════════════════════════
+
+test("M10-05 settings：mainSystemPrompt 默认 null、存取/深合并、空串与超 8000 → 400", async () => {
+  await withDb(async (db) => {
+    assert.equal(DEFAULT_SETTINGS.mainSystemPrompt, null, "预期默认值为 null");
+    assert.equal(getSettings(db).mainSystemPrompt, null, "预期无记录时用内置默认");
+
+    const custom = "你是任务台主控。\n必须调用 create_task。\n每句末尾加[喵]。";
+    const saved = saveSettings(db, { mainSystemPrompt: custom }, 40_000);
+    assert.equal(saved.mainSystemPrompt, custom, "预期自定义提示写入并返回");
+    assert.equal(getSettings(db).mainSystemPrompt, custom, "预期自定义提示可读回");
+
+    const merged = saveSettings(db, { dailyBudgetTokens: 60_000 }, 40_001);
+    assert.equal(merged.mainSystemPrompt, custom, "预期深合并保留自定义提示");
+    assert.equal(getSettings(db).dailyBudgetTokens, 60_000, "预期其他字段照常更新");
+
+    const reset = saveSettings(db, { mainSystemPrompt: null }, 40_002);
+    assert.equal(reset.mainSystemPrompt, null, "预期 null 清回内置默认");
+    assert.equal(getSettings(db).mainSystemPrompt, null);
+
+    assertInvalidSettings({ mainSystemPrompt: "" }, "mainSystemPrompt");
+    assertInvalidSettings({ mainSystemPrompt: "   " }, "mainSystemPrompt");
+    assertInvalidSettings({ mainSystemPrompt: "x".repeat(8001) }, "mainSystemPrompt");
+    assert.equal(
+      validateSettingsInput({ mainSystemPrompt: "x".repeat(8000) }).mainSystemPrompt?.length,
+      8000,
+      "预期 8000 字符是允许的上界",
+    );
+
+    // HTTP 层：超 8000 必须映射为 400，且错误指名 mainSystemPrompt。
+    const app = createApp({ db, scheduler: stubScheduler(), now: () => 41_000 });
+    try {
+      const rejected = await app.inject({
+        method: "PUT",
+        url: "/settings",
+        payload: { mainSystemPrompt: "x".repeat(8001) },
+      });
+      assert.equal(rejected.statusCode, 400, "预期超 8000 返回 400");
+      const rejectedBody = asRecord(rejected.json(), "rejected settings body");
+      const rejectedError = asRecord(rejectedBody.error, "rejected settings error");
+      assert.equal(rejectedError.code, ERROR_CODES.E_INVALID_ARGUMENT);
+      assert.match(String(rejectedError.message), /mainSystemPrompt/u);
+
+      const accepted = await app.inject({
+        method: "PUT",
+        url: "/settings",
+        payload: { mainSystemPrompt: "自定义提示：每句末尾加[喵]。" },
+      });
+      assert.equal(accepted.statusCode, 200, "预期合法提示保存成功");
+      assert.equal(
+        asRecord(accepted.json(), "accepted settings").mainSystemPrompt,
+        "自定义提示：每句末尾加[喵]。",
+      );
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════
+// 验收 15：M10-05 主线每轮读取自定义提示词，清空回内置默认
+// ════════════════════════════════════════════════════════════════
+
+test("M10-05 main-loop：saveSettings 自定义提示 → provider system=自定义；清回 null 恢复内置规则", async () => {
+  await withDb(async (db) => {
+    const workspace = tempDir("task-terminal-m10-prompt-ws-");
+    try {
+      const provider = new FakeProvider([
+        { content: "喵" },
+        { content: "收到" },
+        { content: "显式" },
+      ]);
+      const custom = "你是一只猫。每句末尾加[喵]。\n必须调用 create_task。";
+
+      saveSettings(db, { mainSystemPrompt: custom }, 50_000);
+      await runMainTurn({
+        db,
+        provider,
+        userMessage: "自定义提示",
+        workspace,
+        now: () => 50_001,
+      });
+      const firstSystem = provider.calls[0]?.messages[0];
+      assert.equal(firstSystem?.role, "system");
+      assert.equal(firstSystem?.content, custom, "预期 provider 捕获的自定义系统提示逐字一致");
+
+      saveSettings(db, { mainSystemPrompt: null }, 50_002);
+      await runMainTurn({
+        db,
+        provider,
+        userMessage: "恢复默认",
+        workspace,
+        now: () => 50_003,
+      });
+      const secondSystem = provider.calls[1]?.messages[0];
+      assert.equal(secondSystem?.content, MAIN_SYSTEM_PROMPT, "预期清回 null 后恢复内置全文");
+      assert.ok(
+        String(secondSystem?.content).includes("必须调用 create_task"),
+        "预期内置提示含规则 1 关键字",
+      );
+      assert.ok(
+        String(secondSystem?.content).includes(
+          "8. 用户询问任务进展/进度/执行到哪了时，调用 get_task",
+        ),
+        "预期内置提示规则 8 仍在",
+      );
+
+      // 调用方显式传入 systemPrompt 时仍优先于设置。
+      saveSettings(db, { mainSystemPrompt: "设置里的提示" }, 50_004);
+      await runMainTurn({
+        db,
+        provider,
+        userMessage: "显式覆盖",
+        workspace,
+        systemPrompt: "调用方显式提示",
+        now: () => 50_005,
+      });
+      assert.equal(
+        provider.calls[2]?.messages[0]?.content,
+        "调用方显式提示",
+        "预期显式 systemPrompt 优先于设置",
+      );
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════
+// 验收 16：M10-05 设置页源码（flash 预设、提示词区块、恢复默认）
+// ════════════════════════════════════════════════════════════════
+
+test("M10-05 设置页源码：flash 预设顺序与 title、系统提示词区块、恢复默认与内置全文", () => {
+  const settings = read("src/web/src/pages/Settings.tsx");
+  const chatIndex = settings.indexOf('value: "deepseek-chat"');
+  const flashIndex = settings.indexOf('value: "deepseek-flash"');
+  const reasonerIndex = settings.indexOf('value: "deepseek-reasoner"');
+  assert.ok(chatIndex >= 0, "预期保留 deepseek-chat 预设");
+  assert.ok(
+    chatIndex < flashIndex && flashIndex < reasonerIndex,
+    "预期预设顺序为 deepseek-chat → deepseek-flash → deepseek-reasoner",
+  );
+  for (const marker of [
+    "均衡默认",
+    "快速经济",
+    "深度思考更耗 token",
+    "系统提示词",
+    "恢复默认",
+    "已自定义",
+    "内置默认 · 未修改",
+    "Input.TextArea",
+    "rows={8}",
+    "maxLength={8000}",
+    "mainSystemPrompt",
+    "提示词决定主 AI 的行为规则；清空并保存即恢复内置默认",
+    "改动请谨慎",
+  ]) {
+    assert.ok(settings.includes(marker), `预期 Settings.tsx 包含 ${marker}`);
+  }
+  assert.ok(
+    settings.includes("KNOWN_MODELS = new Set([\"deepseek-chat\", \"deepseek-flash\""),
+    "预期 flash 不再被当成自定义模型",
+  );
+
+  // 前端预填的内置提示词必须与后端 MAIN_SYSTEM_PROMPT 逐字一致，防止两份文案漂移。
+  for (const line of MAIN_SYSTEM_PROMPT.split("\n")) {
+    const escaped = line.replace(/\\/gu, "\\\\").replace(/"/gu, '\\"');
+    assert.ok(settings.includes(`"${escaped}"`), `预期前端内置提示同步：${line.slice(0, 24)}…`);
+  }
+
+  const settingsApi = read("src/web/src/settingsApi.ts");
+  for (const marker of ["mainSystemPrompt", "workspaceDir", "mainTaskDefaultPermission"]) {
+    assert.ok(settingsApi.includes(marker), `预期 settingsApi.ts 包含 ${marker}`);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// 验收 17：M10-05 构建
+// ════════════════════════════════════════════════════════════════
+
+test("M10-05 构建：pnpm build 退出码 0 且 dist/index.html 存在", { timeout: 240_000 }, () => {
+  const buildResult =
+    process.platform === "win32"
+      ? spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "pnpm build"], {
+          cwd: root,
+          stdio: "inherit",
+          env: process.env,
+        })
+      : spawnSync("pnpm", ["build"], {
+          cwd: root,
+          stdio: "inherit",
+          env: process.env,
+        });
+
+  assert.equal(
+    buildResult.status,
+    0,
+    `预期 pnpm build 退出码 0，实际 ${String(buildResult.status)}（error=${buildResult.error?.message ?? "none"}）`,
+  );
+  assert.ok(existsSync(join(root, "dist", "index.html")), "预期 dist/index.html 存在");
+});

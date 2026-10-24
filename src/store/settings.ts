@@ -29,6 +29,11 @@ export interface RoleModelSettings {
 
 export interface AppSettings {
   workspaceDir: string | null;
+  /**
+   * 主线系统提示词（M10-05）。null = 使用 main-loop 的内置 MAIN_SYSTEM_PROMPT；
+   * 非 null 时必须是校验通过的 1–8000 字符文本。
+   */
+  mainSystemPrompt: string | null;
   main: RoleModelSettings;
   subagent: RoleModelSettings;
   mainTaskDefaultPermission: PermissionMode;
@@ -39,6 +44,7 @@ export interface AppSettings {
 /** 设置写入的局部补丁；未出现的字段保持当前值。 */
 export interface SettingsPatch {
   workspaceDir?: string | null;
+  mainSystemPrompt?: string | null;
   main?: Partial<RoleModelSettings>;
   subagent?: Partial<RoleModelSettings>;
   mainTaskDefaultPermission?: PermissionMode;
@@ -51,6 +57,7 @@ export const SETTINGS_ROW_KEY = 'app';
 /** SPEC §10 M10-01：主/子代理默认都 deepseek-chat、思考关闭、温度/topP 1.0。 */
 export const DEFAULT_SETTINGS: AppSettings = {
   workspaceDir: null,
+  mainSystemPrompt: null,
   main: {
     model: 'deepseek-chat',
     thinkingLevel: 'off',
@@ -74,6 +81,7 @@ const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const ROLE_KEYS = ['main', 'subagent'] as const;
 const TOP_LEVEL_KEYS = new Set([
   'workspaceDir',
+  'mainSystemPrompt',
   'main',
   'subagent',
   'mainTaskDefaultPermission',
@@ -89,6 +97,7 @@ const ROLE_FIELDS = new Set([
 ]);
 
 const MODEL_MAX_CHARS = 60;
+const MAIN_SYSTEM_PROMPT_MAX_CHARS = 8000;
 const MAX_TOKENS_MIN = 256;
 const MAX_TOKENS_MAX = 8192;
 const DAILY_BUDGET_MIN = 50_000;
@@ -110,6 +119,7 @@ function isPermissionMode(value: unknown): value is PermissionMode {
 function cloneSettings(settings: AppSettings): AppSettings {
   return {
     workspaceDir: settings.workspaceDir,
+    mainSystemPrompt: settings.mainSystemPrompt,
     main: { ...settings.main },
     subagent: { ...settings.subagent },
     mainTaskDefaultPermission: settings.mainTaskDefaultPermission,
@@ -146,6 +156,24 @@ function parseSettingsPatch(raw: unknown, errors: string[]): SettingsPatch {
       errors.push('workspaceDir 必须是非空路径或 null');
     } else {
       patch.workspaceDir = value.trim();
+    }
+  }
+
+  if ('mainSystemPrompt' in raw) {
+    const value = raw.mainSystemPrompt;
+    if (value === null) {
+      patch.mainSystemPrompt = null;
+    } else if (typeof value !== 'string') {
+      errors.push('mainSystemPrompt 必须是字符串或 null');
+    } else if (value.trim().length === 0) {
+      // 清空后恢复内置默认由前端提交 null 表达；空串本身不是合法提示词。
+      errors.push('mainSystemPrompt 给值时不能为空');
+    } else if (value.length > MAIN_SYSTEM_PROMPT_MAX_CHARS) {
+      errors.push(
+        `mainSystemPrompt 长度不能超过 ${MAIN_SYSTEM_PROMPT_MAX_CHARS} 个字符`,
+      );
+    } else {
+      patch.mainSystemPrompt = value;
     }
   }
 
@@ -278,6 +306,9 @@ function mergeSettings(base: AppSettings, patch: SettingsPatch): AppSettings {
   const merged = cloneSettings(base);
   if ('workspaceDir' in patch) {
     merged.workspaceDir = patch.workspaceDir ?? null;
+  }
+  if ('mainSystemPrompt' in patch) {
+    merged.mainSystemPrompt = patch.mainSystemPrompt ?? null;
   }
   if (patch.main !== undefined) {
     merged.main = { ...merged.main, ...patch.main };

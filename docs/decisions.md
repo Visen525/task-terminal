@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M10-05 系统提示词编辑与 deepseek-flash 预设（2026-10-24）
+
+- **`mainSystemPrompt` 用 `null` 表达「内置默认」，空串仍是非法值**：读取/保存与既有设置共用一个 `app_settings` 单行 JSON，深合并保证改其他字段不会丢提示词；后端校验非空且 ≤8000 字符，前端在保存时把用户清空的 textarea 归一成 `null`，因此「清空并保存即恢复默认」由 UI 完成，API 契约保持「给值必须非空」。
+- **未自定义态选择「预填内置全文 + 未修改标记」**：设置页直接展示 8 条规则的完整文案（只读语义，但允许原地编辑），标题旁显示「内置默认 · 未修改」，改过后换「已自定义」；「恢复默认」把 draft 清回 `null`，仍需点「保存设置」才 PUT，避免一个按钮绕过统一的保存/错误回填流程。前端复制了一份提示词常量，验收测试逐行比对后端 `MAIN_SYSTEM_PROMPT`，两份文案漂移会直接红。
+- **提示词与模型参数同处、每轮读取**：`runMainTurn` 在读取 `main` 设置的同一次 `getSettings` 中取 `mainSystemPrompt`，组装时按「调用方显式 `systemPrompt` → 设置 → 内置」优先，保证运行中修改下一轮生效，也保留测试/特殊轮次覆盖入口。
+- **模型预设只加一项并保持手工输入能力**：顺序固定 chat → flash → reasoner → 自定义，三项预置都进 `KNOWN_MODELS`，各自用 `title` 给一句定位（均衡默认 / 快速经济 / 深度思考更耗 token）；不新增依赖，也不改 provider 映射——flash 只是模型 ID 字符串。
+- **测试沿用临时库 + FakeProvider**：settings 覆盖默认/存取/深合并/空串/8000 边界与 HTTP 400，main-loop 断言 provider 捕获的 system 消息逐字等于自定义文本、清回 null 后恢复含规则 1 的内置全文，另加前端源码与 build 用例；不读 `.env`，提示词只进本地临时 DB。
+
 ## M10-04 任务进度查看（2026-10-24）
 
 - **进度全部由 `buildTaskProgress` 从 tasks/runs/events 只读推导，不新增表或事件**：状态与预算取任务行，attempt 取最新 run，step/spentTokens 对全量任务事件扫一遍；分页沿用 listEvents 的 500 条一页，避免只看到最近一页而低估步数或 token。
