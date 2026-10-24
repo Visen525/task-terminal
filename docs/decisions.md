@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M2-01 DeepSeek 适配（2026-10-24）
+
+- **不引 SDK，直接用 Node 24 内置 fetch**：只有 chat / stream / balance 三个端点，适配层自己控制超时、重试和脱敏；少一个依赖面，也不会把 SDK 的默认重试行为混进我们的策略。
+- **流式事件设计为 `text_delta` / `tool_call_delta` / `done` 三态**：文本增量立即给 UI；tool_call 只给分片，`done.response` 才是唯一完整结果，`LlmToolCall.function.arguments` 在 `done` 之前绝不交付，M3 loop 只需在 `done` 上做 JSON.parse 和工具执行。
+- **重试与超时分离**：429/500/503 指数退避（默认 3 次，基数可注入，尊重 Retry-After）；超时用内部 AbortController 映射为 `E_PROVIDER_TIMEOUT`，调用方 `AbortSignal` 中止保留 `AbortError`，避免把“用户取消”误记成服务故障。
+- **usage 缺失才估算**：有 `prompt_tokens` / `completion_tokens` 时原样映射，`prompt_cache_hit_tokens` 缺省为 0；整段或字段缺失时按字符数/2 估算并置 `estimated=true`，保证记账永远有值且可辨认来源。
+- **假 provider 与 mock server 分开**：verify 用 `FakeProvider` 覆盖 M3 需要的脚本化场景，DeepSeek 的 HTTP/SSE 细节用 127.0.0.1 随机端口 mock server 验证；两者都不碰真 API，也不新增依赖。
+
 ## M1-02 标题/摘要写入与 FTS 索引（2026-10-24）
 
 - **FTS 同步选方案 B（应用层双写，migrate.ts 不动）**：产物只有 `store/artifacts.ts` 一个写入口，主表与 `artifact_fts` 放在同一事务里即可保证原子性；不改 `SCHEMA_VERSION`，避免在“v1 DDL 冻结”的前提下引入 v2 升级与旧数据回填风险。代价是绕过 `insertArtifact` 直接 INSERT artifacts 不会自动进索引，因此仓储层约定为唯一写入口。
