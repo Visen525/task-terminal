@@ -843,3 +843,14 @@ pnpm verify                  # 确认回到绿
 | M9-03 | 对话附件与引用 | `POST /chat` 收附件（≤5 个、单个 ≤8MB、总量 ≤16MB；图片存 data URL 分片真看图，文本文件内联 ≤64KB，其余存档并告知元信息）；`GET /uploads/:id` 受控下发；前端：附件按钮/拖拽/粘贴、发送前图片 canvas 压边（长边 ≤1568px）、气泡缩略图、引用按钮（blockquote 前缀） |
 
 历史消息中非当前轮的图片分片在上下文组装时折为 `[图片 name]` 占位（控 token）。
+
+### v1.2 扩展（2026-10-24，所有者指示）
+
+| 编号 | 任务 | 要点 |
+| --- | --- | --- |
+| M10-01 | 设置系统后端 | app_settings 表（迁移 v2，单行 JSON）；GET/PUT /settings（校验：workspaceDir 必须存在、枚举与数值范围）；GET /fs/browse 目录浏览（仅目录名）；ChatParams 扩展 temperature/topP/maxTokens/reasoningEffort 并映射 API；主/子模型与思考等级每轮生效；主线派任务默认权限 + 子代理权限上限（create_task 钳制）；工作区解析顺序 settings > env > <repo>/workspace |
+| M10-02 | 设置页与初始化向导 | 首次运行（workspaceDir 未设置）向导：目录浏览器/手输/校验后保存；设置页分区：模型与思考（主/子代理各自 model+思考等级+温度+top_p+max_tokens）、权限（默认/上限）、工作空间、日预算 |
+| M10-03 | 对话交互增强 | 划选助手消息任意片段→浮出"引用所选"；助手消息中的选项模式（A/B/C、1/2/3、①②③等）渲染为可点击 chips，点击填入输入框 |
+| M10-04 | 任务进度查看 | 主线 get_task 返回结构化进度（当前步/正在执行的工具/耗时/token 对预算/attempt/最近事件）+ 提示规则：询问进度时调用并转述 |
+
+实测备注（2026-10-24）：`reasoning_effort` 参数当前 API 接受；`deepseek-reasoner` 已支持 function calling（附录 A 旧限制按"以实测为准"条款更新；reasoner 消耗更高 token，UI 需提示）。

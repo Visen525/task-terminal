@@ -224,3 +224,10 @@
 ## v1.1 补记（Manager 修复，2026-10-24）
 
 - **历史附件占位语义**：历史轮图片折叠为 `[图片 name：当轮已送达并被查看；历史回放不重发原图，基于它的回答有效]`，并在主线提示加规则 7。起因：实测发现模型会把"当前上下文没有图"误推为"当时也没收到图"，进而撤回自己基于真实图片的有效回答（干净会话双轮实测验证修复有效：发图答色 → 无图追问 → 模型确认"看到了，结论仍作数"）。
+
+## 契约 · v1.2 设置系统（2026-10-24）
+
+- 实测：deepseek-reasoner 现支持 tools（附录 A 旧禁令按"以实测为准"更新）；reasoning_effort 参数被 API 接受。思考等级=独立参数（off 不发；low/medium/high 发 reasoning_effort），模型选择独立（chat/reasoner/自填）。
+- app_settings 采用单行 JSON（key='app'）而非多行 KV：原子读写、避免部分保存的中间态；迁移 v2 只追加表。
+- 权限两级：mainTaskDefaultPermission（主线 create_task 缺省时的默认）与 subagentPermissionCap（上限，create_task 钳制 min(请求,上限)）。
+- /fs/browse 仅返回目录名列表（本地单用户工具；不返回文件与内容）。
