@@ -24,6 +24,9 @@ export interface SubagentSettings extends RoleModelSettings {
   wallMinutes: number;
 }
 
+/** API Key 来源：界面写入优先，未设置时回退 .env。 */
+export type ApiKeySource = "settings" | "env";
+
 export interface AppSettings {
   workspaceDir: string | null;
   /** null = 使用后端内置主线提示词；非 null 为用户自定义全文。 */
@@ -33,6 +36,10 @@ export interface AppSettings {
   mainTaskDefaultPermission: PermissionMode;
   subagentPermissionCap: PermissionMode;
   dailyBudgetTokens: number;
+  /** GET /settings 只给状态与尾号，绝不返回明文 key。 */
+  hasApiKey: boolean;
+  apiKeyTail: string | null;
+  apiKeySource: ApiKeySource | null;
 }
 
 export interface SettingsPatch {
@@ -43,7 +50,25 @@ export interface SettingsPatch {
   mainTaskDefaultPermission?: PermissionMode;
   subagentPermissionCap?: PermissionMode;
   dailyBudgetTokens?: number;
+  /** 写库即生效；null = 清除界面 key，回退 .env。 */
+  apiKey?: string | null;
 }
+
+export interface ApiKeyBalanceEntry {
+  currency: string;
+  totalBalance: string;
+  grantedBalance: string;
+  toppedUpBalance: string;
+}
+
+export interface ApiKeyBalance {
+  isAvailable: boolean;
+  balances: ApiKeyBalanceEntry[];
+}
+
+export type ApiKeyCheckResult =
+  | { ok: true; balance: ApiKeyBalance }
+  | { ok: false; reason: string };
 
 export interface BrowseEntry {
   name: string;
@@ -88,6 +113,29 @@ function isPermissionMode(value: unknown): value is PermissionMode {
   return typeof value === "string" && (PERMISSION_MODES as readonly string[]).includes(value);
 }
 
+function isApiKeySource(value: unknown): value is ApiKeySource {
+  return value === "settings" || value === "env";
+}
+
+function isBalanceEntry(value: unknown): value is ApiKeyBalanceEntry {
+  return (
+    isRecord(value) &&
+    typeof value.currency === "string" &&
+    typeof value.totalBalance === "string" &&
+    typeof value.grantedBalance === "string" &&
+    typeof value.toppedUpBalance === "string"
+  );
+}
+
+function isBalance(value: unknown): value is ApiKeyBalance {
+  return (
+    isRecord(value) &&
+    typeof value.isAvailable === "boolean" &&
+    Array.isArray(value.balances) &&
+    value.balances.every(isBalanceEntry)
+  );
+}
+
 function isRoleModelSettings(value: unknown): value is RoleModelSettings {
   return (
     isRecord(value) &&
@@ -127,7 +175,10 @@ function isAppSettings(value: unknown): value is AppSettings {
     isSubagentSettings(value.subagent) &&
     isPermissionMode(value.mainTaskDefaultPermission) &&
     isPermissionMode(value.subagentPermissionCap) &&
-    isFiniteNumber(value.dailyBudgetTokens)
+    isFiniteNumber(value.dailyBudgetTokens) &&
+    typeof value.hasApiKey === "boolean" &&
+    (value.apiKeyTail === null || typeof value.apiKeyTail === "string") &&
+    (value.apiKeySource === null || isApiKeySource(value.apiKeySource))
   );
 }
 
@@ -182,6 +233,27 @@ export async function putSettings(patch: SettingsPatch): Promise<AppSettings> {
   return body;
 }
 
+/**
+ * GET /settings/key-check（M12-01）：后端用当前生效 key 调 checkBalance。
+ * 失败仍是 HTTP 200；只有网络/协议错误才会 reject。
+ */
+export async function checkApiKey(): Promise<ApiKeyCheckResult> {
+  const body = await requestJson("/settings/key-check");
+  if (!isRecord(body) || typeof body.ok !== "boolean") {
+    throw new Error("GET /settings/key-check 返回格式不合法");
+  }
+  if (body.ok) {
+    if (!isBalance(body.balance)) {
+      throw new Error("GET /settings/key-check 的余额格式不合法");
+    }
+    return { ok: true, balance: body.balance };
+  }
+  return {
+    ok: false,
+    reason: typeof body.reason === "string" ? body.reason : "测试连接失败",
+  };
+}
+
 /** GET /fs/browse?path=；缺省 path 时由后端选择当前盘根。 */
 export async function browseDirectory(path?: string): Promise<BrowseResult> {
   const trimmed = path?.trim() ?? "";
@@ -217,7 +289,7 @@ export async function browseDirectory(path?: string): Promise<BrowseResult> {
  * 只识别设置页真实存在的字段，避免把任意路径/文本误当字段。
  */
 const SETTINGS_FIELD_PATTERN =
-  /^(main\.(?:model|thinkingLevel|temperature|topP|maxTokens)|subagent\.(?:model|thinkingLevel|temperature|topP|maxTokens|budgetTokens|maxSteps|wallMinutes)|workspaceDir|mainSystemPrompt|mainTaskDefaultPermission|subagentPermissionCap|dailyBudgetTokens)\b/u;
+  /^(main\.(?:model|thinkingLevel|temperature|topP|maxTokens)|subagent\.(?:model|thinkingLevel|temperature|topP|maxTokens|budgetTokens|maxSteps|wallMinutes)|workspaceDir|mainSystemPrompt|mainTaskDefaultPermission|subagentPermissionCap|dailyBudgetTokens|apiKey)\b/u;
 
 export interface ParsedSettingsError {
   fieldErrors: Record<string, string>;

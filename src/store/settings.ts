@@ -37,6 +37,9 @@ export interface SubagentSettings extends RoleModelSettings {
   wallMinutes: number;
 }
 
+/** API Key 的来源：界面写入（优先）或 .env / process.env 回退。 */
+export type ApiKeySource = 'settings' | 'env';
+
 export interface AppSettings {
   workspaceDir: string | null;
   /**
@@ -49,6 +52,18 @@ export interface AppSettings {
   mainTaskDefaultPermission: PermissionMode;
   subagentPermissionCap: PermissionMode;
   dailyBudgetTokens: number;
+  /**
+   * 界面配置的 DeepSeek API Key（M12-01）。null = 回退 env。
+   *
+   * 该字段被刻意设为不可枚举：JSON.stringify(settings) 永远不含明文，
+   * GET /settings / 日志/错误消息因此不可能意外带出 key；落库由
+   * serializeSettings() 显式拼装，仍会把 key 写进 app_settings。
+   */
+  apiKey: string | null;
+  /** 以下三项是读时派生的视图字段，不落库，供 GET /settings 与界面使用。 */
+  hasApiKey: boolean;
+  apiKeyTail: string | null;
+  apiKeySource: ApiKeySource | null;
 }
 
 /** 设置写入的局部补丁；未出现的字段保持当前值。 */
@@ -60,6 +75,7 @@ export interface SettingsPatch {
   mainTaskDefaultPermission?: PermissionMode;
   subagentPermissionCap?: PermissionMode;
   dailyBudgetTokens?: number;
+  apiKey?: string | null;
 }
 
 export const SETTINGS_ROW_KEY = 'app';
@@ -88,7 +104,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   mainTaskDefaultPermission: 'workspace-write',
   subagentPermissionCap: 'workspace-write',
   dailyBudgetTokens: 2_000_000,
+  apiKey: null,
+  hasApiKey: false,
+  apiKeyTail: null,
+  apiKeySource: null,
 };
+// M12-01 安全红线：默认值里的 apiKey 也不可枚举，避免任何通用序列化带出。
+hideApiKey(DEFAULT_SETTINGS);
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const ROLE_KEYS = ['main', 'subagent'] as const;
@@ -100,7 +122,10 @@ const TOP_LEVEL_KEYS = new Set([
   'mainTaskDefaultPermission',
   'subagentPermissionCap',
   'dailyBudgetTokens',
+  'apiKey',
 ]);
+/** GET /settings 的派生字段；客户端把整份响应 PUT 回来时忽略，不落库。 */
+const DERIVED_KEYS = new Set(['hasApiKey', 'apiKeyTail', 'apiKeySource']);
 const ROLE_FIELDS = new Set([
   'model',
   'thinkingLevel',
@@ -126,6 +151,8 @@ const SUBAGENT_MAX_STEPS_MIN = 1;
 const SUBAGENT_MAX_STEPS_MAX = 500;
 const SUBAGENT_WALL_MINUTES_MIN = 1;
 const SUBAGENT_WALL_MINUTES_MAX = 240;
+const API_KEY_MIN_CHARS = 8;
+const API_KEY_MAX_CHARS = 200;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -141,8 +168,38 @@ function isPermissionMode(value: unknown): value is PermissionMode {
   );
 }
 
+/** 当前 env 中的 key；空白视同未配置。每次调用都重新读，测试可注入。 */
+function readEnvApiKey(): string | null {
+  const value = process.env.DEEPSEEK_API_KEY;
+  if (value === undefined) return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** apiKey 不可枚举：任何 JSON 序列化（GET /settings、日志）都不会带出明文。 */
+function hideApiKey(settings: AppSettings): AppSettings {
+  Object.defineProperty(settings, 'apiKey', {
+    value: settings.apiKey,
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  });
+  return settings;
+}
+
+/** 由当前生效 key 派生 hasApiKey / 尾号 / 来源；不修改 apiKey 本身。 */
+function applyApiKeyView(settings: AppSettings): void {
+  const stored = settings.apiKey;
+  const envKey = readEnvApiKey();
+  const effective = stored ?? envKey;
+  settings.hasApiKey = effective !== null;
+  settings.apiKeyTail = effective === null ? null : effective.slice(-4);
+  settings.apiKeySource =
+    stored !== null ? 'settings' : envKey !== null ? 'env' : null;
+}
+
 function cloneSettings(settings: AppSettings): AppSettings {
-  return {
+  return hideApiKey({
     workspaceDir: settings.workspaceDir,
     mainSystemPrompt: settings.mainSystemPrompt,
     main: { ...settings.main },
@@ -150,7 +207,11 @@ function cloneSettings(settings: AppSettings): AppSettings {
     mainTaskDefaultPermission: settings.mainTaskDefaultPermission,
     subagentPermissionCap: settings.subagentPermissionCap,
     dailyBudgetTokens: settings.dailyBudgetTokens,
-  };
+    apiKey: settings.apiKey,
+    hasApiKey: settings.hasApiKey,
+    apiKeyTail: settings.apiKeyTail,
+    apiKeySource: settings.apiKeySource,
+  });
 }
 
 /**
@@ -166,6 +227,7 @@ function parseSettingsPatch(raw: unknown, errors: string[]): SettingsPatch {
   const patch: SettingsPatch = {};
 
   for (const key of Object.keys(raw)) {
+    if (DERIVED_KEYS.has(key)) continue;
     if (!TOP_LEVEL_KEYS.has(key)) {
       errors.push(`${key} 不是可配置字段`);
     }
@@ -181,6 +243,29 @@ function parseSettingsPatch(raw: unknown, errors: string[]): SettingsPatch {
       errors.push('workspaceDir 必须是非空路径或 null');
     } else {
       patch.workspaceDir = value.trim();
+    }
+  }
+
+  if ('apiKey' in raw) {
+    const value = raw.apiKey;
+    if (value === null) {
+      patch.apiKey = null;
+    } else if (typeof value !== 'string') {
+      errors.push('apiKey 必须是字符串或 null');
+    } else {
+      // 允许用户粘贴带首尾空白的内容；落库前归一化，内部空白一律拒绝。
+      const key = value.trim();
+      if (key.length === 0) {
+        errors.push('apiKey 给值时不能为空');
+      } else if (key.length < API_KEY_MIN_CHARS || key.length > API_KEY_MAX_CHARS) {
+        errors.push(
+          `apiKey 长度必须在 ${API_KEY_MIN_CHARS} 到 ${API_KEY_MAX_CHARS} 个字符之间`,
+        );
+      } else if (/\s/u.test(key)) {
+        errors.push('apiKey 不能包含空白字符');
+      } else {
+        patch.apiKey = key;
+      }
     }
   }
 
@@ -389,6 +474,11 @@ function mergeSettings(base: AppSettings, patch: SettingsPatch): AppSettings {
   if (patch.dailyBudgetTokens !== undefined) {
     merged.dailyBudgetTokens = patch.dailyBudgetTokens;
   }
+  if ('apiKey' in patch) {
+    merged.apiKey = patch.apiKey ?? null;
+  }
+  // 派生字段始终由「当前 settings + env」重新计算，绝不信任落库值。
+  applyApiKeyView(merged);
   return merged;
 }
 
@@ -431,7 +521,11 @@ export function getSettings(db: DatabaseSync): AppSettings {
   const row = db
     .prepare('SELECT value FROM app_settings WHERE key = ?')
     .get(SETTINGS_ROW_KEY) as unknown as { value?: unknown } | undefined;
-  if (row === undefined) return cloneSettings(DEFAULT_SETTINGS);
+  if (row === undefined) {
+    const defaults = cloneSettings(DEFAULT_SETTINGS);
+    applyApiKeyView(defaults);
+    return defaults;
+  }
 
   let parsed: unknown;
   try {
@@ -455,6 +549,23 @@ export function getSettings(db: DatabaseSync): AppSettings {
 }
 
 /**
+ * 落库序列化显式列出字段：apiKey 在内存里不可枚举（防日志/GET 泄露），
+ * 但必须写进 app_settings；派生视图字段不落库。
+ */
+function serializeSettings(settings: AppSettings): string {
+  return JSON.stringify({
+    workspaceDir: settings.workspaceDir,
+    mainSystemPrompt: settings.mainSystemPrompt,
+    main: settings.main,
+    subagent: settings.subagent,
+    mainTaskDefaultPermission: settings.mainTaskDefaultPermission,
+    subagentPermissionCap: settings.subagentPermissionCap,
+    dailyBudgetTokens: settings.dailyBudgetTokens,
+    apiKey: settings.apiKey,
+  });
+}
+
+/**
  * 保存设置：校验 → 与当前值深合并 → 整行覆盖 key='app'，updated_at=now。
  * 校验失败不会写库。
  */
@@ -469,8 +580,18 @@ export function saveSettings(
     `INSERT INTO app_settings(key, value, updated_at)
      VALUES(?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-  ).run(SETTINGS_ROW_KEY, JSON.stringify(merged), now);
+  ).run(SETTINGS_ROW_KEY, serializeSettings(merged), now);
   return merged;
+}
+
+/**
+ * 当前生效 key：settings.apiKey > env DEEPSEEK_API_KEY > null（M12-01）。
+ * 每次调用都重新读 DB/env，因此设置页保存后下一轮对话/下一次 tick 立即生效。
+ */
+export function getEffectiveApiKey(db: DatabaseSync): string | null {
+  const stored = getSettings(db).apiKey;
+  if (stored !== null && stored.length > 0) return stored;
+  return readEnvApiKey();
 }
 
 /**

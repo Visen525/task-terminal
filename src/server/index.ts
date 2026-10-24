@@ -52,6 +52,7 @@ import {
 } from '../store/messages.ts';
 import { getTask, listTasks } from '../store/repo.ts';
 import {
+  getEffectiveApiKey,
   getSettings,
   resolveDefaultWorkspace,
   saveSettings,
@@ -91,6 +92,12 @@ export interface CreateAppOptions {
    * 只注入 provider，db / scheduler / workspace 仍由本层持有。
    */
   mainAi?: { provider: LlmProvider };
+  /**
+   * M12-01：为 true 时 POST /chat 在无生效 key 时直接 503。
+   * 生产装配（src/index.ts）显式开启；直接 createApp 的既有测试/嵌入
+   * 调用保持 M6-03 行为（无 key 也把请求交给注入的 provider）。
+   */
+  requireApiKey?: boolean;
   /** 对话附件落盘根目录；默认 <cwd>/data/uploads（测试可注入临时目录）。 */
   uploadsDir?: string;
   /** 可注入时钟；默认 Date.now。 */
@@ -137,6 +144,9 @@ function httpStatusFor(code: ErrorCode): number {
       return 403;
     case ERROR_CODES.E_BUDGET_EXCEEDED:
       return 429;
+    case ERROR_CODES.E_PROVIDER_AUTH:
+      // M12-01：未配置 key 属于“服务可用但功能未就绪”，不是内部错误。
+      return 503;
     default:
       return 500;
   }
@@ -294,6 +304,12 @@ function logError(message: string, fields: Record<string, unknown> = {}): void {
   console.error(JSON.stringify({ level: 'error', msg: message, ...fields }));
 }
 
+/** key-check 的失败原因可能来自第三方错误体；兜底把当前 key 抹掉。 */
+function redactSecret(text: string, secret: string | null): string {
+  if (secret === null || secret.length === 0) return text;
+  return text.split(secret).join('[REDACTED]');
+}
+
 /** fire-and-forget：HTTP 响应不等整轮 agent 执行。 */
 function wakeScheduler(scheduler: Scheduler): void {
   void scheduler.tick().then(
@@ -372,7 +388,8 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ContractError) {
       const status = httpStatusFor(error.code);
-      if (status >= 500) {
+      // E_PROVIDER_AUTH 的 503 是给用户的明确指引，不按内部错误遮掉消息。
+      if (status >= 500 && error.code !== ERROR_CODES.E_PROVIDER_AUTH) {
         logError('request failed', {
           method: request.method,
           url: request.url,
@@ -604,6 +621,31 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   });
 
   /**
+   * GET /settings/key-check（M12-01）：用当前生效 key 调 provider.checkBalance。
+   * 成功 `{ok:true,balance}`，失败 `{ok:false,reason}`；任何分支都不回 key。
+   */
+  app.get('/settings/key-check', async () => {
+    const apiKey = getEffectiveApiKey(db);
+    if (apiKey === null) {
+      return { ok: false, reason: '未配置 API Key：请打开设置填写后重试' };
+    }
+    const provider = options.mainAi?.provider;
+    if (provider?.checkBalance === undefined) {
+      return { ok: false, reason: '当前模型提供方不支持余额查询' };
+    }
+    try {
+      const balance = await provider.checkBalance();
+      return { ok: true, balance };
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message.length > 0
+          ? error.message
+          : '测试连接失败，请检查 API Key 与网络';
+      return { ok: false, reason: redactSecret(message, apiKey) };
+    }
+  });
+
+  /**
    * GET /fs/browse?path=：只列目录名与“是否可进入”，不返回文件/文件内容。
    * 缺省 path 为 process.cwd() 所在盘根；最多 500 条，超出以 truncated 标注。
    */
@@ -699,6 +741,14 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     const mainAi = options.mainAi;
     if (mainAi === undefined) {
       throw new ContractError(ERROR_CODES.E_INTERNAL, '主线 AI 未装配，POST /chat 不可用');
+    }
+
+    // M12-01：无 key 时不建立 SSE，直接 503 JSON 指引进设置；每次请求实时解析。
+    if (options.requireApiKey === true && getEffectiveApiKey(db) === null) {
+      throw new ContractError(
+        ERROR_CODES.E_PROVIDER_AUTH,
+        '未配置 API Key：请打开设置填写后重试',
+      );
     }
 
     // 附件校验/落盘在建立 SSE 之前完成：违规直接走全局 400 JSON。

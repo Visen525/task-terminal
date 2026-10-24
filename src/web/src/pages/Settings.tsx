@@ -27,10 +27,13 @@ import {
   Typography,
 } from "antd";
 import {
+  CheckCircleOutlined,
+  ClearOutlined,
   DatabaseOutlined,
   DeleteOutlined,
   FolderOpenOutlined,
   InfoCircleOutlined,
+  KeyOutlined,
   LinkOutlined,
   ReloadOutlined,
   SaveOutlined,
@@ -41,9 +44,12 @@ import DirectoryBrowserModal from "../components/DirectoryBrowser";
 import EmptyState from "../components/EmptyState";
 import PageHeader from "../components/PageHeader";
 import {
+  checkApiKey,
   getSettings,
   parseSettingsFieldErrors,
   putSettings,
+  type ApiKeyBalance,
+  type ApiKeyCheckResult,
   type AppSettings,
   type RoleModelSettings,
   type SubagentSettings,
@@ -240,6 +246,15 @@ function formatTime(timestamp: number): string {
 
 function shortId(id: string): string {
   return id.length <= 16 ? id : `${id.slice(0, 8)}…${id.slice(-6)}`;
+}
+
+/** 余额明细优先展示总额；没有返回值时退回可用状态。 */
+function formatApiKeyBalance(balance: ApiKeyBalance): string {
+  const entries = balance.balances
+    .filter((item) => item.totalBalance.trim().length > 0)
+    .map((item) => `${item.currency.length > 0 ? item.currency : "CNY"} ${item.totalBalance}`);
+  if (entries.length > 0) return entries.join(" · ");
+  return balance.isAvailable ? "账户可用（接口未返回余额明细）" : "账户当前不可用";
 }
 
 /** SQLite 中 confidence 是 0–1 的小数；展示时夹紧到 0–100%。 */
@@ -701,6 +716,9 @@ export default function Settings({ onOpenTask }: SettingsProps) {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [saveError, setSaveError] = useState<string | null>(null);
   const [browserOpen, setBrowserOpen] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
+  const [keyCheck, setKeyCheck] = useState<ApiKeyCheckResult | null>(null);
 
   const overviewQuery = useQuery({
     queryKey: ["settings", "overview"],
@@ -773,6 +791,50 @@ export default function Settings({ onOpenTask }: SettingsProps) {
       } else {
         setSaveError(null);
       }
+    },
+  });
+
+  /**
+   * API Key 单独走 PUT：GET 永远不回明文，所以不能放进 draft 一起提交。
+   * 保存/清除成功即更新 ["settings","current"]，App 顶部横幅会立刻消失/出现。
+   */
+  const apiKeySaveMutation = useMutation({
+    mutationFn: (apiKey: string) => putSettings({ apiKey }),
+    onSuccess: (saved) => {
+      setApiKeyInput("");
+      setApiKeyError(null);
+      setKeyCheck(null);
+      queryClient.setQueryData(["settings", "current"], saved);
+      message.success("API Key 已保存，立即生效");
+      void queryClient.invalidateQueries({ queryKey: ["settings", "overview"] });
+    },
+    onError: (error: Error) => {
+      const parsed = parseSettingsFieldErrors(error.message);
+      setApiKeyError(parsed.fieldErrors.apiKey ?? error.message);
+    },
+  });
+
+  const apiKeyClearMutation = useMutation({
+    mutationFn: () => putSettings({ apiKey: null }),
+    onSuccess: (saved) => {
+      setKeyCheck(null);
+      setApiKeyError(null);
+      queryClient.setQueryData(["settings", "current"], saved);
+      message.success("已清除界面 API Key，若 .env 有值将自动回退");
+      void queryClient.invalidateQueries({ queryKey: ["settings", "overview"] });
+    },
+    onError: (error: Error) => {
+      setApiKeyError(error.message);
+    },
+  });
+
+  const keyCheckMutation = useMutation({
+    mutationFn: () => checkApiKey(),
+    onSuccess: (result) => {
+      setKeyCheck(result);
+    },
+    onError: (error: Error) => {
+      setKeyCheck({ ok: false, reason: error.message });
     },
   });
 
@@ -915,6 +977,123 @@ export default function Settings({ onOpenTask }: SettingsProps) {
         <LoadingPanel text="加载设置…" />
       ) : draft === null ? null : (
         <>
+          <section style={{ marginBottom: 28 }}>
+            <div className="section-heading">
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                <h2 className="section-title">API Key</h2>
+                <KeyOutlined style={{ color: "var(--tt-text-tertiary)" }} />
+              </span>
+              <span className="section-hint">保存后立即生效，无需重启</span>
+            </div>
+            <div className="info-panel">
+              <div className="settings-field">
+                <div className="settings-field-head">
+                  <span className="settings-field-label">DeepSeek API Key</span>
+                  <span className="settings-field-value">
+                    {draft.hasApiKey ? (
+                      <Tag color="green">
+                        已配置 · 尾号 {draft.apiKeyTail ?? "----"} · 来源{" "}
+                        {draft.apiKeySource === "settings" ? "界面" : ".env"}
+                      </Tag>
+                    ) : (
+                      <Tag>未配置</Tag>
+                    )}
+                  </span>
+                </div>
+
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 8,
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                  }}
+                >
+                  <Input.Password
+                    value={apiKeyInput}
+                    placeholder="sk-…（只保存在本地数据库）"
+                    autoComplete="new-password"
+                    maxLength={200}
+                    aria-label="DeepSeek API Key"
+                    style={{ maxWidth: 420, minWidth: 260 }}
+                    onChange={(event) => {
+                      setApiKeyInput(event.target.value);
+                      setApiKeyError(null);
+                    }}
+                  />
+                  <Button
+                    type="primary"
+                    icon={<SaveOutlined />}
+                    loading={apiKeySaveMutation.isPending}
+                    disabled={apiKeyInput.trim().length === 0}
+                    onClick={() => {
+                      apiKeySaveMutation.mutate(apiKeyInput.trim());
+                    }}
+                  >
+                    保存 Key
+                  </Button>
+                  <Button
+                    icon={<CheckCircleOutlined />}
+                    loading={keyCheckMutation.isPending}
+                    disabled={!draft.hasApiKey}
+                    title={draft.hasApiKey ? undefined : "请先保存 API Key 再测试"}
+                    onClick={() => {
+                      keyCheckMutation.mutate();
+                    }}
+                  >
+                    测试连接
+                  </Button>
+                  <Button
+                    danger
+                    icon={<ClearOutlined />}
+                    loading={apiKeyClearMutation.isPending}
+                    disabled={draft.apiKeySource !== "settings"}
+                    onClick={() => {
+                      apiKeyClearMutation.mutate();
+                    }}
+                  >
+                    清除
+                  </Button>
+                </div>
+
+                <span className="settings-field-help">
+                  只回显尾号，GET /settings 不返回明文；未配置时对话与任务不可用。
+                </span>
+                {apiKeyError === null ? null : (
+                  <span className="settings-field-error">{apiKeyError}</span>
+                )}
+
+                {keyCheck === null ? null : keyCheck.ok ? (
+                  <Alert
+                    style={{ marginTop: 12 }}
+                    type={keyCheck.balance.isAvailable ? "success" : "warning"}
+                    showIcon
+                    closable
+                    message={
+                      keyCheck.balance.isAvailable ? "连接成功" : "连接成功，但账户当前不可用"
+                    }
+                    description={formatApiKeyBalance(keyCheck.balance)}
+                    onClose={() => {
+                      setKeyCheck(null);
+                    }}
+                  />
+                ) : (
+                  <Alert
+                    style={{ marginTop: 12 }}
+                    type="error"
+                    showIcon
+                    closable
+                    message="连接测试失败"
+                    description={keyCheck.reason}
+                    onClose={() => {
+                      setKeyCheck(null);
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+          </section>
+
           <section style={{ marginBottom: 28 }}>
             <div className="section-heading">
               <h2 className="section-title">模型与思考</h2>

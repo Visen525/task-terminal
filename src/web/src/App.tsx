@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Button, Layout, Menu, Tooltip } from "antd";
+import { Alert, Button, Layout, Menu, Tooltip } from "antd";
 import {
   AppstoreOutlined,
   FolderOpenOutlined,
@@ -98,7 +98,10 @@ export default function App() {
   const settingsQuery = useQuery({
     queryKey: ["settings", "current"],
     queryFn: getSettings,
+    // M12-01：外部改了 .env/数据库也能在 10s 内反映到横幅；设置页保存则即时更新缓存。
+    refetchInterval: 10_000,
   });
+  const hasApiKey = settingsQuery.data?.hasApiKey;
 
   const openTask = (taskId: string): void => {
     setSelectedTaskId(taskId);
@@ -182,6 +185,26 @@ export default function App() {
           </div>
         </Sider>
         <Layout className="app-main">
+          {hasApiKey === false ? (
+            <div style={{ padding: "12px 24px 0" }}>
+              <Alert
+                type="warning"
+                showIcon
+                message="未配置 API Key，对话与任务暂不可用"
+                action={
+                  <Button
+                    size="small"
+                    type="primary"
+                    onClick={() => {
+                      setActiveKey("settings");
+                    }}
+                  >
+                    去设置
+                  </Button>
+                }
+              />
+            </div>
+          ) : null}
           <Content className="app-content">
             <div className="app-page" style={{ maxWidth: activeKey === "chat" ? 860 : 1080 }}>
               {content}

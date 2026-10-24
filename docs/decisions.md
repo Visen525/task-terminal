@@ -2,6 +2,15 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M12-01 API Key 界面化与优雅启动（2026-10-24）
+
+- **key 只在落库时显式写出，内存对象里不可枚举**：`apiKey` 存 `app_settings` 单行 JSON；`serializeSettings()` 显式拼装后写库，而内存中的 `settings.apiKey` 用 `defineProperty(enumerable:false)` 隐藏，因此 `JSON.stringify(settings)` / GET / 日志/错误消息都不可能顺手带出明文。`getEffectiveApiKey` 每次调用重读 settings > env，不缓存，所以设置页保存后下一轮对话/下一 tick 立即生效。
+- **派生视图字段是 AppSettings 的一部分但不落库**：GET /settings 只多出 `hasApiKey` / `apiKeyTail`（尾 4 位）/ `apiKeySource`（settings|env），不含 apiKey；PUT 收到这些派生字段时忽略，便于客户端把 GET 结果整份回写。既有 m10 用 `deepEqual(getSettings(), DEFAULT_SETTINGS)` 锁默认值，因此派生字段也进了默认值与设置类型，`apiKey` 则保持不可枚举。
+- **key 校验取「8–200 字符且不含空白」**：任务卡写“以 `sk-` 开头或至少不含空白”，按后半个条件实现为不强制前缀（只拒绝空白/过短/过长）；首尾空白 trim 后落库，内部空白一律 400，错误信息带 `apiKey` 字段路径且不回显值。
+- **优雅启动是“装配照常、能力 gate”**：`DeepSeekOptions.apiKey` 接受 `string | (() => string)`，函数模式构造时不校验、发请求时才为空抛 `E_PROVIDER_AUTH`；`src/index.ts` 不再因缺 key 抛错，只打一条 WARN 并把启动日志标成 `ai=disabled`。scheduler 新增 `getApiKey` gate，无 key 时 tick 返回 `{started:false,reason:'no-key'}` 且不写 run/事件；`createApp` 新增显式 `requireApiKey`（生产装配传 true），开启后 `/chat` 在建 SSE 前直接 503 中文指引；`POST /tasks` 仍 201，任务停在 queued（按本卡“建任务成功但调度不启动”的口径）。两个 gate 都采用注入式开关，是为了不改变既有 M4/M6/M9 直接构造 scheduler/createApp 的测试语义——生产入口 `src/index.ts` 两条都接线。
+- **key-check 失败也用 200，原因二次脱敏**：`GET /settings/key-check` 用当前生效 key 调 `provider.checkBalance`，成功 `{ok:true,balance}`、失败 `{ok:false,reason}`；无 key/无 checkBalance 也走 ok:false，不制造 500。失败原因按当前 key 再做一次 `[REDACTED]` 兜底，防止第三方错误体回显。
+- **前端 key 独立保存，不进设置 draft**：GET 不回明文，所以密码框只在本地 state，保存/清除直接 PUT `{apiKey}` 并 `setQueryData(["settings","current"])`，App 顶部横幅立即消失/出现；另有 10s 轮询兜底。聊天发送与看板新建按钮在 `hasApiKey===false` 时置灰并用 Tooltip 指路。测试显式清空 `DEEPSEEK_API_KEY` 并在用例结束恢复，只用临时库、FakeProvider 与本机 mock server，零新增依赖。
+
 ## M11-02 子代理预算放开与上限可调（2026-10-24）
 
 - **任务级 token 预算默认 0=不限，但钱包护栏不动**：`LoopLimits.maxTokens` 改为可选，undefined/0 时 loop 跳过 `max_tokens` 检查；`runGuardedLoop` 只在 `task.budgetTokens > 0` 时接线 `limits.maxTokens`。全局日预算 gate（`canStartTask`）与 M11-01 的每 run 30 次联网上限原样保留，二者仍会在钱包/调用次数上兜底。

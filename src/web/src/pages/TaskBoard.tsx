@@ -11,6 +11,7 @@ import {
   Select,
   Space,
   Spin,
+  Tooltip,
 } from "antd";
 import {
   AppstoreOutlined,
@@ -31,6 +32,7 @@ import {
   type Task,
   type TaskStatus,
 } from "../api";
+import { getSettings } from "../settingsApi";
 
 interface TaskBoardProps {
   onOpenTask: (taskId: string) => void;
@@ -102,6 +104,11 @@ export default function TaskBoard({ onOpenTask }: TaskBoardProps) {
     queryFn: listTasks,
     refetchInterval: 2000,
   });
+  const settingsQuery = useQuery({
+    queryKey: ["settings", "current"],
+    queryFn: getSettings,
+  });
+  const noApiKey = settingsQuery.data?.hasApiKey === false;
 
   const createMutation = useMutation({
     mutationFn: (input: CreateTaskInput) => createTask(input),
@@ -157,9 +164,21 @@ export default function TaskBoard({ onOpenTask }: TaskBoardProps) {
             >
               刷新
             </Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={openModal}>
-              新建任务
-            </Button>
+            <Tooltip
+              title={noApiKey ? "未配置 API Key，请先到设置填写后再新建任务" : ""}
+              placement="bottom"
+            >
+              <span style={{ display: "inline-block" }}>
+                <Button
+                  type="primary"
+                  icon={<PlusOutlined />}
+                  disabled={noApiKey}
+                  onClick={openModal}
+                >
+                  新建任务
+                </Button>
+              </span>
+            </Tooltip>
           </Space>
         }
       />
@@ -194,9 +213,21 @@ export default function TaskBoard({ onOpenTask }: TaskBoardProps) {
           title="还没有任务"
           description="创建第一条任务，让主 AI 拆解目标并派给子智能体执行。"
           action={
-            <Button type="primary" icon={<PlusOutlined />} onClick={openModal}>
-              新建任务
-            </Button>
+            <Tooltip
+              title={noApiKey ? "未配置 API Key，请先到设置填写后再新建任务" : ""}
+              placement="top"
+            >
+              <span style={{ display: "inline-block" }}>
+                <Button
+                  type="primary"
+                  icon={<PlusOutlined />}
+                  disabled={noApiKey}
+                  onClick={openModal}
+                >
+                  新建任务
+                </Button>
+              </span>
+            </Tooltip>
           }
         />
       ) : (
@@ -293,6 +324,7 @@ export default function TaskBoard({ onOpenTask }: TaskBoardProps) {
         okText="创建"
         cancelText="取消"
         confirmLoading={createMutation.isPending}
+        okButtonProps={{ disabled: noApiKey }}
         onOk={() => {
           form.submit();
         }}

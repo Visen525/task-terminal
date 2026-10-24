@@ -67,12 +67,17 @@ export interface SchedulerOptions {
   dailyBudgetTokens?: number;
   /** 创建时先跑一次 reaper（启动恢复）；默认 true。 */
   reapOnStart?: boolean;
+  /**
+   * 当前生效 API Key 解析器（M12-01）。给了它且返回空时，tick 直接
+   * no-op（reason='no-key'），只读不写库；未给则保持既有行为。
+   */
+  getApiKey?: () => string | null;
 }
 
 export type SchedulerTickResult =
   | {
       started: false;
-      reason: 'busy' | 'shutdown' | 'empty' | 'budget';
+      reason: 'busy' | 'shutdown' | 'empty' | 'budget' | 'no-key';
       /** reason === 'budget' 时给出门禁读数。 */
       gate?: DailyBudgetGate;
     }
@@ -295,6 +300,14 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
   async function tick(): Promise<SchedulerTickResult> {
     if (closed) return { started: false, reason: 'shutdown' };
     if (busy) return { started: false, reason: 'busy' };
+
+    // M12-01：无 key 时调度器保持装配但禁用；任务仍可创建并停在 queued。
+    if (options.getApiKey !== undefined) {
+      const key = options.getApiKey();
+      if (key === null || key.trim().length === 0) {
+        return { started: false, reason: 'no-key' };
+      }
+    }
 
     const task = listTasks(db, { status: 'queued', limit: 1 })[0];
     if (task === undefined) return { started: false, reason: 'empty' };

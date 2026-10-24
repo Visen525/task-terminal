@@ -47,7 +47,11 @@ export interface DeepSeekRetryOptions {
 }
 
 export interface DeepSeekOptions {
-  apiKey: string;
+  /**
+   * 固定 key，或每次调用时解析的函数（M12-01：设置页改 key 无需重启）。
+   * 函数模式允许构造时暂无 key，真正发请求时才校验并报 E_PROVIDER_AUTH。
+   */
+  apiKey: string | (() => string);
   baseUrl?: string;
   model?: string;
   timeouts?: DeepSeekTimeouts;
@@ -120,7 +124,9 @@ class RequestScope {
 }
 
 export class DeepSeekProvider implements LlmProvider {
-  private readonly apiKey: string;
+  private readonly resolveApiKey: () => string;
+  /** 最近一次请求使用的 key，仅用于把错误体里的同一个 key 脱敏。 */
+  private lastApiKey = "";
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly connectMs: number;
@@ -131,13 +137,28 @@ export class DeepSeekProvider implements LlmProvider {
   private readonly maxDelayMs: number;
 
   constructor(options: DeepSeekOptions) {
-    if (options.apiKey.trim().length === 0) {
-      throw new ContractError(
-        ERROR_CODES.E_PROVIDER_AUTH,
-        "DeepSeek API key 不能为空；请通过构造参数注入",
-      );
+    if (typeof options.apiKey === "string") {
+      const key = options.apiKey.trim();
+      if (key.length === 0) {
+        throw new ContractError(
+          ERROR_CODES.E_PROVIDER_AUTH,
+          "DeepSeek API key 不能为空；请通过构造参数注入",
+        );
+      }
+      this.resolveApiKey = () => key;
+    } else {
+      const readKey = options.apiKey;
+      this.resolveApiKey = () => {
+        const key = readKey().trim();
+        if (key.length === 0) {
+          throw new ContractError(
+            ERROR_CODES.E_PROVIDER_AUTH,
+            "未配置 API Key：请打开设置填写后重试",
+          );
+        }
+        return key;
+      };
     }
-    this.apiKey = options.apiKey.trim();
     this.baseUrl = (options.baseUrl ?? DEEPSEEK_DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.model = options.model ?? DEEPSEEK_DEFAULT_MODEL;
     this.connectMs = options.timeouts?.connectMs ?? 10_000;
@@ -489,8 +510,11 @@ export class DeepSeekProvider implements LlmProvider {
     stream: boolean,
   ): Promise<{ response: Response; scope: RequestScope }> {
     throwIfAborted(signal);
+    // 每次请求都重新解析：设置页保存后无需重建 provider。
+    const apiKey = this.resolveApiKey();
+    this.lastApiKey = apiKey;
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       Accept: stream ? "text/event-stream" : "application/json",
     };
     if (payload !== undefined) {
@@ -600,7 +624,7 @@ export class DeepSeekProvider implements LlmProvider {
       case 401:
         return new ContractError(
           ERROR_CODES.E_PROVIDER_AUTH,
-          `DeepSeek 401 鉴权失败：API key 无效或已过期，请检查 .env 中的 DEEPSEEK_API_KEY${suffix}`,
+          `DeepSeek 401 鉴权失败：API key 无效或已过期，请在设置中检查 API Key${suffix}`,
         );
       case 402:
         return new ContractError(
@@ -676,8 +700,9 @@ export class DeepSeekProvider implements LlmProvider {
 
   private redact(text: string): string {
     let result = text;
-    if (this.apiKey.length > 0) {
-      result = result.split(this.apiKey).join("[REDACTED]");
+    const key = this.lastApiKey;
+    if (key.length > 0) {
+      result = result.split(key).join("[REDACTED]");
     }
     return result.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]");
   }

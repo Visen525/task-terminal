@@ -19,6 +19,7 @@ import {
   type ClipboardEvent,
   type DragEvent,
 } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Alert, App as AntdApp, Button, Input, Spin, Tooltip } from "antd";
 import { MessageOutlined, PaperClipOutlined, SendOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
@@ -54,6 +55,7 @@ import {
   type ChatAttachmentInput,
   type ChatMessage,
 } from "../chatApi";
+import { getSettings } from "../settingsApi";
 
 /** 16–32ms 合批窗口，取中间值。 */
 const FLUSH_INTERVAL_MS = 24;
@@ -199,6 +201,12 @@ function MessageBubble({
 
 export default function Chat() {
   const { message: toast } = AntdApp.useApp();
+  const settingsQuery = useQuery({
+    queryKey: ["settings", "current"],
+    queryFn: getSettings,
+  });
+  /** false 才置灰；设置加载中不误伤现有输入。 */
+  const noApiKey = settingsQuery.data?.hasApiKey === false;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -440,6 +448,10 @@ export default function Chat() {
 
   const send = useCallback(async (): Promise<void> => {
     const text = input.trim();
+    if (noApiKey) {
+      toast.warning("未配置 API Key，请先到设置填写");
+      return;
+    }
     if (
       (text.length === 0 && attachments.length === 0) ||
       sending ||
@@ -562,7 +574,7 @@ export default function Chat() {
         }
       }
     }
-  }, [attachments, flushDeltas, input, loadingHistory, quote, sending, toast]);
+  }, [attachments, flushDeltas, input, loadingHistory, noApiKey, quote, sending, toast]);
 
   const handleDragOver = useCallback((event: DragEvent<HTMLDivElement>): void => {
     if (!event.dataTransfer.types.includes("Files")) return;
@@ -752,22 +764,30 @@ export default function Chat() {
               Enter 发送 · Shift+Enter 换行 · 可拖拽/粘贴
             </span>
           </div>
-          <Button
-            className="send-button"
-            type="primary"
-            icon={<SendOutlined />}
-            loading={sending}
-            disabled={
-              sending ||
-              loadingHistory ||
-              (input.trim().length === 0 && attachments.length === 0)
-            }
-            onClick={() => {
-              void send();
-            }}
+          <Tooltip
+            title={noApiKey ? "未配置 API Key，请先到设置填写" : ""}
+            placement="top"
           >
-            {sending ? "回复中…" : "发送"}
-          </Button>
+            <span style={{ display: "inline-block" }}>
+              <Button
+                className="send-button"
+                type="primary"
+                icon={<SendOutlined />}
+                loading={sending}
+                disabled={
+                  noApiKey ||
+                  sending ||
+                  loadingHistory ||
+                  (input.trim().length === 0 && attachments.length === 0)
+                }
+                onClick={() => {
+                  void send();
+                }}
+              >
+                {sending ? "回复中…" : "发送"}
+              </Button>
+            </span>
+          </Tooltip>
         </div>
       </div>
       {selectionDraft === null ? null : (

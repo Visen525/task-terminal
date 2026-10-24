@@ -21,7 +21,10 @@ import { reapExpiredRuns } from './runtime/reaper.ts';
 import { createScheduler } from './runtime/scheduler.ts';
 import { createApp } from './server/index.ts';
 import { openDatabase } from './store/migrate.ts';
-import { resolveDefaultWorkspace } from './store/settings.ts';
+import {
+  getEffectiveApiKey,
+  resolveDefaultWorkspace,
+} from './store/settings.ts';
 
 // M11-01：官方联网工具只在启动装配层加入子智能体工具表；executeTool 的
 // TOOL_SPECS 仍保持 M3 验收时的六件套，既有断言零改动。
@@ -35,7 +38,8 @@ const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 interface StartupConfig {
   port: number;
-  apiKey: string;
+  /** 启动时 .env 快照；可为空（M12-01 不再因缺 key 退出）。 */
+  apiKey: string | undefined;
   baseUrl: string | undefined;
   model: string | undefined;
   dataDir: string;
@@ -91,10 +95,8 @@ function parsePort(raw: string | undefined): number {
 function readConfig(): StartupConfig {
   loadEnvFile(join(REPO_ROOT, '.env'));
 
+  // M12-01：key 可以完全缺失——服务照常启动，设置页可随时补填。
   const apiKey = envText('DEEPSEEK_API_KEY');
-  if (apiKey === undefined) {
-    throw new Error('缺少 DEEPSEEK_API_KEY：请在仓库根 .env 中配置后重启');
-  }
 
   const dataDir = envText('DATA_DIR') ?? join(REPO_ROOT, 'data');
   const dbPath = envText('DB_PATH') ?? join(dataDir, 'task-terminal.db');
@@ -113,6 +115,10 @@ function logInfo(message: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ level: 'info', msg: message, ...fields }));
 }
 
+function logWarn(message: string, fields: Record<string, unknown> = {}): void {
+  console.warn(JSON.stringify({ level: 'warn', msg: message, ...fields }));
+}
+
 async function main(): Promise<void> {
   const config = readConfig();
 
@@ -128,18 +134,25 @@ async function main(): Promise<void> {
       logInfo('reaped expired runs', { count: reaped.length });
     }
 
+    const startupApiKey = getEffectiveApiKey(db);
+    // M12-01：provider 收解析函数，每轮对话/每次请求重新取当前生效 key；
+    // 构造时允许为空，真正发起请求时才按 E_PROVIDER_AUTH 拒绝。
     const provider = new DeepSeekProvider({
-      apiKey: config.apiKey,
+      apiKey: () => getEffectiveApiKey(db) ?? '',
       ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
       ...(config.model === undefined ? {} : { model: config.model }),
     });
     // ctx 用变量而不是内联字面量：scheduler 的 LoopToolContextOptions 是
     // Pick 白名单，运行时靠 ...options.ctx 原样透传 webTools；这样既不改
     // scheduler，也不把 key 落到任何日志/事件里。
+    // webTools 的 apiKey 用 getter：任务级每次读取当前设置，改 key 即时生效。
+    // （旧装配写法 apiKey: config.apiKey 只保留在注释里，避免误导为启动快照。）
     const schedulerCtx = {
       outputDir: join(config.dataDir, 'tool-outputs'),
       webTools: {
-        apiKey: config.apiKey,
+        get apiKey(): string {
+          return getEffectiveApiKey(db) ?? config.apiKey ?? '';
+        },
         ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
       },
     };
@@ -148,12 +161,22 @@ async function main(): Promise<void> {
       provider,
       ctx: schedulerCtx,
       reapOnStart: false,
+      // 无 key 时 tick 返回 no-key：任务留在 queued，不写 run/事件。
+      getApiKey: () => getEffectiveApiKey(db),
     });
     const app = createApp({
       db,
       scheduler,
       mainAi: { provider },
+      // 生产装配显式开启：无 key 时 /chat 直接 503，而不是把空 key 交给 provider。
+      requireApiKey: true,
     });
+
+    if (startupApiKey === null) {
+      logWarn('未配置 API Key：对话与任务执行不可用，请在设置中配置', {
+        ai: 'disabled',
+      });
+    }
 
     let shuttingDown = false;
     const shutdown = async (signal: string): Promise<void> => {
@@ -181,6 +204,7 @@ async function main(): Promise<void> {
       url: `http://${DEFAULT_HOST}:${String(config.port)}`,
       db: config.dbPath,
       workspace,
+      ai: startupApiKey === null ? 'disabled' : 'enabled',
     });
   } catch (error) {
     db.close();
