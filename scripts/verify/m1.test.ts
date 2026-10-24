@@ -8,7 +8,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { ContractError, ERROR_CODES } from "../../src/core/errors.ts";
 import { foldEvents } from "../../src/core/fold.ts";
 import type { EventActor, EventType, JsonValue, TaskEvent } from "../../src/core/types.ts";
-import { openDatabase } from "../../src/store/migrate.ts";
+import { getArtifact, insertArtifact, searchArtifacts, updateArtifactSummary } from "../../src/store/artifacts.ts";
+import { migrate, openDatabase } from "../../src/store/migrate.ts";
 import { appendEvent, listEvents } from "../../src/store/events.ts";
 import { insertTask } from "../../src/store/repo.ts";
 import {
@@ -291,4 +292,207 @@ test("M1-01 空流、缺 task.created 与终态后活动事件均拒绝", () => 
     isInvalidTransition,
     "终态之后不应再接受活动事件",
   );
+});
+
+// ── M1-02 产物写入与 FTS 索引验收 ────────────────────────────────
+
+function makeTask(db: DatabaseSync): string {
+  return insertTask(db, { title: "产物检索任务", goal: "g", workspace: "C:/ws" }).id;
+}
+
+test("M1-02 中文标题/摘要写入后按中文关键词命中并带 snippet", () => {
+  withTempDb((db) => {
+    const taskId = makeTask(db);
+    const artifact = insertArtifact(db, {
+      taskId,
+      kind: "note",
+      title: "月度销售分析",
+      summary: "华东区环比增长 12%",
+      tags: ["销售", "月报"],
+      findings: ["环比由负转正"],
+    });
+
+    assert.ok(artifact.id.startsWith("a_"), `期望产物 ID 以 a_ 开头，实际 ${artifact.id}`);
+    assert.equal(artifact.title, "月度销售分析", "标题读回不一致");
+    assert.deepEqual(artifact.tags, ["销售", "月报"], "tags 应按 JSON 数组读回");
+    assert.deepEqual(artifact.findings, ["环比由负转正"], "findings 应按 JSON 数组读回");
+
+    // 2 字中文走短查询退化路径：trigram 的 MATCH 要求 >=3 字。
+    const shortHits = searchArtifacts(db, "环比", 10);
+    assert.equal(shortHits.length, 1, `期望“环比”命中 1 条，实际 ${shortHits.length}`);
+    assert.equal(shortHits[0]!.id, artifact.id, "短查询命中的产物 ID 不符");
+    assert.ok(shortHits[0]!.snippet.includes("环比"), `snippet 应含命中词，实际 ${shortHits[0]!.snippet}`);
+    assert.ok(shortHits[0]!.snippet.includes("[环比]"), `snippet 应高亮命中词，实际 ${shortHits[0]!.snippet}`);
+
+    // >=3 字走 FTS5 MATCH + bm25 + snippet()。
+    const ftsHits = searchArtifacts(db, "环比增长", 10);
+    assert.equal(ftsHits.length, 1, `期望“环比增长”命中 1 条，实际 ${ftsHits.length}`);
+    assert.ok(ftsHits[0]!.snippet.includes("[环比增长]"), `snippet 应高亮 FTS 命中词，实际 ${ftsHits[0]!.snippet}`);
+    assert.ok(ftsHits[0]!.score < 0, `bm25 应为负分，实际 ${ftsHits[0]!.score}`);
+
+    // tags / findings 也进入索引。
+    assert.equal(searchArtifacts(db, "月报").length, 1, "tags 中的中文应可检索");
+    assert.equal(searchArtifacts(db, "由负转正").length, 1, "findings 中的中文应可检索");
+  });
+});
+
+test("M1-02 不相交关键词不命中，防止假索引或全量返回", () => {
+  withTempDb((db) => {
+    const taskId = makeTask(db);
+    insertArtifact(db, {
+      taskId,
+      kind: "note",
+      title: "月度销售分析",
+      summary: "华东区环比增长 12%",
+    });
+
+    assert.equal(searchArtifacts(db, "量子纠缠").length, 0, "4 字不相交关键词不应命中");
+    assert.equal(searchArtifacts(db, "库存").length, 0, "2 字不相交关键词不应命中");
+    assert.equal(searchArtifacts(db, "环比增长").length, 1, "对照关键词应命中，排除全量返回");
+  });
+});
+
+test("M1-02 更新摘要后旧关键词消失、新关键词命中，并同步 title/tags/findings", () => {
+  withTempDb((db) => {
+    const taskId = makeTask(db);
+    const artifact = insertArtifact(db, {
+      taskId,
+      kind: "note",
+      title: "月度销售分析",
+      summary: "华东区环比增长 12%",
+      tags: ["渠道"],
+      findings: ["环比转正"],
+    });
+
+    const updated = updateArtifactSummary(db, artifact.id, {
+      summary: "华南区同比下降 3%",
+      tags: ["复盘"],
+      findings: ["需求下滑"],
+    });
+    assert.equal(updated.summary, "华南区同比下降 3%", "摘要更新未读回");
+    assert.deepEqual(updated.tags, ["复盘"], "tags 更新未读回");
+    assert.deepEqual(updated.findings, ["需求下滑"], "findings 更新未读回");
+
+    assert.equal(searchArtifacts(db, "环比增长").length, 0, "旧摘要关键词不应再命中");
+    assert.equal(searchArtifacts(db, "渠道").length, 0, "旧 tag 不应再命中");
+    assert.equal(searchArtifacts(db, "同比下降").length, 1, "新摘要关键词应命中");
+    const hits = searchArtifacts(db, "同比下降", 10);
+    assert.ok(hits[0]!.snippet.includes("[同比下降]"), `新关键词 snippet 未高亮，实际 ${hits[0]!.snippet}`);
+
+    // 字符串形式等价于只更新 summary；title 更新也要重建索引。
+    const renamed = updateArtifactSummary(db, artifact.id, { title: "华南区复盘" });
+    assert.equal(renamed.title, "华南区复盘", "标题更新未读回");
+    assert.equal(searchArtifacts(db, "月度销售").length, 0, "旧标题关键词不应再命中");
+    assert.equal(searchArtifacts(db, "华南区复盘").length, 1, "新标题关键词应命中");
+
+    updateArtifactSummary(db, artifact.id, "西北区同比持平");
+    assert.equal(getArtifact(db, artifact.id)?.summary, "西北区同比持平", "字符串 patch 未更新摘要");
+    assert.equal(searchArtifacts(db, "同比下降").length, 0, "被替换的摘要关键词不应再命中");
+    assert.equal(searchArtifacts(db, "同比持平").length, 1, "字符串 patch 的新关键词应命中");
+  });
+});
+
+test("M1-02 多条产物按 bm25 相关性排序且 limit 生效", () => {
+  withTempDb((db) => {
+    const taskId = makeTask(db);
+    const weak = insertArtifact(db, {
+      taskId,
+      kind: "note",
+      title: "周报",
+      summary: "环比增长 1 次",
+    });
+    const strong = insertArtifact(db, {
+      taskId,
+      kind: "note",
+      title: "季度复盘",
+      summary: "环比增长 环比增长 环比增长",
+    });
+
+    const all = searchArtifacts(db, "环比增长", 10);
+    assert.equal(all.length, 2, `期望命中 2 条，实际 ${all.length}`);
+    assert.equal(all[0]!.id, strong.id, "高频命中应排在前面");
+    assert.equal(all[1]!.id, weak.id, "低频命中应排在后面");
+    assert.ok(all[0]!.score <= all[1]!.score, `bm25 应升序，实际 ${all[0]!.score} / ${all[1]!.score}`);
+
+    const limited = searchArtifacts(db, "环比增长", 1);
+    assert.equal(limited.length, 1, `limit=1 期望 1 条，实际 ${limited.length}`);
+    assert.equal(limited[0]!.id, strong.id, "limit 后仍应返回最相关的一条");
+    const optionsLimited = searchArtifacts(db, { query: "环比增长", limit: 1 });
+    assert.equal(optionsLimited.length, 1, "options 形式的 limit 也应生效");
+    assert.equal(optionsLimited[0]!.id, strong.id, "options 形式的排序结果不符");
+    assert.equal(searchArtifacts(db, "环比增长", 0).length, 0, "limit=0 应返回空");
+    assert.equal(searchArtifacts(db, "   ", 5).length, 0, "空查询应返回空");
+  });
+});
+
+test("M1-02 FTS 只索引 title/summary/tags/findings 四列", () => {
+  withTempDb((db) => {
+    const columns = db.prepare("PRAGMA table_info(artifact_fts)").all() as unknown as {
+      name: string;
+    }[];
+    assert.deepEqual(
+      columns.map((column) => column.name),
+      ["title", "summary", "tags", "findings"],
+      "FTS 列应恰好是四个检索字段",
+    );
+
+    const ddl = db
+      .prepare("SELECT sql FROM sqlite_master WHERE name = 'artifact_fts'")
+      .get() as unknown as { sql: string };
+    assert.ok(ddl.sql.includes("content='artifacts'"), "FTS 应为外部内容表");
+    assert.ok(ddl.sql.includes("tokenize='trigram'"), "FTS 必须使用 trigram");
+    assert.ok(!ddl.sql.includes("unicode61"), "禁止使用 unicode61");
+
+    const taskId = makeTask(db);
+    insertArtifact(db, {
+      taskId,
+      kind: "file",
+      title: "月度销售分析",
+      summary: "华东区环比增长 12%",
+      path: "workspace/量子纠缠-正文.txt",
+    });
+    assert.equal(searchArtifacts(db, "量子纠缠").length, 0, "path/正文不应进入 FTS 索引");
+    assert.equal(searchArtifacts(db, "环比增长").length, 1, "四个索引列仍应可检索");
+  });
+});
+
+test("M1-02 迁移可重复执行，FTS 同步不随重复迁移失效", () => {
+  withTempDb((db) => {
+    assert.doesNotThrow(() => migrate(db), "新库再次迁移不应报错");
+    assert.doesNotThrow(() => migrate(db), "连续第三次迁移不应报错");
+    const versions = db
+      .prepare("SELECT COUNT(*) AS n FROM schema_migrations")
+      .get() as unknown as { n: number };
+    assert.equal(versions.n, 1, `迁移版本记录应只有 1 条，实际 ${versions.n}`);
+
+    const taskId = makeTask(db);
+    insertArtifact(db, {
+      taskId,
+      kind: "dataset",
+      title: "月度销售分析",
+      summary: "华东区环比增长 12%",
+    });
+    assert.equal(searchArtifacts(db, "环比增长").length, 1, "重复迁移后 FTS 仍应可用");
+  });
+});
+
+test("M1-02 给不存在的任务插产物抛 E_NOT_FOUND 且不写索引", () => {
+  withTempDb((db) => {
+    assert.throws(
+      () =>
+        insertArtifact(db, {
+          taskId: "t_missing",
+          kind: "note",
+          title: "孤儿产物",
+          summary: "不应写入",
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof ContractError, `期望 ContractError，实际 ${String(err)}`);
+        assert.equal(err.code, ERROR_CODES.E_NOT_FOUND, "错误码应为 E_NOT_FOUND");
+        return true;
+      },
+      "不存在的 task_id 必须被拒绝",
+    );
+    assert.equal(searchArtifacts(db, "孤儿产物").length, 0, "被拒绝的插入不应留下索引");
+  });
 });

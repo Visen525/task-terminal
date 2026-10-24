@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M1-02 标题/摘要写入与 FTS 索引（2026-10-24）
+
+- **FTS 同步选方案 B（应用层双写，migrate.ts 不动）**：产物只有 `store/artifacts.ts` 一个写入口，主表与 `artifact_fts` 放在同一事务里即可保证原子性；不改 `SCHEMA_VERSION`，避免在“v1 DDL 冻结”的前提下引入 v2 升级与旧数据回填风险。代价是绕过 `insertArtifact` 直接 INSERT artifacts 不会自动进索引，因此仓储层约定为唯一写入口。
+- **tags / findings 原样索引 JSON 数组文本**：`artifact_fts` 是 `content='artifacts'` 的外部内容表，索引值必须与主表列值完全一致，`rebuild` 与外部内容 `delete` 才不会失配；因此不做“拼接成空格分隔字符串”的转换，中文仍能被 trigram 切到。
+- **更新先 delete 旧索引值，再改主表、再写新索引**：外部内容 FTS 的 `delete` 命令要求提供索引时的旧列值；三步同事务执行，旧关键词在提交后立即消失，不会出现主表已改、索引仍残留的窗口。
+- **检索按词长分流**：所有词 ≥3 字时走 FTS5 `MATCH`（每个词加引号转义成短语，词间 AND）+ `bm25()` 升序 + `snippet(-1, '[', ']', '…', 32)`；任一词 <3 字时 trigram 无法 MATCH（验收示例“环比”只有 2 字），退化为对 title/summary/tags/findings 四列做 `instr` 过滤并按字段命中加权排序、手工加高亮。两条路径都只碰这四个检索列，正文/path 不参与索引。
+- **verify 仍只用临时目录库**：新增用例全部走 `mkdtemp` + `openDatabase`，不产生 `data/` 残留；迁移健壮性用新库连续调用 `migrate()` 覆盖，未引入触发器，因此 v1→v2 升级用例不适用。
+
 ## M1-01 事件流与 foldEvents（2026-10-23）
 
 - **events 采用方案 A（实现迁到 `store/events.ts`，`repo.ts` re-export）**：事件流是 SSE / runtime 的稳定模块边界，行映射与分页 SQL 放在一起便于独立演进；re-export 保证 M0 的 `repo.appendEvent/listEvents` 调用方零改动，也避免两处实现漂移。
