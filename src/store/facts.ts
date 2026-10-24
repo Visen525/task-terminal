@@ -7,7 +7,8 @@
  *   - 值相同则原地更新 confidence / 来源 / updated_at，不制造重复行。
  * 读语义：
  *   - 只读当前有效记录，按 confidence DESC、updated_at DESC 排序；
- *   - query 对 key/value 做大小写不敏感子串匹配，空 query 返回 topN。
+ *   - query 对 key/value 做大小写不敏感子串匹配，空 query 返回 topN；
+ *   - scope 精确过滤；传 project / project: 时按 project: 前缀过滤项目族。
  *
  * 本模块不写事件：memory.fact_upserted 的编排由主线工具负责。
  */
@@ -50,6 +51,7 @@ export interface UpsertFactInput {
 export interface RecallFactsOptions {
   /** 对 key/value 做大小写不敏感子串匹配；空串/省略返回 topN。 */
   query?: string;
+  /** 精确 scope；project / project: 表示匹配全部 project: 前缀。 */
   scope?: string;
   /** 默认 DEFAULT_RECALL_LIMIT。 */
   limit?: number;
@@ -76,6 +78,14 @@ function normalizeLimit(limit: number | undefined): number {
 function normalizeConfidence(value: number | undefined, fallback: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback;
   return value;
+}
+
+/**
+ * 把用户输入当成字面量做 LIKE 子串匹配：先转义反斜杠，再转义 % 与 _，
+ * 配合 SQL 的 ESCAPE '\'，查询 "100%" 只命中含字面量 "100%" 的事实。
+ */
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, '\\$&');
 }
 
 function parseSourceSeqs(raw: string | null): number[] | null {
@@ -247,7 +257,9 @@ export function upsertFact(db: DatabaseSync, input: UpsertFactInput): Fact {
 
 /**
  * 检索当前有效事实。
- * query 为空（或省略）时按 confidence + 时间返回 topN；scope 精确过滤。
+ * query 为空（或省略）时按 confidence + 时间返回 topN；
+ * query 对 key/value 做字面量模糊匹配（%、_ 不当通配符）；
+ * scope 精确过滤，project / project: 匹配全部项目事实。
  */
 export function recallFacts(
   db: DatabaseSync,
@@ -259,15 +271,21 @@ export function recallFacts(
   const where: string[] = ['superseded_by IS NULL'];
   const params: Array<string | number> = [];
   if (options.scope !== undefined) {
-    where.push('scope = ?');
-    params.push(options.scope);
+    const scope = options.scope.trim();
+    if (scope === 'project' || scope === 'project:') {
+      where.push("scope LIKE 'project:%'");
+    } else {
+      where.push('scope = ?');
+      params.push(scope);
+    }
   }
   const query = options.query?.trim() ?? '';
   if (query.length > 0) {
+    const pattern = `%${escapeLikePattern(query)}%`;
     where.push(
-      '(instr(lower(key), lower(?)) > 0 OR instr(lower(value), lower(?)) > 0)',
+      "(lower(key) LIKE lower(?) ESCAPE '\\' OR lower(value) LIKE lower(?) ESCAPE '\\')",
     );
-    params.push(query, query);
+    params.push(pattern, pattern);
   }
 
   const rows = db

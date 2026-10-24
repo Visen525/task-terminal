@@ -45,7 +45,7 @@ export const DEFAULT_MAIN_HISTORY_TURNS = 12;
 export const DEFAULT_MAIN_MAX_TOOL_ROUNDS = 10;
 
 /**
- * 附录 B 主线系统提示骨架，必须包含 5 条规则。
+ * 附录 B 主线系统提示骨架（5 条）+ M7-02 来源引用硬规则（第 6 条）。
  * M5-02 会在此之上注入长期事实/看板/产物摘要，本卡只做骨架 + 最近历史。
  */
 export const MAIN_SYSTEM_PROMPT = [
@@ -56,6 +56,7 @@ export const MAIN_SYSTEM_PROMPT = [
   '3. 摘要不等于事实。未经 read_artifact 确认的结论，要说明是"根据摘要"。',
   '4. 不确定用户的意图时，先 ask_user，不要猜。',
   '5. 回答用中文，简洁。',
+  '6. 引用任何产物结论时，必须同时给出它的来源任务 ID（source_task_id）；未经 read_artifact 核对的，注明"根据摘要"。',
 ].join('\n');
 
 /** 与子智能体工具表一起导出，便于装配层/测试断言十件套。 */
@@ -107,6 +108,8 @@ export interface RunMainTurnOptions {
   scheduler?: TaskCanceller | null;
   /** create_task 的默认工作区；默认 process.cwd()。 */
   workspace?: string;
+  /** note 产物正文根目录；默认 <cwd>/data/artifacts，测试/装配层可注入。 */
+  artifactsDir?: string;
   /** 可注入时钟（毫秒时间戳）；默认 Date.now。 */
   now?: () => number;
   /** 模型名；默认 MAIN_MODEL。 */
@@ -237,6 +240,7 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
       ? {}
       : { onTaskCreated: options.onTaskCreated }),
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
+    ...(options.artifactsDir === undefined ? {} : { artifactsDir: options.artifactsDir }),
     now: clock,
   };
 

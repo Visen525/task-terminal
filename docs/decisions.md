@@ -2,6 +2,13 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M7-02 长期事实与回访链路（2026-10-29）
+
+- **来源任务同时进搜索与读正文的结构化结果**：`search_artifacts` 每项新增 `source_task_id`（保留既有 `task_id`），`read_artifact` 的 `data` 新增 `source_task_id` 并固定返回 `kind` / `sha256`；note 的 `output` 仍是正文分页，不把元数据混进正文，模型从 `search_artifacts` 结果拿到来源 ID 后再按提示规则引用。主线提示追加第 6 条硬规则：引用产物结论必须带 `source_task_id`，未读原文要注明“根据摘要”。
+- **facts 的 query 从 instr 升级为带 ESCAPE 的 LIKE**：先转义反斜杠再转义 `%` / `_`，查询 `100%` 或 `a_b` 只命中字面量，不会退化成全表匹配；`lower(key/value) LIKE lower(?)` 保留 ASCII 大小写不敏感，排序仍是 `confidence DESC, updated_at DESC`。scope 精确匹配，另支持传 `project` / `project:` 匹配全部 `project:<key>` 事实族。
+- **`runMainTurn` 增加可选 `artifactsDir` 并透传 main-tools**：生产默认 `<cwd>/data/artifacts` 行为不变；验收测试必须用临时目录放 note 正文，否则 read_artifact 会去仓库 data/ 找文件，因此这个注入点是回访链路可测试性的最小缺口。
+- **回访测试按真实调用序断言**：剧本 B 用 `runGuardedLoop + persistArtifacts` 造 completed 任务与 note，再用新 `FakeProvider` 走 `search_artifacts → read_artifact → 文本`；断言工具序列、`read_artifact` 的 `source_task_id/kind/sha256/offset/limit/content`、搜索结果的来源字段，以及最终回复完全来自 provider 剧本。真 API 的语义验证留给 Manager 手测。
+
 ## M7-01 产物落盘与检索（2026-10-28）
 
 - **落盘只挂一个 loop 钩子，且必须排在 task.completed 之前**：`RunLoopOptions.onBeforeComplete` 在 submit_result 校验通过、`agent.tool_result` 写完之后同步调用；`persistArtifacts` 先写全部 `artifact.created`，最后写一条 `summary.generated`，loop 随后才写 `task.completed`。这样 foldEvents 看到的 `artifact.created` / `summary.generated` 都在 running 态，不会触发非法转移；钩子抛错复用既有 `fail('result_invalid')`，事件 payload 与返回值都带 `error_code`，不新增失败原因。

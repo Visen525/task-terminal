@@ -156,11 +156,17 @@ export const MAIN_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: 'recall',
-    description: '按关键词检索当前有效的长期事实；query 为空时返回置信度最高的若干条。',
+    description:
+      '按关键词检索当前有效的长期事实；query 为空时返回置信度最高的若干条。key 与 value 都参与模糊匹配。',
     parameters: {
       type: 'object',
       properties: {
         query: { type: 'string', description: '检索关键词；可为空字符串' },
+        scope: {
+          type: 'string',
+          minLength: 1,
+          description: '作用域过滤，可选；global 或 project:<key>，传 project: 匹配全部项目事实',
+        },
       },
       required: ['query'],
       additionalProperties: false,
@@ -447,6 +453,8 @@ function readArtifact(
   const nextOffset = end < content.length ? end : null;
   const data = {
     artifact_id: artifact.id,
+    // 回访链路必须能从正文回到来源任务：两个字段同值，source_task_id 与提示词对齐。
+    source_task_id: artifact.taskId,
     task_id: artifact.taskId,
     kind: artifact.kind,
     title: artifact.title,
@@ -455,7 +463,7 @@ function readArtifact(
     total_chars: content.length,
     next_offset: nextOffset,
     ...(artifact.path === null ? {} : { path: artifact.path }),
-    ...(artifact.sha256 === null ? {} : { sha256: artifact.sha256 }),
+    sha256: artifact.sha256,
     ...(artifact.bytes === null ? {} : { bytes: artifact.bytes }),
     content: page,
   };
@@ -589,6 +597,7 @@ export async function executeMainTool(
           count: hits.length,
           artifacts: hits.map((hit) => ({
             id: hit.id,
+            source_task_id: hit.taskId,
             task_id: hit.taskId,
             kind: hit.kind,
             title: hit.title,
@@ -613,7 +622,11 @@ export async function executeMainTool(
         if (rawQuery !== undefined && typeof rawQuery !== 'string') {
           return invalid(tool, 'query 必须是字符串');
         }
-        const facts = recallFacts(options.db, { query: rawQuery ?? '' });
+        const scope = optionalString(tool, record, 'scope');
+        const facts = recallFacts(options.db, {
+          query: rawQuery ?? '',
+          ...(scope === undefined ? {} : { scope }),
+        });
         return success(tool, { count: facts.length, facts });
       }
 

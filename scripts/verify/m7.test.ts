@@ -13,6 +13,7 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
 import { persistArtifacts } from "../../src/agent/artifacts.ts";
+import { MAIN_SYSTEM_PROMPT, runMainTurn } from "../../src/agent/main-loop.ts";
 import { executeMainTool, type MainToolOptions } from "../../src/agent/main-tools.ts";
 import type { SubmitResult } from "../../src/agent/result-validator.ts";
 import { ContractError, ERROR_CODES } from "../../src/core/errors.ts";
@@ -20,8 +21,9 @@ import { foldEvents } from "../../src/core/fold.ts";
 import type { LlmToolCall, Task, TaskEvent } from "../../src/core/types.ts";
 import { FakeProvider, type FakeStep } from "../../src/providers/fake.ts";
 import { runGuardedLoop, type GuardedLoopTask } from "../../src/runtime/watchdog.ts";
-import { insertArtifact } from "../../src/store/artifacts.ts";
+import { insertArtifact, type Artifact } from "../../src/store/artifacts.ts";
 import { appendEvent, listEvents } from "../../src/store/events.ts";
+import { recallFacts, upsertFact } from "../../src/store/facts.ts";
 import { openDatabase } from "../../src/store/migrate.ts";
 import { insertTask } from "../../src/store/repo.ts";
 import { searchArtifactsRanked } from "../../src/store/search.ts";
@@ -646,4 +648,349 @@ test("M7-01 scheduler 接线：调度路径真实落盘产物（Manager 补接�
   const evTypes = (db.prepare("SELECT type FROM events WHERE task_id=? ORDER BY seq").all(t.id) as { type: string }[]).map(r => r.type);
   assert.ok(evTypes.includes("artifact.created"), "应有 artifact.created 事件");
   assert.ok(evTypes.indexOf("summary.generated") < evTypes.indexOf("task.completed"), "summary.generated 应在 task.completed 之前");
+});
+
+// ════════════════════════════════════════════════════════════════
+// M7-02 主线提示：引用产物必须带来源任务
+// ════════════════════════════════════════════════════════════════
+
+test("M7-02 主线提示：含 source_task_id 来源引用硬规则", () => {
+  assert.match(MAIN_SYSTEM_PROMPT, /引用任何产物结论/u);
+  assert.match(MAIN_SYSTEM_PROMPT, /source_task_id/u);
+  assert.match(MAIN_SYSTEM_PROMPT, /根据摘要/u);
+});
+
+// ════════════════════════════════════════════════════════════════
+// M7-02 剧本 C：版本链（三次 remember）
+// ════════════════════════════════════════════════════════════════
+
+test("M7-02 版本链：同 key 三次 remember 只最新有效，superseded_by 逐级指向", async () => {
+  await withFixture(async (fixture) => {
+    const options: MainToolOptions = {
+      db: fixture.db,
+      workspace: fixture.workspace,
+      now: () => FIXED_NOW,
+    };
+    const values = ["先说重点", "先给结论再展开", "结论先行，简洁中文"];
+    for (const [index, value] of values.entries()) {
+      const result = await executeMainTool(
+        "remember",
+        { key: "回答风格", value, scope: "global" },
+        options,
+      );
+      assert.equal(result.ok, true, `第 ${index + 1} 次 remember 应成功`);
+    }
+
+    const rows = fixture.db
+      .prepare(
+        "SELECT id, value, superseded_by FROM memory_facts WHERE scope = ? AND key = ? ORDER BY rowid ASC",
+      )
+      .all("global", "回答风格") as unknown as Array<{
+      id: string;
+      value: string;
+      superseded_by: string | null;
+    }>;
+    assert.equal(rows.length, 3, "三次不同值的 remember 应留下三行版本链");
+    assert.deepEqual(
+      rows.map((row) => row.value),
+      values,
+    );
+    assert.equal(rows[0]?.superseded_by, rows[1]?.id, "旧记录 1 必须指向记录 2");
+    assert.equal(rows[1]?.superseded_by, rows[2]?.id, "旧记录 2 必须指向记录 3");
+    assert.equal(rows[2]?.superseded_by, null, "最新记录必须保持有效");
+
+    const effective = recallFacts(fixture.db, { query: "回答风格" });
+    assert.equal(effective.length, 1, "recall 只能返回当前有效记录");
+    assert.equal(effective[0]?.id, rows[2]?.id);
+    assert.equal(effective[0]?.value, values[2]);
+
+    const memoryEvents = listEvents(fixture.db, { limit: 100 }).filter(
+      (event) => event.type === "memory.fact_upserted",
+    );
+    assert.equal(memoryEvents.length, 3, "每次 remember 都应留一条事实事件");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════
+// M7-02 facts 检索：key/value 模糊 + %_ 转义 + scope 过滤
+// ════════════════════════════════════════════════════════════════
+
+test("M7-02 recallFacts：query 模糊命中 key/value，%_ 转义，scope 支持 global/project 前缀", async () => {
+  await withFixture(async (fixture) => {
+    const keyHit = upsertFact(fixture.db, {
+      key: "用户偏好",
+      value: "喜欢中文简洁回答",
+      confidence: 0.9,
+      now: FIXED_NOW,
+    });
+    const valueHit = upsertFact(fixture.db, {
+      key: "输出格式",
+      value: "偏好表格",
+      now: FIXED_NOW + 1_000,
+    });
+    const projectHit = upsertFact(fixture.db, {
+      key: "部署偏好",
+      value: "pnpm",
+      scope: "project:alpha",
+      now: FIXED_NOW + 2_000,
+    });
+    const percentHit = upsertFact(fixture.db, {
+      key: "进度 100%",
+      value: "正常",
+      scope: "project:beta",
+      now: FIXED_NOW + 3_000,
+    });
+    const underscoreHit = upsertFact(fixture.db, {
+      key: "a_b",
+      value: "下划线",
+      now: FIXED_NOW + 4_000,
+    });
+
+    // key=用户偏好 与 value 含“偏好”的各命中一条；按 confidence + 时间排序。
+    const fuzzy = recallFacts(fixture.db, { query: "偏好" });
+    assert.deepEqual(
+      fuzzy.map((fact) => fact.id),
+      [keyHit.id, projectHit.id, valueHit.id],
+    );
+
+    assert.deepEqual(
+      recallFacts(fixture.db, { query: "偏好", scope: "global" }).map((fact) => fact.id),
+      [keyHit.id, valueHit.id],
+      "scope=global 只返回全局事实",
+    );
+    assert.deepEqual(
+      recallFacts(fixture.db, { query: "偏好", scope: "project:alpha" }).map(
+        (fact) => fact.id,
+      ),
+      [projectHit.id],
+      "project:<key> 精确命中该项目",
+    );
+    assert.deepEqual(
+      recallFacts(fixture.db, { query: "偏好", scope: "project:" }).map((fact) => fact.id),
+      [projectHit.id],
+      "project: 前缀命中项目族",
+    );
+
+    // % 与 _ 是用户输入的字面量，不能当 SQL LIKE 通配符。
+    assert.deepEqual(
+      recallFacts(fixture.db, { query: "%" }).map((fact) => fact.id),
+      [percentHit.id],
+      "% 只应命中字面量百分号",
+    );
+    assert.deepEqual(
+      recallFacts(fixture.db, { query: "_" }).map((fact) => fact.id),
+      [underscoreHit.id],
+      "_ 只应命中字面量下划线",
+    );
+    assert.deepEqual(recallFacts(fixture.db, { query: "不存在" }), []);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════
+// M7-02 剧本 A：remember → 新会话 recall + prompt 注入
+// ════════════════════════════════════════════════════════════════
+
+test("M7-02 剧本 A：主线程 remember 后新会话 recall 命中且事实注入 prompt", async () => {
+  await withFixture(async (fixture) => {
+    const firstProvider = new FakeProvider([
+      {
+        toolCalls: [
+          loopCall("call_remember_pref", "remember", {
+            key: "用户偏好",
+            value: "喜欢中文简洁回答",
+          }),
+        ],
+      },
+      { content: "记住了：你喜欢中文简洁回答。" },
+    ]);
+    const firstResult = await runMainTurn({
+      db: fixture.db,
+      provider: firstProvider,
+      userMessage: "记住我喜欢中文简洁回答",
+      workspace: fixture.workspace,
+      artifactsDir: fixture.artifactsDir,
+      now: () => FIXED_NOW,
+    });
+    assert.equal(firstResult.reply, "记住了：你喜欢中文简洁回答。");
+    assert.deepEqual(
+      firstResult.toolTrace.map((entry) => entry.tool),
+      ["remember"],
+    );
+
+    // 新会话 = 新 provider（calls 从空开始），同一长期事实库。
+    const secondProvider = new FakeProvider([
+      {
+        toolCalls: [loopCall("call_recall_pref", "recall", { query: "偏好" })],
+      },
+      { content: "你偏好中文简洁回答。" },
+    ]);
+    assert.equal(secondProvider.calls.length, 0, "新会话不应带旧 provider 调用记录");
+
+    const secondResult = await runMainTurn({
+      db: fixture.db,
+      provider: secondProvider,
+      userMessage: "我的回答偏好是什么？",
+      workspace: fixture.workspace,
+      artifactsDir: fixture.artifactsDir,
+      now: () => FIXED_NOW,
+    });
+    assert.equal(secondResult.reply, "你偏好中文简洁回答。");
+    assert.deepEqual(
+      secondResult.toolTrace.map((entry) => entry.tool),
+      ["recall"],
+    );
+    assert.equal(secondResult.toolTrace[0]?.ok, true);
+    assert.match(secondResult.toolTrace[0]?.output ?? "", /用户偏好/u);
+    assert.match(secondResult.toolTrace[0]?.output ?? "", /喜欢中文简洁回答/u);
+
+    // recall 工具结果回喂给模型（第 2 次 provider 调用的最后一条消息）。
+    const recallToolMessage = secondProvider.calls[1]?.messages.at(-1);
+    assert.equal(recallToolMessage?.role, "tool");
+    assert.match(recallToolMessage?.content ?? "", /用户偏好/u);
+    assert.match(recallToolMessage?.content ?? "", /喜欢中文简洁回答/u);
+
+    // 新会话首次 provider 调用的 system prompt 已注入长期事实块。
+    const system = secondProvider.calls[0]?.messages[0];
+    assert.equal(system?.role, "system");
+    assert.match(system?.content ?? "", /## 长期事实/u);
+    assert.match(system?.content ?? "", /用户偏好/u);
+    assert.match(system?.content ?? "", /喜欢中文简洁回答/u);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════
+// M7-02 剧本 B：完成任务落盘 → 新对话 search → read → 回答
+// ════════════════════════════════════════════════════════════════
+
+test("M7-02 剧本 B：回访检索命中并读原文，read_artifact 带 source_task_id/kind/sha256", async () => {
+  await withFixture(async (fixture) => {
+    const task = makeTask(fixture);
+    let noteArtifact: Artifact | null = null;
+    const producer = new FakeProvider([
+      {
+        toolCalls: [
+          loopCall("call_submit_revisit", "submit_result", {
+            summary: "季度分析完成",
+            findings: ["营收环比增长 12%"],
+            artifacts: [
+              {
+                kind: "note",
+                title: "季度分析结论",
+                summary: "营收环比增长 12%，主要来自企业客户",
+                tags: ["季度", "分析"],
+              },
+            ],
+          }),
+        ],
+      },
+    ]);
+    const outcome = await runGuardedLoop({
+      task: toLoopTask(task),
+      db: fixture.db,
+      provider: producer,
+      runId: RUN_ID,
+      limits: { maxSteps: 10 },
+      now: () => FIXED_NOW,
+      ctx: { outputDir: join(fixture.base, "outputs") },
+      onBeforeComplete: (result) => {
+        const persisted = persistArtifacts(fixture.db, {
+          taskId: task.id,
+          runId: RUN_ID,
+          workspace: fixture.workspace,
+          result,
+          now: FIXED_NOW,
+          artifactsDir: fixture.artifactsDir,
+        });
+        noteArtifact = persisted.find((artifact) => artifact.kind === "note") ?? null;
+      },
+    });
+    assert.equal(outcome.status, "completed");
+    assert.ok(noteArtifact !== null, "完成任务应落盘 note 产物");
+    const note = noteArtifact as Artifact;
+    assert.ok(note.path !== null);
+    const noteText = readFileSync(noteFileOf(fixture.artifactsDir, note.path), "utf8");
+
+    const finalReply =
+      `来源任务 ${task.id}（source_task_id: ${task.id}）：` +
+      "上次分析的结论是营收环比增长 12%。";
+    const revisit = new FakeProvider([
+      {
+        toolCalls: [
+          loopCall("call_search_revisit", "search_artifacts", { query: "环比增长" }),
+        ],
+      },
+      {
+        toolCalls: [
+          loopCall("call_read_revisit", "read_artifact", {
+            artifact_id: note.id,
+            offset: 0,
+            limit: 10,
+          }),
+        ],
+      },
+      { content: finalReply },
+    ]);
+    const result = await runMainTurn({
+      db: fixture.db,
+      provider: revisit,
+      userMessage: "上次那份分析的环比结论是什么",
+      workspace: fixture.workspace,
+      artifactsDir: fixture.artifactsDir,
+      now: () => FIXED_NOW,
+    });
+
+    assert.deepEqual(
+      result.toolTrace.map((entry) => entry.tool),
+      ["search_artifacts", "read_artifact"],
+      "回访工具调用序列必须是 search → read",
+    );
+    assert.equal(result.reply, finalReply, "最终回复由剧本 provider 给出");
+
+    // 检索结果把来源任务回喂给模型（第 2 次 provider 调用）。
+    const searchToolMessage = revisit.calls[1]?.messages.at(-1);
+    assert.equal(searchToolMessage?.role, "tool");
+    assert.match(searchToolMessage?.content ?? "", /季度分析结论/u);
+    assert.match(searchToolMessage?.content ?? "", new RegExp(task.id, "u"));
+
+    // 读正文：note 分页输出仍是正文页（第 3 次 provider 调用）。
+    const readToolMessage = revisit.calls[2]?.messages.at(-1);
+    assert.equal(readToolMessage?.role, "tool");
+    assert.equal(readToolMessage?.content, noteText.slice(0, 10));
+
+    const options: MainToolOptions = {
+      db: fixture.db,
+      workspace: fixture.workspace,
+      artifactsDir: fixture.artifactsDir,
+    };
+    const read = await executeMainTool(
+      "read_artifact",
+      { artifact_id: note.id, offset: 0, limit: 10 },
+      options,
+    );
+    assert.equal(read.ok, true);
+    const readData = read.data as Record<string, unknown>;
+    assert.equal(readData.source_task_id, task.id, "read_artifact 必须返回来源任务");
+    assert.equal(readData.task_id, task.id);
+    assert.equal(readData.kind, "note");
+    assert.equal(readData.sha256, note.sha256);
+    assert.equal(readData.offset, 0);
+    assert.equal(readData.limit, 10);
+    assert.equal(readData.content, noteText.slice(0, 10));
+    assert.equal(read.output, noteText.slice(0, 10));
+
+    const searched = await executeMainTool(
+      "search_artifacts",
+      { query: "环比增长" },
+      options,
+    );
+    assert.equal(searched.ok, true);
+    const searchData = searched.data as {
+      count: number;
+      artifacts: Array<Record<string, unknown>>;
+    };
+    const hit = searchData.artifacts.find((artifact) => artifact.id === note.id);
+    assert.ok(hit !== undefined, "检索应命中刚落盘的 note");
+    assert.equal(hit.source_task_id, task.id);
+    assert.equal(hit.task_id, task.id);
+  });
 });
