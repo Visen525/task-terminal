@@ -398,6 +398,63 @@ function searchShortQuery(db: DatabaseSync, tokens: string[], limit: number): Ar
   });
 }
 
+/** 浏览模式分页选项（M11-03）：kind 可选，limit 钳 1–100，offset 不得为负。 */
+export interface ListArtifactsOptions {
+  limit?: number;
+  offset?: number;
+  kind?: ArtifactKind;
+}
+
+export interface ArtifactListPage {
+  total: number;
+  items: Artifact[];
+}
+
+export const DEFAULT_LIST_LIMIT = 50;
+export const MAX_LIST_LIMIT = 100;
+
+function clampListLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIST_LIMIT;
+  return Math.min(MAX_LIST_LIMIT, Math.max(1, Math.floor(limit)));
+}
+
+function clampListOffset(offset: number | undefined): number {
+  if (offset === undefined || !Number.isFinite(offset) || offset < 0) return 0;
+  return Math.floor(offset);
+}
+
+/**
+ * 浏览产物：created_at 倒序（同时间用 rowid 兜底保证稳定），支持 kind 过滤与
+ * limit/offset 分页；total 是过滤后的总条数，不受分页影响。
+ */
+export function listArtifacts(
+  db: DatabaseSync,
+  options: ListArtifactsOptions = {},
+): ArtifactListPage {
+  const limit = clampListLimit(options.limit);
+  const offset = clampListOffset(options.offset);
+  const params: Array<string | number> = [];
+  let where = '';
+  if (options.kind !== undefined) {
+    where = ' WHERE a.kind = ?';
+    params.push(options.kind);
+  }
+
+  const totalRow = db
+    .prepare(`SELECT COUNT(*) AS count FROM artifacts AS a${where}`)
+    .get(...params) as unknown as { count: number | bigint } | undefined;
+  const rows = db
+    .prepare(
+      `SELECT ${ARTIFACT_COLUMNS}
+         FROM artifacts AS a${where}
+        ORDER BY a.created_at DESC, a.rowid DESC
+        LIMIT ? OFFSET ?`,
+    )
+    .all(...params, limit, offset) as unknown as ArtifactRow[];
+
+  return { total: Number(totalRow?.count ?? 0), items: rows.map(mapArtifact) };
+}
+
 function makeSnippet(artifact: Artifact, tokens: string[]): string {
   const fields = [
     artifact.title,

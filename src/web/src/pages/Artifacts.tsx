@@ -1,10 +1,10 @@
 /**
- * 产物库（M6-03）：搜索 + 结果卡片 + 详情抽屉。
+ * 产物库（M11-03）：默认浏览全部产物 + kind 筛选 + 服务端分页，搜索是可选过滤。
  *
- * 列表只展示 title / summary / tags / trust / 来源任务 / 时间；点开卡片后
+ * 卡片只展示 title / summary / tags / trust / 来源任务 / 时间；点开卡片后
  * 才 GET /artifacts/:id 拉单产物详情。正文落盘是 M7-01 的事，本页不读取正文。
  */
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -12,6 +12,8 @@ import {
   Drawer,
   Empty,
   Input,
+  Pagination,
+  Segmented,
   Space,
   Spin,
   Tag,
@@ -23,9 +25,14 @@ import EmptyState from "../components/EmptyState";
 import PageHeader from "../components/PageHeader";
 import {
   getArtifact,
+  listArtifacts,
   searchArtifacts,
   type Artifact,
+  type ArtifactBrowseResult,
   type ArtifactHit,
+  type ArtifactKind,
+  type ArtifactMode,
+  type ArtifactSearchResult,
   type ArtifactTrust,
 } from "../artifactApi";
 
@@ -44,6 +51,18 @@ const TRUST_META: Record<ArtifactTrust, TrustMeta> = {
   verified: { label: "已验证", color: "success" },
   failed: { label: "验证失败", color: "error" },
 };
+
+const PAGE_SIZE = 24;
+
+type KindFilter = ArtifactKind | "all";
+
+const KIND_OPTIONS: Array<{ value: KindFilter; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "file", label: "文件" },
+  { value: "note", label: "笔记" },
+  { value: "dataset", label: "数据集" },
+  { value: "patch", label: "补丁" },
+];
 
 const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   year: "numeric",
@@ -72,11 +91,18 @@ function TrustTag({ trust }: { trust: ArtifactTrust }) {
 }
 
 export default function Artifacts({ onOpenTask }: ArtifactsProps) {
+  /** 单一模式开关：browse=默认全量浏览，search=带 query 的检索结果。 */
+  const [mode, setMode] = useState<ArtifactMode>("browse");
   const [query, setQuery] = useState("");
-  const [results, setResults] = useState<ArtifactHit[]>([]);
-  const [searched, setSearched] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [activeQuery, setActiveQuery] = useState("");
+  const [kind, setKind] = useState<KindFilter>("all");
+  const [page, setPage] = useState(1);
+
+  const [browse, setBrowse] = useState<ArtifactBrowseResult | null>(null);
+  const [search, setSearch] = useState<ArtifactSearchResult | null>(null);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
 
   const [selected, setSelected] = useState<Artifact | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -84,20 +110,75 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
   const [detailError, setDetailError] = useState<string | null>(null);
   /** 防止快速点开另一张卡片时，先发出的详情响应覆盖后选的卡片。 */
   const detailRequestRef = useRef(0);
+  /** 浏览/搜索各自用递增请求号丢弃过期响应，避免模式切换时串台。 */
+  const browseRequestRef = useRef(0);
+  const searchRequestRef = useRef(0);
 
-  const runSearch = useCallback(async (raw: string): Promise<void> => {
+  useEffect(() => {
+    if (mode !== "browse") return;
+    const requestId = browseRequestRef.current + 1;
+    browseRequestRef.current = requestId;
     setLoading(true);
     setError(null);
-    setSearched(true);
+
+    const offset = (page - 1) * PAGE_SIZE;
+    listArtifacts({
+      limit: PAGE_SIZE,
+      offset,
+      ...(kind === "all" ? {} : { kind }),
+    })
+      .then((result) => {
+        if (browseRequestRef.current !== requestId) return;
+        setBrowse(result);
+      })
+      .catch((loadError: unknown) => {
+        if (browseRequestRef.current !== requestId) return;
+        setBrowse(null);
+        setError(loadError instanceof Error ? loadError.message : String(loadError));
+      })
+      .finally(() => {
+        if (browseRequestRef.current === requestId) setLoading(false);
+      });
+  }, [mode, kind, page, reloadToken]);
+
+  const backToBrowse = useCallback((): void => {
+    // 取消可能仍在途的搜索响应；切回浏览时 effect 会重新拉全量。
+    searchRequestRef.current += 1;
+    setMode("browse");
+    setActiveQuery("");
+    setQuery("");
+    setKind("all");
+    setPage(1);
+    setError(null);
+    setReloadToken((token) => token + 1);
+  }, []);
+
+  const runSearch = useCallback(async (raw: string): Promise<void> => {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) {
+      backToBrowse();
+      return;
+    }
+
+    // 丢弃在途的浏览响应，避免它把 loading 提前关掉。
+    browseRequestRef.current += 1;
+    const requestId = searchRequestRef.current + 1;
+    searchRequestRef.current = requestId;
+    setMode("search");
+    setActiveQuery(trimmed);
+    setLoading(true);
+    setError(null);
     try {
-      setResults(await searchArtifacts(raw, 30));
+      const result = await searchArtifacts(trimmed, 50);
+      if (searchRequestRef.current === requestId) setSearch(result);
     } catch (searchError) {
-      setResults([]);
+      if (searchRequestRef.current !== requestId) return;
+      setSearch(null);
       setError(searchError instanceof Error ? searchError.message : String(searchError));
     } finally {
-      setLoading(false);
+      if (searchRequestRef.current === requestId) setLoading(false);
     }
-  }, []);
+  }, [backToBrowse]);
 
   const openDetail = useCallback(async (hit: Artifact): Promise<void> => {
     const requestId = detailRequestRef.current + 1;
@@ -127,12 +208,75 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
     setDetailError(null);
   };
 
+  const retry = (): void => {
+    if (mode === "search") {
+      void runSearch(activeQuery);
+    } else {
+      setReloadToken((token) => token + 1);
+    }
+  };
+
+  const items: Artifact[] =
+    mode === "browse" ? (browse?.items ?? []) : (search?.items ?? []);
+  const total = mode === "browse" ? (browse?.total ?? 0) : (search?.total ?? 0);
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  const cards = items.map((artifact: Artifact) => (
+    <Card
+      key={artifact.id}
+      className="artifact-card"
+      hoverable
+      onClick={() => {
+        void openDetail(artifact);
+      }}
+      extra={<TrustTag trust={artifact.trust} />}
+      title={
+        <Typography.Text strong ellipsis={{ tooltip: artifact.title }}>
+          {artifact.title}
+        </Typography.Text>
+      }
+      styles={{ body: { display: "flex", flexDirection: "column", gap: 10 } }}
+    >
+      <Typography.Paragraph
+        type="secondary"
+        ellipsis={{ rows: 3 }}
+        className="artifact-summary"
+      >
+        {artifact.summary}
+      </Typography.Paragraph>
+
+      {artifact.tags.length > 0 ? (
+        <Space size={[0, 6]} wrap>
+          {artifact.tags.map((tag) => (
+            <Tag key={tag} className="soft-tag">
+              {tag}
+            </Tag>
+          ))}
+        </Space>
+      ) : (
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          无标签
+        </Typography.Text>
+      )}
+
+      <div className="artifact-footer">
+        <span>
+          来源任务{" "}
+          <Typography.Text code title={artifact.taskId}>
+            {shortId(artifact.taskId)}
+          </Typography.Text>
+        </span>
+        <span>{formatTime(artifact.createdAt)}</span>
+      </div>
+    </Card>
+  ));
+
   return (
     <>
       <PageHeader
         eyebrow="Artifacts"
         title="产物库"
-        subtitle="按关键词检索产物摘要、标签与发现；点卡片查看详情。"
+        subtitle="浏览全部产物并按类型筛选；需要时再用关键词搜索。"
       />
 
       <div className="artifact-search">
@@ -141,7 +285,7 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
           allowClear
           prefix={<SearchOutlined />}
           value={query}
-          placeholder="输入关键词，例如：月度分析、环比、CSV"
+          placeholder="搜索产物（留空即浏览全部）"
           onChange={(event) => {
             setQuery(event.target.value);
           }}
@@ -168,15 +312,10 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
           <Alert
             type="error"
             showIcon
-            message="产物检索失败"
+            message={mode === "search" ? "产物检索失败" : "产物加载失败"}
             description={error}
             action={
-              <Button
-                size="small"
-                onClick={() => {
-                  void runSearch(query);
-                }}
-              >
+              <Button size="small" onClick={retry}>
                 重试
               </Button>
             }
@@ -188,73 +327,112 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
           <div style={{ display: "flex", justifyContent: "center", padding: "72px 0" }}>
             <Space size={10} style={{ color: "var(--tt-text-secondary)" }}>
               <Spin />
-              <span>检索中…</span>
+              <span>{mode === "search" ? "检索中…" : "加载产物…"}</span>
             </Space>
           </div>
-        ) : error !== null ? null : !searched ? (
-          <EmptyState
-            icon={<FolderOpenOutlined />}
-            title="开始检索产物"
-            description="输入关键词后回车或点「搜索」，从摘要、标签与发现中查找产物。"
-          />
-        ) : results.length === 0 ? (
-          <EmptyState
-            icon={<SearchOutlined />}
-            title="没有匹配的产物"
-            description={`没有命中「${query.trim()}」的产物，换个关键词试试。`}
-          />
+        ) : error !== null ? null : mode === "search" ? (
+          <>
+            <div
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                flexWrap: "wrap",
+                marginBottom: 16,
+                padding: "3px 6px 3px 12px",
+                border: "1px solid var(--tt-border)",
+                borderRadius: 999,
+                background: "var(--tt-surface)",
+                fontSize: 13,
+                color: "var(--tt-text-secondary)",
+              }}
+            >
+              <span>
+                搜索 “{activeQuery}” · {total} 条
+              </span>
+              <Button type="link" size="small" onClick={backToBrowse}>
+                清除，返回全部
+              </Button>
+            </div>
+
+            {items.length === 0 ? (
+              <EmptyState
+                icon={<SearchOutlined />}
+                title="没有匹配的产物"
+                description={`没有命中「${activeQuery}」的产物，换个关键词试试，或清除搜索查看全部。`}
+              />
+            ) : (
+              <div className="artifact-grid">{cards}</div>
+            )}
+          </>
         ) : (
-          <div className="artifact-grid">
-            {results.map((artifact) => (
-              <Card
-                key={artifact.id}
-                className="artifact-card"
-                hoverable
-                onClick={() => {
-                  void openDetail(artifact);
+          <>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                flexWrap: "wrap",
+                marginBottom: 16,
+              }}
+            >
+              <Segmented
+                value={kind}
+                options={KIND_OPTIONS}
+                onChange={(value) => {
+                  const next =
+                    KIND_OPTIONS.find((option) => option.value === value)?.value ?? "all";
+                  setKind(next);
+                  setPage(1);
                 }}
-                extra={<TrustTag trust={artifact.trust} />}
-                title={
-                  <Typography.Text strong ellipsis={{ tooltip: artifact.title }}>
-                    {artifact.title}
-                  </Typography.Text>
+              />
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                共 {total} 个产物
+              </Typography.Text>
+            </div>
+
+            {items.length === 0 ? (
+              <EmptyState
+                icon={<FolderOpenOutlined />}
+                title={kind === "all" ? "还没有产物" : "该类型下暂无产物"}
+                description={
+                  kind === "all"
+                    ? "任务产出的文件与结论会沉淀在这里。"
+                    : "换个类型筛选，或切回「全部」查看所有产物。"
                 }
-                styles={{ body: { display: "flex", flexDirection: "column", gap: 10 } }}
-              >
-                <Typography.Paragraph
-                  type="secondary"
-                  ellipsis={{ rows: 3 }}
-                  className="artifact-summary"
+              />
+            ) : (
+              <>
+                <div className="artifact-grid">{cards}</div>
+
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    flexWrap: "wrap",
+                    marginTop: 20,
+                    fontSize: 12,
+                    color: "var(--tt-text-tertiary)",
+                  }}
                 >
-                  {artifact.summary}
-                </Typography.Paragraph>
-
-                {artifact.tags.length > 0 ? (
-                  <Space size={[0, 6]} wrap>
-                    {artifact.tags.map((tag) => (
-                      <Tag key={tag} className="soft-tag">
-                        {tag}
-                      </Tag>
-                    ))}
-                  </Space>
-                ) : (
-                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    无标签
-                  </Typography.Text>
-                )}
-
-                <div className="artifact-footer">
                   <span>
-                    来源任务{" "}
-                    <Typography.Text code title={artifact.taskId}>
-                      {shortId(artifact.taskId)}
-                    </Typography.Text>
+                    第 {page} / {totalPages} 页 · 共 {total} 条
                   </span>
-                  <span>{formatTime(artifact.createdAt)}</span>
+                  <Pagination
+                    size="small"
+                    current={page}
+                    pageSize={PAGE_SIZE}
+                    total={total}
+                    showSizeChanger={false}
+                    onChange={setPage}
+                  />
                 </div>
-              </Card>
-            ))}
-          </div>
+              </>
+            )}
+          </>
         )}
       </div>
 

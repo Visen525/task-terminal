@@ -36,7 +36,13 @@ import type { LlmProvider } from '../providers/types.ts';
 import { cancelTask, createTask, retryTask } from '../runtime/ops.ts';
 import type { Scheduler } from '../runtime/scheduler.ts';
 import { getLocalDayRange } from '../runtime/watchdog.ts';
-import { getArtifact, searchArtifacts } from '../store/artifacts.ts';
+import {
+  ARTIFACT_KINDS,
+  getArtifact,
+  listArtifacts,
+  searchArtifacts,
+  type ArtifactKind,
+} from '../store/artifacts.ts';
 import { deleteFact, listFacts } from '../store/facts.ts';
 import { listEvents, type ListEventsOptions } from '../store/events.ts';
 import { getDailyUsage } from '../store/llm-calls.ts';
@@ -210,6 +216,15 @@ function parseOptionalStatus(raw: unknown): Task['status'] | undefined {
     invalid(`status 必须是 ${TASK_STATUSES.join('|')} 之一`);
   }
   return raw as Task['status'];
+}
+
+/** 产物 kind 过滤参数：缺省不过滤，非法值 400。 */
+function parseOptionalArtifactKind(raw: unknown): ArtifactKind | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !(ARTIFACT_KINDS as readonly string[]).includes(raw)) {
+    invalid(`kind 必须是 ${ARTIFACT_KINDS.join('|')} 之一`);
+  }
+  return raw as ArtifactKind;
 }
 
 /** 布尔 query 参数：空串/true/1 为真，false/0 为假；其余一律 400。 */
@@ -493,8 +508,21 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     if (rawQuery !== undefined && typeof rawQuery !== 'string') {
       invalid('query 必须是字符串');
     }
+
+    // 空白 query 与缺省同义：浏览模式；带 query 仍走既有 FTS 检索。
+    const queryText = typeof rawQuery === 'string' ? rawQuery.trim() : '';
+    if (queryText.length === 0) {
+      const kind = parseOptionalArtifactKind(query.kind);
+      const limit = parseOptionalLimit(query.limit, 50);
+      const offset =
+        query.offset === undefined ? 0 : parseNonNegativeInteger(query.offset, 'offset');
+      const page = listArtifacts(db, { limit, offset, ...(kind === undefined ? {} : { kind }) });
+      return { mode: 'browse' as const, total: page.total, items: page.items };
+    }
+
     const limit = parseOptionalLimit(query.limit, 10);
-    return searchArtifacts(db, rawQuery ?? '', limit);
+    const items = searchArtifacts(db, queryText, limit);
+    return { mode: 'search' as const, total: items.length, items };
   });
 
   app.get('/artifacts/:id', async (request, reply) => {

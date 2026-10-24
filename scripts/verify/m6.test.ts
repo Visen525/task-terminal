@@ -647,12 +647,10 @@ test("M6-03 GET /artifacts/:id：返回单产物全量字段；不存在返回 4
         url: "/artifacts?query=%E6%9C%88%E5%BA%A6%E5%88%86%E6%9E%90",
       });
       assert.equal(searchResponse.statusCode, 200);
-      const hits = searchResponse.json();
-      assert.ok(Array.isArray(hits));
-      assert.ok(
-        (hits as Array<Record<string, unknown>>).some((hit) => hit.id === artifact.id),
-        "预期中文关键词检索命中产物",
-      );
+      const hits = searchResponse.json() as { mode: string; items: Array<Record<string, unknown>> };
+      // M11-03：搜索响应统一为 {mode,total,items}（契约 2edffcf4）。
+      assert.equal(hits.mode, "search");
+      assert.ok(hits.items.some((hit) => hit.id === artifact.id), "预期中文关键词检索命中产物");
 
       const missing = await app.inject({ method: "GET", url: "/artifacts/a_missing" });
       assert.equal(missing.statusCode, 404, "预期不存在的产物返回 404");

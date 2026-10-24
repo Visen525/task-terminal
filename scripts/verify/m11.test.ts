@@ -1005,3 +1005,53 @@ test("M11-02 设置页源码：三字段、0=不限提示与 deepseek-v4-pro 预
     assert.ok(settingsApi.includes(marker), `settingsApi.ts 缺少 ${marker}`);
   }
 });
+
+// ── M11-03 产物库浏览模式 ─────────────────────────────────────────
+
+test("M11-03 listArtifacts：倒序 + 分页 + kind 过滤 + total", async () => {
+  const { openDatabase } = await import("../../src/store/migrate.ts");
+  const { insertTask } = await import("../../src/store/repo.ts");
+  const { insertArtifact } = await import("../../src/store/artifacts.ts");
+  const db = openDatabase(":memory:");
+  const t = insertTask(db, { title: "t", goal: "g", workspace: process.cwd(), permission: "workspace-write" });
+  for (let i = 0; i < 5; i += 1) {
+    insertArtifact(db, {
+      taskId: t.id, kind: i % 2 === 0 ? "file" : "note",
+      title: `产物 ${String(i)}`, summary: `第 ${String(i)} 号摘要`,
+      now: 1_000 + i,
+    });
+  }
+  const { listArtifacts } = await import("../../src/store/artifacts.ts");
+  const all = listArtifacts(db, {});
+  assert.equal(all.total, 5);
+  assert.deepEqual(all.items.map((a: { title: string }) => a.title), ["产物 4", "产物 3", "产物 2", "产物 1", "产物 0"], "应按时间倒序");
+  const page2 = listArtifacts(db, { limit: 2, offset: 4 });
+  assert.equal(page2.items.length, 1, "分页越界只剩 1 条");
+  const notes = listArtifacts(db, { kind: "note" });
+  assert.equal(notes.total, 2, "5 条交替插入应有 2 条 note");
+  assert.ok(notes.items.every((a: { kind: string }) => a.kind === "note"));
+});
+
+test("M11-03 GET /artifacts：无 query 走 browse，带 query 走 search，响应形状统一", async () => {
+  const { createApp } = await import("../../src/server/index.ts");
+  const { openDatabase } = await import("../../src/store/migrate.ts");
+  const { insertTask } = await import("../../src/store/repo.ts");
+  const { insertArtifact } = await import("../../src/store/artifacts.ts");
+  const db = openDatabase(":memory:");
+  const t = insertTask(db, { title: "t", goal: "g", workspace: process.cwd(), permission: "workspace-write" });
+  insertArtifact(db, { taskId: t.id, kind: "note", title: "销售月报", summary: "华东区环比增长", tags: ["销售"] });
+  insertArtifact(db, { taskId: t.id, kind: "file", title: "数据脚本", summary: "python 清洗", now: 2_000 });
+  const app = createApp({ db, scheduler: null as never });
+  const browse = await app.inject({ method: "GET", url: "/artifacts" });
+  assert.equal(browse.statusCode, 200);
+  const browseBody = browse.json() as { mode: string; total: number; items: unknown[] };
+  assert.equal(browseBody.mode, "browse", "无 query 应为 browse 模式");
+  assert.equal(browseBody.total, 2);
+  assert.equal(browseBody.items.length, 2);
+  const search = await app.inject({ method: "GET", url: "/artifacts?query=" + encodeURIComponent("环比") });
+  const searchBody = search.json() as { mode: string; total: number; items: unknown[] };
+  assert.equal(searchBody.mode, "search");
+  assert.equal(searchBody.total, 1, "中文关键词应命中 1 条");
+  const badOffset = await app.inject({ method: "GET", url: "/artifacts?offset=-1" });
+  assert.equal(badOffset.statusCode, 400, "offset 负数应 400");
+});

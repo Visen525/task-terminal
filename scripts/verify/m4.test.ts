@@ -1057,7 +1057,10 @@ test("M4-02 参数校验与 404：错误响应统一为 {error:{code,message}}",
 
       const artifacts = await requestJson(baseUrl, "/artifacts?query=test&limit=5");
       assert.equal(artifacts.status, 200);
-      assert.ok(Array.isArray(artifacts.body));
+      // M11-03：/artifacts 响应统一为 {mode,total,items}（契约 2edffcf4）。
+      const artifactsBody = artifacts.body as { mode?: string; items?: unknown[] };
+      assert.equal(artifactsBody.mode, "search");
+      assert.ok(Array.isArray(artifactsBody.items));
     });
   });
 });
