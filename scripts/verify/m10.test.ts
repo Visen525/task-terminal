@@ -1007,3 +1007,96 @@ test("M10-02 构建：pnpm build 退出码 0 且 dist/index.html 存在", { time
   );
   assert.ok(existsSync(join(root, "dist", "index.html")), "预期 dist/index.html 存在");
 });
+
+// ════════════════════════════════════════════════════════════════
+// 验收 12：M10-03 划选引用与选项 chips 源码接线
+// ════════════════════════════════════════════════════════════════
+
+test("M10-03 划选引用源码：document 监听、气泡归属、坐标钳制与引用所选按钮", () => {
+  for (const path of [
+    "src/web/src/components/SelectionQuoteButton.tsx",
+    "src/web/src/components/OptionChips.tsx",
+  ]) {
+    assert.ok(existsSync(join(root, path)), `预期组件存在：${path}`);
+  }
+
+  const chat = read("src/web/src/pages/Chat.tsx");
+  for (const marker of [
+    'document.addEventListener("selectionchange"',
+    'document.addEventListener("mouseup"',
+    "getBoundingClientRect",
+    "data-chat-role",
+    "findAssistantSelection",
+    "truncateQuoteSelection",
+    "clampSelectionButtonPosition",
+    "<SelectionQuoteButton",
+    "<OptionChips",
+    "onOptionPick",
+    "setInput(text)",
+    "setQuote(",
+    "chat-quote-stack",
+    "chat-quote-source",
+    "来源 {quoteSource}",
+  ]) {
+    assert.ok(chat.includes(marker), `预期 Chat.tsx 包含 ${marker}`);
+  }
+
+  const selectionButton = read("src/web/src/components/SelectionQuoteButton.tsx");
+  for (const marker of [
+    "SELECTION_QUOTE_MAX_CHARS = 200",
+    "truncateQuoteSelection",
+    "clampSelectionButtonPosition",
+    "data-selection-quote-button",
+    "引用所选",
+    "…",
+  ]) {
+    assert.ok(selectionButton.includes(marker), `预期 SelectionQuoteButton.tsx 包含 ${marker}`);
+  }
+
+  const quoteBar = read("src/web/src/components/ChatQuoteBar.tsx");
+  for (const marker of ["chat-quote-bar", "引用"]) {
+    assert.ok(quoteBar.includes(marker), `预期 ChatQuoteBar.tsx 包含 ${marker}`);
+  }
+});
+
+test("M10-03 选项 chips 源码：四种序号正则、60 字符上限、多组解析与点击填入输入框", () => {
+  const chips = read("src/web/src/components/OptionChips.tsx");
+  for (const marker of [
+    "OPTION_MAX_CHARS = 60",
+    "[A-F]",
+    "[1-6]",
+    "[①②③④⑤⑥]",
+    "（一）（二）（三）",
+    "OPTION_PATTERNS",
+    "parseOptionGroups",
+    "OPTION_MIN_COUNT",
+    "OPTION_MAX_COUNT",
+    "disabled={isPicked}",
+    "onPick(value)",
+    "chat-option-chip",
+  ]) {
+    assert.ok(chips.includes(marker), `预期 OptionChips.tsx 包含 ${marker}`);
+  }
+});
+
+test("M10-03 构建：pnpm build 退出码 0 且 dist/index.html 存在", { timeout: 240_000 }, () => {
+  const buildResult =
+    process.platform === "win32"
+      ? spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "pnpm build"], {
+          cwd: root,
+          stdio: "inherit",
+          env: process.env,
+        })
+      : spawnSync("pnpm", ["build"], {
+          cwd: root,
+          stdio: "inherit",
+          env: process.env,
+        });
+
+  assert.equal(
+    buildResult.status,
+    0,
+    `预期 pnpm build 退出码 0，实际 ${String(buildResult.status)}（error=${buildResult.error?.message ?? "none"}）`,
+  );
+  assert.ok(existsSync(join(root, "dist", "index.html")), "预期 dist/index.html 存在");
+});

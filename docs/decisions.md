@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M10-03 划选引用与选项 chips（2026-10-24）
+
+- **选区归属靠 assistant 气泡上的 `data-chat-role`，不靠 DOM 结构猜测**：`selectionchange` 与 `mouseup` 都只负责调度一次刷新，真正的判定是 `range.startContainer` 向上找最近气泡、再要求 `range.endContainer` 与 `commonAncestorContainer` 都在同一气泡内。跨气泡、选到用户消息或纯空白选区一律不浮按钮，因此 ReactMarkdown 的多层节点不会造成误判。
+- **按钮用 `Range.getBoundingClientRect()` 的视口坐标 + `position: fixed`**：横向以选区中心对齐后钳制到 `[8, innerWidth - 按钮宽 - 8]`，上方放不下时改放选区下方并钳制底部；按钮 mousedown `preventDefault` 保住选区，点击后再 `removeAllRanges`。`mouseup` 之外的 `mousedown`（按钮除外）、气泡/窗口滚动和 resize 都直接收起按钮。
+- **划选与整条引用共用同一套 quote 状态，只多一个来源标注**：选中文本按 Unicode 码点截断到 200 字符补 `…`，`quoteSource` 记录气泡里的时间（时间缺失退回序号），引用条外再渲染一个来源小标签；发送仍走既有 `buildQuotedMessage`，后端协议与 `ChatQuoteBar` 内部结构都不变。
+- **OptionChips 是纯解析组件，解析失败返回 `null`**：按行匹配 A–F、1–6、①–⑥、（一）–（六）四类前缀，要求同一格式内序号从第一项连续递增、每项去序号后非空且 ≤60 码点、连续 2–6 项；空行、普通段落或超长项都会结束当前组。点击只把去序号文本 `setInput` 到输入框，不自动发送，已点击项用本地 Set 置灰，同一条消息的多组分别渲染。
+- **样式与测试都只做加法**：chips 用 13px、圆角胶囊、主色描边 hover，`flex-wrap` 保证 375px 不横向溢出；`m10.test.ts` 只追加源码断言与构建用例，既有 M9/M10 断言未改，依赖清单零新增。
+
 ## M10-02 设置页与初始化向导（2026-10-24）
 
 - **设置页以 GET /settings 为唯一可编辑数据源，PUT 整份回写**：页面同时保留 M9-02 的 `/settings/overview` 查询，只把其中的今日用量/统计用于展示；模型、思考、采样参数、权限、工作空间、日预算都在本地 draft 中编辑，保存时一次性 PUT。这样 400 的字段路径可以直接映射回 `main.model` / `main.temperature` / `workspaceDir` 等控件，不需要每改一个控件就发一次请求，也不会出现半套设置已生效的状态。

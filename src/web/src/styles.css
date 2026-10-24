@@ -1140,6 +1140,20 @@ body {
   font-size: 10.5px;
 }
 
+.chat-quote-stack {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 4px 4px 2px;
+}
+
+.chat-quote-stack .chat-quote-bar {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+
 .chat-quote-bar {
   display: flex;
   align-items: center;
@@ -1150,7 +1164,7 @@ body {
   border-radius: 0 8px 8px 0;
   background: #f8fafc;
   color: var(--tt-text-secondary);
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .chat-quote-label {
@@ -1159,12 +1173,100 @@ body {
   color: var(--tt-primary);
 }
 
+.chat-quote-source {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--tt-primary-border);
+  border-radius: 999px;
+  background: var(--tt-primary-soft);
+  color: #6366f1;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
 .chat-quote-text {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ── 划选引用与选项 chips（M10-03） ────────────────────── */
+
+.chat-selection-quote {
+  position: fixed;
+  z-index: 30;
+  user-select: none;
+  animation: tt-quote-pop 0.12s ease-out;
+}
+
+.chat-selection-quote .ant-btn {
+  height: 30px;
+  padding-inline: 11px;
+  border-radius: 8px;
+  font-size: 13px;
+  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.26);
+}
+
+@keyframes tt-quote-pop {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.chat-option-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin-top: 8px;
+}
+
+.chat-option-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chat-option-chip.ant-btn {
+  height: auto;
+  min-height: 28px;
+  max-width: 100%;
+  padding: 3px 11px;
+  border: 1px solid var(--tt-border);
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #374151;
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: left;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.chat-option-chip.ant-btn:hover:not(:disabled) {
+  border-color: var(--tt-primary);
+  background: var(--tt-primary-soft);
+  color: var(--tt-primary);
+}
+
+.chat-option-chip.ant-btn:focus-visible {
+  outline: 3px solid rgba(79, 70, 229, 0.18);
+  outline-offset: 1px;
+}
+
+.chat-option-chip.is-picked.ant-btn,
+.chat-option-chip.is-picked.ant-btn:disabled {
+  border-color: var(--tt-border-soft);
+  background: #f3f4f6;
+  color: var(--tt-text-tertiary);
 }
 
 .chat-drop-overlay {

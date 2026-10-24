@@ -7,6 +7,9 @@
  *
  * 附件：回形针 / 拖拽 / 粘贴图片三条入口，图片先 canvas 压缩；引用只拼文本，
  * 用户气泡再把开头的 blockquote 行渲染成灰色引用块。
+ *
+ * M10-03：assistant 气泡支持划选任意片段浮出「引用所选」；消息里的连续选项
+ * （A/B/C、1/2/3、①②③、（一）（二））渲染为可点击 chips，点击只填输入框。
  */
 import {
   useCallback,
@@ -38,6 +41,12 @@ import {
   ChatQuoteBar,
   splitQuotedMessage,
 } from "../components/ChatQuoteBar";
+import { OptionChips } from "../components/OptionChips";
+import {
+  clampSelectionButtonPosition,
+  SelectionQuoteButton,
+  truncateQuoteSelection,
+} from "../components/SelectionQuoteButton";
 import {
   listMessages,
   streamChat,
@@ -50,8 +59,52 @@ import {
 const FLUSH_INTERVAL_MS = 24;
 const HISTORY_LIMIT = 50;
 
+interface SelectionDraft {
+  text: string;
+  source: string;
+  top: number;
+  left: number;
+}
+
+interface AssistantSelection {
+  bubble: HTMLElement;
+  range: Range;
+}
+
 function localId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 引用来源：优先显示本地时间，时间缺失时退回消息序号。 */
+function quoteSourceLabel(message: ChatMessage): string {
+  const date = new Date(message.ts);
+  if (Number.isFinite(message.ts) && message.ts > 0 && !Number.isNaN(date.getTime())) {
+    const hours = String(date.getHours()).padStart(2, "0");
+    const minutes = String(date.getMinutes()).padStart(2, "0");
+    return `AI · ${hours}:${minutes}`;
+  }
+  return message.seq > 0 ? `AI · 第 ${message.seq} 条` : "AI 回复";
+}
+
+/**
+ * 选区必须完整落在同一个 assistant 气泡内：
+ * 起点向上找到最近的气泡，终点也必须在同一气泡中；跨气泡或选到用户消息一律忽略。
+ */
+function findAssistantSelection(selection: Selection): AssistantSelection | null {
+  if (selection.rangeCount === 0 || selection.isCollapsed) return null;
+  const range = selection.getRangeAt(0);
+  if (range.collapsed) return null;
+
+  const startElement =
+    range.startContainer instanceof Element
+      ? range.startContainer
+      : range.startContainer.parentElement;
+  const bubble =
+    startElement?.closest<HTMLElement>('[data-chat-role="assistant"]') ?? null;
+  if (bubble === null) return null;
+  if (!bubble.contains(range.endContainer)) return null;
+  if (!bubble.contains(range.commonAncestorContainer)) return null;
+  return { bubble, range };
 }
 
 function ThinkingDots() {
@@ -70,13 +123,16 @@ function MessageBubble({
   message,
   thinking,
   onQuote,
+  onOptionPick,
 }: {
   message: ChatMessage;
   thinking: boolean;
-  onQuote: (text: string) => void;
+  onQuote: (text: string, source: string) => void;
+  onOptionPick: (text: string) => void;
 }) {
   const isUser = message.role === "user";
   const quoted = isUser ? splitQuotedMessage(message.text) : null;
+  const quoteSource = isUser ? null : quoteSourceLabel(message);
 
   return (
     <div className={isUser ? "chat-row chat-row-user" : "chat-row chat-row-assistant"}>
@@ -88,7 +144,11 @@ function MessageBubble({
       </div>
       <div className="chat-bubble-col">
         <div className="chat-bubble-wrap">
-          <div className={isUser ? "chat-bubble chat-bubble-user" : "chat-bubble chat-bubble-ai"}>
+          <div
+            className={isUser ? "chat-bubble chat-bubble-user" : "chat-bubble chat-bubble-ai"}
+            data-chat-role={isUser ? "user" : "assistant"}
+            data-quote-source={quoteSource ?? undefined}
+          >
             {isUser ? (
               <>
                 {quoted !== null && quoted.quote !== null ? (
@@ -114,6 +174,7 @@ function MessageBubble({
               </>
             )}
           </div>
+          {isUser ? null : <OptionChips text={message.text} onPick={onOptionPick} />}
           {isUser ? null : (
             <Tooltip title="引用这条回复" placement="bottom">
               <Button
@@ -123,7 +184,7 @@ function MessageBubble({
                 icon={<MessageOutlined />}
                 disabled={message.text.length === 0}
                 onClick={() => {
-                  onQuote(message.text);
+                  onQuote(message.text, quoteSource ?? "AI 回复");
                 }}
               >
                 引用
@@ -142,6 +203,8 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [quote, setQuote] = useState<string | null>(null);
+  const [quoteSource, setQuoteSource] = useState<string | null>(null);
+  const [selectionDraft, setSelectionDraft] = useState<SelectionDraft | null>(null);
   const [sending, setSending] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [dragActive, setDragActive] = useState(false);
@@ -149,6 +212,7 @@ export default function Chat() {
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const selectionDraftRef = useRef<SelectionDraft | null>(null);
   const deltaBufferRef = useRef("");
   const flushTimerRef = useRef<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -239,6 +303,102 @@ export default function Chat() {
     },
     [replaceAttachments, toast],
   );
+
+  const clearSelectionDraft = useCallback((): void => {
+    if (selectionDraftRef.current === null) return;
+    selectionDraftRef.current = null;
+    setSelectionDraft(null);
+  }, []);
+
+  /**
+   * document 级 selectionchange / mouseup 的统一刷新：
+   * 只读 window.getSelection，校验完整落在 assistant 气泡，
+   * 再用 Range.getBoundingClientRect() 换算 fixed 坐标并钳制到视口内。
+   */
+  const refreshSelectionDraft = useCallback((): void => {
+    const selection = window.getSelection();
+    const found = selection === null ? null : findAssistantSelection(selection);
+    if (selection === null || found === null) {
+      clearSelectionDraft();
+      return;
+    }
+
+    const text = truncateQuoteSelection(selection.toString());
+    if (text.length === 0) {
+      clearSelectionDraft();
+      return;
+    }
+
+    const rect = found.range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      clearSelectionDraft();
+      return;
+    }
+    const position = clampSelectionButtonPosition(rect, {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    });
+    const draft: SelectionDraft = {
+      text,
+      source: found.bubble.dataset.quoteSource ?? "AI 回复",
+      top: position.top,
+      left: position.left,
+    };
+    selectionDraftRef.current = draft;
+    setSelectionDraft(draft);
+  }, [clearSelectionDraft]);
+
+  const applySelectionQuote = useCallback((): void => {
+    const draft = selectionDraftRef.current;
+    if (draft === null) return;
+    setQuote(draft.text);
+    setQuoteSource(draft.source);
+    window.getSelection()?.removeAllRanges();
+    clearSelectionDraft();
+  }, [clearSelectionDraft]);
+
+  // 划选引用：选区变化/鼠标抬起时刷新；点别处、滚动气泡或窗口缩放时收起。
+  useEffect(() => {
+    let frame: number | null = null;
+    const scheduleRefresh = (): void => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        refreshSelectionDraft();
+      });
+    };
+    const handleMouseDown = (event: MouseEvent): void => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest("[data-selection-quote-button]") !== null
+      ) {
+        return;
+      }
+      clearSelectionDraft();
+    };
+    const hideOnScroll = (): void => {
+      clearSelectionDraft();
+    };
+
+    document.addEventListener("selectionchange", scheduleRefresh);
+    document.addEventListener("mouseup", scheduleRefresh);
+    document.addEventListener("mousedown", handleMouseDown);
+    const panel = listRef.current;
+    panel?.addEventListener("scroll", hideOnScroll, { passive: true });
+    window.addEventListener("scroll", hideOnScroll, { passive: true });
+    window.addEventListener("resize", hideOnScroll);
+
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      document.removeEventListener("selectionchange", scheduleRefresh);
+      document.removeEventListener("mouseup", scheduleRefresh);
+      document.removeEventListener("mousedown", handleMouseDown);
+      panel?.removeEventListener("scroll", hideOnScroll);
+      window.removeEventListener("scroll", hideOnScroll);
+      window.removeEventListener("resize", hideOnScroll);
+    };
+  }, [clearSelectionDraft, refreshSelectionDraft]);
 
   // 首屏历史；卸载时中止在途对话并清掉未触发的合批定时器与本地预览 URL。
   useEffect(() => {
@@ -339,6 +499,7 @@ export default function Chat() {
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
     setInput("");
     setQuote(null);
+    setQuoteSource(null);
     // 预览 URL 仍被上面的本地消息引用，不能 revoke，留给卸载时统一清理。
     attachmentsRef.current = [];
     setAttachments([]);
@@ -509,8 +670,12 @@ export default function Chat() {
                 key={item.id}
                 message={item}
                 thinking={sending && item.role === "assistant" && item.text.length === 0}
-                onQuote={(text) => {
+                onQuote={(text, source) => {
                   setQuote(text);
+                  setQuoteSource(source);
+                }}
+                onOptionPick={(text) => {
+                  setInput(text);
                 }}
               />
             ))}
@@ -520,12 +685,20 @@ export default function Chat() {
 
       <div className="chat-composer">
         {quote === null ? null : (
-          <ChatQuoteBar
-            text={quote}
-            onClose={() => {
-              setQuote(null);
-            }}
-          />
+          <div className="chat-quote-stack">
+            <ChatQuoteBar
+              text={quote}
+              onClose={() => {
+                setQuote(null);
+                setQuoteSource(null);
+              }}
+            />
+            {quoteSource === null ? null : (
+              <span className="chat-quote-source" title={`来源 ${quoteSource}`}>
+                来源 {quoteSource}
+              </span>
+            )}
+          </div>
         )}
         <Input.TextArea
           variant="borderless"
@@ -597,6 +770,12 @@ export default function Chat() {
           </Button>
         </div>
       </div>
+      {selectionDraft === null ? null : (
+        <SelectionQuoteButton
+          position={{ top: selectionDraft.top, left: selectionDraft.left }}
+          onClick={applySelectionQuote}
+        />
+      )}
     </div>
   );
 }
