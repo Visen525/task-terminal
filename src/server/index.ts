@@ -689,6 +689,8 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       // v1.1 契约字段；content 保留给 M6 起的既有前端/断言，值相同。
       text: message.content,
       content: message.content,
+      // M13-02：思考链全文；模型未产出思考时缺省。
+      ...(message.reasoning === undefined ? {} : { reasoning: message.reasoning }),
       tokens: message.tokens,
       ts: message.ts,
       ...(message.attachments === undefined
@@ -725,9 +727,10 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   });
 
   /**
-   * POST /chat：SSE 流式主线对话（M6-03）。
+   * POST /chat：SSE 流式主线对话（M6-03；M13-02 增 reasoning 事件）。
    *
    * 协议：HTTP 200 + text/event-stream
+   *   event: reasoning data: {text}（思考链增量，先于 delta）
    *   event: delta  data: {text}
    *   event: done   data: {reply, usage}
    *   event: error  data: {code, message}（随后结束，HTTP 仍是 200）
@@ -776,6 +779,10 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
     const writeDelta = (text: string): void => {
       write(`event: delta\ndata: ${JSON.stringify({ text })}\n\n`);
+    };
+
+    const writeReasoning = (text: string): void => {
+      write(`event: reasoning\ndata: ${JSON.stringify({ text })}\n\n`);
     };
 
     const writeDone = (data: unknown): void => {
@@ -829,6 +836,9 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         signal: controller.signal,
         onTextDelta: (text) => {
           writeDelta(text);
+        },
+        onReasoningDelta: (text) => {
+          writeReasoning(text);
         },
         onTaskCreated: () => {
           wakeScheduler(scheduler);

@@ -21,7 +21,13 @@ import {
 } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Alert, App as AntdApp, Button, Input, Spin, Tooltip } from "antd";
-import { MessageOutlined, PaperClipOutlined, SendOutlined } from "@ant-design/icons";
+import {
+  BulbOutlined,
+  CaretRightOutlined,
+  MessageOutlined,
+  PaperClipOutlined,
+  SendOutlined,
+} from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 
 import EmptyState from "../components/EmptyState";
@@ -42,7 +48,7 @@ import {
   ChatQuoteBar,
   splitQuotedMessage,
 } from "../components/ChatQuoteBar";
-import { OptionChips } from "../components/OptionChips";
+import { OptionCards } from "../components/OptionChips";
 import {
   clampSelectionButtonPosition,
   SelectionQuoteButton,
@@ -121,6 +127,45 @@ function ThinkingDots() {
   );
 }
 
+/**
+ * 思考过程折叠面板（M13-02）。
+ * 自动展开规则：思考链在流式产出且正文未开始时展开；正文开始或结束后收起；
+ * 历史消息默认收起。用户手动点击后以用户的选择为准（userExpanded 覆盖自动行为）。
+ */
+function ThinkingPanel({
+  reasoning,
+  hasAnswer,
+}: {
+  reasoning: string;
+  hasAnswer: boolean;
+}) {
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
+  const autoExpanded = reasoning.length > 0 && !hasAnswer;
+  const expanded = userExpanded ?? autoExpanded;
+
+  return (
+    <div className={expanded ? "chat-thinking is-open" : "chat-thinking"}>
+      <button
+        type="button"
+        className="chat-thinking-header"
+        aria-expanded={expanded}
+        onClick={() => {
+          setUserExpanded(!expanded);
+        }}
+      >
+        <BulbOutlined className="chat-thinking-icon" aria-hidden />
+        <span>思考过程</span>
+        <CaretRightOutlined
+          className="chat-thinking-caret"
+          aria-hidden
+          rotate={expanded ? 90 : 0}
+        />
+      </button>
+      {expanded ? <div className="chat-thinking-body">{reasoning}</div> : null}
+    </div>
+  );
+}
+
 function MessageBubble({
   message,
   thinking,
@@ -163,6 +208,23 @@ function MessageBubble({
                   <MessageAttachments attachments={message.attachments} />
                 )}
               </>
+            ) : message.reasoning !== undefined && message.reasoning.length > 0 ? (
+              <>
+                <ThinkingPanel
+                  reasoning={message.reasoning}
+                  hasAnswer={message.text.length > 0}
+                />
+                {message.text.length === 0 ? (
+                  <ThinkingDots />
+                ) : (
+                  <div className="chat-markdown">
+                    <ReactMarkdown>{message.text}</ReactMarkdown>
+                  </div>
+                )}
+                {message.attachments === undefined ? null : (
+                  <MessageAttachments attachments={message.attachments} />
+                )}
+              </>
             ) : message.text.length === 0 && thinking ? (
               <ThinkingDots />
             ) : (
@@ -176,7 +238,7 @@ function MessageBubble({
               </>
             )}
           </div>
-          {isUser ? null : <OptionChips text={message.text} onPick={onOptionPick} />}
+          {isUser ? null : <OptionCards text={message.text} onPick={onOptionPick} />}
           {isUser ? null : (
             <Tooltip title="引用这条回复" placement="bottom">
               <Button
@@ -222,26 +284,36 @@ export default function Chat() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectionDraftRef = useRef<SelectionDraft | null>(null);
   const deltaBufferRef = useRef("");
+  const reasoningBufferRef = useRef("");
   const flushTimerRef = useRef<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(true);
   const attachmentsRef = useRef<PendingAttachment[]>([]);
   const previewUrlsRef = useRef<string[]>([]);
 
-  /** 每次 flush 只调用一次 setMessages；空缓冲直接返回。 */
+  /** 每次 flush 只调用一次 setMessages；文本与思考缓冲都清空。 */
   const flushDeltas = useCallback((assistantId: string): void => {
     if (flushTimerRef.current !== null) {
       window.clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
     }
     const chunk = deltaBufferRef.current;
-    if (chunk.length === 0) return;
+    const reasoningChunk = reasoningBufferRef.current;
+    if (chunk.length === 0 && reasoningChunk.length === 0) return;
     deltaBufferRef.current = "";
+    reasoningBufferRef.current = "";
     if (!mountedRef.current) return;
     setMessages((prev) =>
-      prev.map((item) =>
-        item.id === assistantId ? { ...item, text: item.text + chunk } : item,
-      ),
+      prev.map((item) => {
+        if (item.id !== assistantId) return item;
+        return {
+          ...item,
+          text: item.text + chunk,
+          ...(reasoningChunk.length > 0
+            ? { reasoning: (item.reasoning ?? "") + reasoningChunk }
+            : {}),
+        };
+      }),
     );
   }, []);
 
@@ -435,6 +507,7 @@ export default function Chat() {
         flushTimerRef.current = null;
       }
       deltaBufferRef.current = "";
+      reasoningBufferRef.current = "";
       for (const url of previewUrlsRef.current) URL.revokeObjectURL(url);
       previewUrlsRef.current = [];
     };
@@ -446,46 +519,58 @@ export default function Chat() {
     if (element !== null) element.scrollTop = element.scrollHeight;
   }, [messages, sending]);
 
-  const send = useCallback(async (): Promise<void> => {
-    const text = input.trim();
-    if (noApiKey) {
-      toast.warning("未配置 API Key，请先到设置填写");
-      return;
-    }
-    if (
-      (text.length === 0 && attachments.length === 0) ||
-      sending ||
-      loadingHistory
-    ) {
-      return;
-    }
-
-    setSending(true);
-    setError(null);
-
-    const attachmentInputs: ChatAttachmentInput[] = [];
-    try {
-      for (const item of attachments) {
-        attachmentInputs.push({
-          name: item.name,
-          mime: item.mime,
-          dataBase64: await readFileBase64(item.file),
-        });
+  /**
+   * 发送一条消息。overrideText 来自选项卡片「发送所选」：直接以所选文本发送，
+   * 不携带附件/引用，也不清空输入框与附件（普通发送保持原行为）。
+   */
+  const send = useCallback(
+    async (overrideText?: string): Promise<void> => {
+      const override =
+        typeof overrideText === "string" && overrideText.trim().length > 0
+          ? overrideText.trim()
+          : undefined;
+      const text = (override ?? input).trim();
+      if (noApiKey) {
+        toast.warning("未配置 API Key，请先到设置填写");
+        return;
       }
-    } catch {
-      setSending(false);
-      toast.error("读取附件失败，请重试");
-      return;
-    }
+      if (
+        (text.length === 0 && attachments.length === 0) ||
+        sending ||
+        loadingHistory
+      ) {
+        return;
+      }
 
-    const outgoingText = quote === null ? text : buildQuotedMessage(quote, text);
-    const localAttachments: ChatAttachment[] = attachments.map((item) => ({
-      id: item.key,
-      name: item.name,
-      mime: item.mime,
-      size: item.size,
-      ...(item.previewUrl === undefined ? {} : { previewUrl: item.previewUrl }),
-    }));
+      setSending(true);
+      setError(null);
+
+      const activeAttachments = override === undefined ? attachments : [];
+      const attachmentInputs: ChatAttachmentInput[] = [];
+      try {
+        for (const item of activeAttachments) {
+          attachmentInputs.push({
+            name: item.name,
+            mime: item.mime,
+            dataBase64: await readFileBase64(item.file),
+          });
+        }
+      } catch {
+        setSending(false);
+        toast.error("读取附件失败，请重试");
+        return;
+      }
+
+      const outgoingText =
+        override ??
+        (quote === null ? text : buildQuotedMessage(quote, text));
+      const localAttachments: ChatAttachment[] = activeAttachments.map((item) => ({
+        id: item.key,
+        name: item.name,
+        mime: item.mime,
+        size: item.size,
+        ...(item.previewUrl === undefined ? {} : { previewUrl: item.previewUrl }),
+      }));
     const assistantId = localId("local-assistant");
     const now = Date.now();
     const userMessage: ChatMessage = {
@@ -509,13 +594,17 @@ export default function Chat() {
     };
 
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
-    setInput("");
-    setQuote(null);
-    setQuoteSource(null);
-    // 预览 URL 仍被上面的本地消息引用，不能 revoke，留给卸载时统一清理。
-    attachmentsRef.current = [];
-    setAttachments([]);
+    // 选项卡片直发保留输入框/引用/附件；普通发送清空三者。
+    if (override === undefined) {
+      setInput("");
+      setQuote(null);
+      setQuoteSource(null);
+      // 预览 URL 仍被上面的本地消息引用，不能 revoke，留给卸载时统一清理。
+      attachmentsRef.current = [];
+      setAttachments([]);
+    }
     deltaBufferRef.current = "";
+    reasoningBufferRef.current = "";
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -528,6 +617,14 @@ export default function Chat() {
         {
           onDelta: (delta) => {
             deltaBufferRef.current += delta;
+            if (flushTimerRef.current !== null) return;
+            flushTimerRef.current = window.setTimeout(() => {
+              flushTimerRef.current = null;
+              flushDeltas(assistantId);
+            }, FLUSH_INTERVAL_MS);
+          },
+          onReasoning: (delta) => {
+            reasoningBufferRef.current += delta;
             if (flushTimerRef.current !== null) return;
             flushTimerRef.current = window.setTimeout(() => {
               flushTimerRef.current = null;
@@ -567,9 +664,14 @@ export default function Chat() {
       if (mountedRef.current) {
         setSending(false);
         if (failed) {
-          // 一个字都没收到就失败时不要留空气泡；有部分内容则保留。
+          // 一个字/一段思考都没收到就失败时不要留空气泡；有部分内容则保留。
           setMessages((prev) =>
-            prev.filter((item) => item.id !== assistantId || item.text.trim().length > 0),
+            prev.filter(
+              (item) =>
+                item.id !== assistantId ||
+                item.text.trim().length > 0 ||
+                (item.reasoning ?? "").trim().length > 0,
+            ),
           );
         }
       }
@@ -687,7 +789,8 @@ export default function Chat() {
                   setQuoteSource(source);
                 }}
                 onOptionPick={(text) => {
-                  setInput(text);
+                  // 选项卡片「发送所选」：直接以所选文本发送（M13-03）。
+                  void send(text);
                 }}
               />
             ))}

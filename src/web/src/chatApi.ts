@@ -32,6 +32,8 @@ export interface ChatMessage {
   /** 纯文本视图（v1.1 GET /messages）；附件另见 attachments。 */
   text: string;
   attachments?: ChatAttachment[];
+  /** 思考链全文（M13-02）；仅 assistant 且模型产出思考时存在。 */
+  reasoning?: string;
   tokens: number | null;
   ts: number;
 }
@@ -55,6 +57,8 @@ export interface ChatStreamError {
 
 export interface ChatStreamHandlers {
   onDelta: (text: string) => void;
+  /** 思考链增量（M13-02）；模型不开思考时不会触发。 */
+  onReasoning?: (text: string) => void;
   onDone: (done: ChatDone) => void;
   onError: (error: ChatStreamError) => void;
 }
@@ -137,6 +141,12 @@ function handleFrame(frame: ParsedFrame, handlers: ChatStreamHandlers): void {
   if (frame.event === "delta") {
     if (typeof parsed.text === "string" && parsed.text.length > 0) {
       handlers.onDelta(parsed.text);
+    }
+    return;
+  }
+  if (frame.event === "reasoning") {
+    if (typeof parsed.text === "string" && parsed.text.length > 0) {
+      handlers.onReasoning?.(parsed.text);
     }
     return;
   }

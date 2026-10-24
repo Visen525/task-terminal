@@ -36,6 +36,8 @@ export interface FakeStep {
   error?: unknown;
   /** 流式文本分片；默认整段一次。传 [] 表示不产文本。 */
   textDeltas?: string[];
+  /** 流式思考链分片（M13-02）；先于文本产出，done.response.reasoningContent 汇总。 */
+  reasoningDeltas?: string[];
   /** 流式 tool_call 分片；默认每个 tool_call 一次完整参数。 */
   toolCallDeltas?: FakeToolCallDelta[];
   /** 每个事件之间的延迟（毫秒），默认 0。 */
@@ -79,6 +81,12 @@ export class FakeProvider implements LlmProvider {
       throw step.error;
     }
     await this.wait(step, params.signal);
+
+    const reasoningDeltas = step.reasoningDeltas ?? [];
+    for (const text of reasoningDeltas) {
+      await this.wait(step, params.signal);
+      yield { type: "reasoning_delta", text };
+    }
 
     const textDeltas =
       step.textDeltas ??
@@ -153,12 +161,14 @@ function toResponse(step: FakeStep, params: ChatParams): LlmResponse {
         }))
       : assembleToolDeltas(step.toolCallDeltas);
   const usage = step.usage ?? estimateTokenUsage(params.messages, content, toolCalls);
+  const reasoning = (step.reasoningDeltas ?? []).join("");
   return {
     content,
     toolCalls,
     usage,
     finishReason:
       step.finishReason ?? (toolCalls.length > 0 ? "tool_calls" : "stop"),
+    ...(reasoning.length > 0 ? { reasoningContent: reasoning } : {}),
   };
 }
 

@@ -1269,6 +1269,192 @@ body {
   color: var(--tt-text-tertiary);
 }
 
+/* ── 选项卡片（M13-03，对标用户截图）────────────────────────── */
+
+.chat-option-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  padding: 14px 16px;
+  border: 1px solid var(--tt-border);
+  border-radius: 16px;
+  background: var(--tt-surface);
+}
+
+.chat-option-card-title {
+  color: var(--tt-text);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.chat-option-card-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-option-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--tt-text);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.5;
+  text-align: left;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.chat-option-item:hover:not(:disabled) {
+  background: var(--tt-bg);
+}
+
+.chat-option-item:focus-visible {
+  outline: 3px solid rgba(79, 70, 229, 0.18);
+  outline-offset: 1px;
+}
+
+.chat-option-item.is-picked {
+  border-color: var(--tt-text);
+  background: var(--tt-bg);
+}
+
+.chat-option-item:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.chat-option-radio {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--tt-text-tertiary);
+  border-radius: 50%;
+}
+
+.chat-option-item.is-picked .chat-option-radio {
+  border-color: var(--tt-text);
+}
+
+.chat-option-item.is-picked .chat-option-radio::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tt-text);
+}
+
+.chat-option-marker {
+  flex: none;
+  font-weight: 600;
+}
+
+.chat-option-text {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.chat-option-text code {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: #f2f3f5;
+  color: var(--tt-text);
+  font-family: var(--tt-mono);
+  font-size: 13px;
+}
+
+.chat-option-send {
+  align-self: stretch;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 999px;
+  background: #111827;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  transition: opacity 0.15s ease;
+}
+
+.chat-option-send:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.chat-option-send:focus-visible {
+  outline: 3px solid rgba(17, 24, 39, 0.22);
+  outline-offset: 1px;
+}
+
+.chat-option-send:disabled {
+  background: #d5d8de;
+  cursor: default;
+}
+
+/* ── 思考过程折叠面板（M13-02）──────────────────────────────── */
+
+.chat-thinking {
+  margin-bottom: 8px;
+  border: 1px solid var(--tt-border-soft);
+  border-radius: 10px;
+  background: var(--tt-bg);
+  overflow: hidden;
+}
+
+.chat-thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  color: var(--tt-text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.chat-thinking-header:hover {
+  color: var(--tt-text);
+}
+
+.chat-thinking-header:focus-visible {
+  outline: 3px solid rgba(79, 70, 229, 0.18);
+  outline-offset: -3px;
+}
+
+.chat-thinking-icon {
+  font-size: 12px;
+}
+
+.chat-thinking-caret {
+  margin-left: auto;
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+
+.chat-thinking-body {
+  max-height: 280px;
+  padding: 8px 12px 10px;
+  border-top: 1px dashed var(--tt-border-soft);
+  color: var(--tt-text-secondary);
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+}
+
 .chat-drop-overlay {
   position: absolute;
   inset: 0;

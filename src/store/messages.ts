@@ -37,6 +37,8 @@ export interface Message {
   content: string;
   /** 仅在消息带附件时出现。 */
   attachments?: MessageAttachment[];
+  /** 思考链全文（M13-02）；仅 assistant 消息且模型产出思考时存在。 */
+  reasoning?: string;
   tokens: number | null;
   ts: number;
 }
@@ -48,6 +50,8 @@ export interface NewMessageInput {
   content: string;
   /** 带附件时按 v1.1 的 {text,attachments} 对象落库；不带时保持旧版 JSON 字符串。 */
   attachments?: readonly MessageAttachment[];
+  /** 思考链全文（M13-02）；空串视同缺省，不落库。 */
+  reasoning?: string;
   tokens?: number | null;
   /** 可注入时钟；默认 Date.now()。 */
   ts?: number;
@@ -68,6 +72,7 @@ interface MessageRow {
 interface StoredContent {
   text: string;
   attachments: MessageAttachment[];
+  reasoning?: string;
 }
 
 function validateAttachment(value: unknown): MessageAttachment {
@@ -118,8 +123,19 @@ function parseStoredContent(raw: string): StoredContent {
     throw new ContractError(ERROR_CODES.E_INTERNAL, 'messages.content.text 应为字符串');
   }
   const rawAttachments = record.attachments;
+  if (record.reasoning !== undefined && typeof record.reasoning !== 'string') {
+    throw new ContractError(ERROR_CODES.E_INTERNAL, 'messages.content.reasoning 应为字符串');
+  }
+  const reasoning =
+    record.reasoning !== undefined && record.reasoning.length > 0
+      ? record.reasoning
+      : undefined;
   if (rawAttachments === undefined) {
-    return { text: record.text, attachments: [] };
+    return {
+      text: record.text,
+      attachments: [],
+      ...(reasoning !== undefined ? { reasoning } : {}),
+    };
   }
   if (!Array.isArray(rawAttachments)) {
     throw new ContractError(ERROR_CODES.E_INTERNAL, 'messages.content.attachments 应为数组');
@@ -127,6 +143,7 @@ function parseStoredContent(raw: string): StoredContent {
   return {
     text: record.text,
     attachments: rawAttachments.map(validateAttachment),
+    ...(reasoning !== undefined ? { reasoning } : {}),
   };
 }
 
@@ -139,6 +156,7 @@ function mapMessage(row: MessageRow): Message {
     role: row.role as MessageRole,
     content: parsed.text,
     ...(parsed.attachments.length > 0 ? { attachments: parsed.attachments } : {}),
+    ...(parsed.reasoning !== undefined ? { reasoning: parsed.reasoning } : {}),
     tokens: row.tokens,
     ts: row.ts,
   };
@@ -180,9 +198,17 @@ export function appendMessage(db: DatabaseSync, input: NewMessageInput): Message
   const attachments = (input.attachments ?? []).map((attachment) =>
     validateAttachment(attachment),
   );
+  const reasoning =
+    input.reasoning !== undefined && input.reasoning.length > 0
+      ? input.reasoning
+      : undefined;
   const serializedContent =
-    attachments.length > 0
-      ? JSON.stringify({ text: input.content, attachments })
+    attachments.length > 0 || reasoning !== undefined
+      ? JSON.stringify({
+          text: input.content,
+          ...(attachments.length > 0 ? { attachments } : {}),
+          ...(reasoning !== undefined ? { reasoning } : {}),
+        })
       : JSON.stringify(input.content);
 
   db.prepare(
@@ -197,6 +223,7 @@ export function appendMessage(db: DatabaseSync, input: NewMessageInput): Message
     role: input.role,
     content: input.content,
     ...(attachments.length > 0 ? { attachments } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
     tokens,
     ts,
   };

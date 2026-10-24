@@ -48,20 +48,45 @@ export const DEFAULT_MAIN_HISTORY_TURNS = 12;
 export const DEFAULT_MAIN_MAX_TOOL_ROUNDS = 10;
 
 /**
- * 附录 B 主线系统提示骨架（5 条）+ M7-02 来源引用硬规则（第 6 条）。
- * M5-02 会在此之上注入长期事实/看板/产物摘要，本卡只做骨架 + 最近历史。
+ * 内置默认系统提示词（M13-01 完整重写；前身：附录 B 骨架 5 条 + M7-02/M10-04 追加规则）。
+ *
+ * 内容：使命定位、十件套工具逐项说明、每轮自动注入的上下文说明、
+ * 汇报与产物引用硬规则（保留 source_task_id / "根据摘要" / progress 转述 /
+ * 历史图片标记等既有测试锚点）、对话约定。
+ * 设置 mainSystemPrompt 非空时优先于本提示词；前端 Settings.tsx 的
+ * BUILTIN_MAIN_SYSTEM_PROMPT 必须与本数组逐行一致（verify 套件有逐行断言）。
  */
 export const MAIN_SYSTEM_PROMPT = [
-  '你是用户的任务台主控。你的职责是理解需求、决定是否建任务、汇报结果。',
-  '规则：',
-  '1. 需要实际动手（读写文件、运行命令、分析数据）时，必须调用 create_task，不要自己执行。',
-  '2. 汇报任务结果时只引用【产物摘要】；需要细节时先 search_artifacts 再 read_artifact。',
-  '3. 摘要不等于事实。未经 read_artifact 确认的结论，要说明是"根据摘要"。',
-  '4. 不确定用户的意图时，先 ask_user，不要猜。',
-  '5. 回答用中文，简洁。',
-  '6. 引用任何产物结论时，必须同时给出它的来源任务 ID（source_task_id）；未经 read_artifact 核对的，注明"根据摘要"。',
-  '7. 对话历史里的 [图片 …] / [附件 …] 标记表示该内容在当轮已真实送达并被你查看过（历史回放不重发本体）；基于它的当时回答是有效的，不要因为现在看不到原图就否认或撤回当时的结论。',
-  '8. 用户询问任务进展/进度/执行到哪了时，调用 get_task 并向用户转述 progress（第几步/共几步、正在执行的工具、已耗时、token 消耗占预算），不要编造未在 progress 里的细节。',
+  '你是「任务终端」的主线 AI：用户的本地任务台总控，负责理解需求、派活、跟进、验收与汇报。',
+  '## 使命',
+  '你是用户与执行体系之间的唯一接口。凡需要动手的工作（读写文件、运行命令、联网搜索、分析数据），都由你调用 create_task 派给子智能体执行；你不直接执行任何文件或命令操作。你的职责：把目标写清楚、跟进进度、核验产物、向用户汇报。',
+  '## 你可以使用的工具',
+  '- create_task：派活。把完整目标写进 goal；创建后子智能体会自动执行，成果进入产物库。创建后向用户转述任务 ID。',
+  '- get_task：查询任务实时进度（progress）。用户问进展时调用并照实转述，不要编造。',
+  '- list_tasks：查看任务看板，掌握当前所有任务与状态。',
+  '- cancel_task：停止一个正在运行的任务。',
+  '- retry_task：重试一个失败的任务。',
+  '- search_artifacts：按关键词检索产物摘要。回答与历史工作有关的问题前先检索。',
+  '- read_artifact：读取产物正文原文。需要细节或要下结论时用它核对。',
+  '- remember：把值得长期记住的事实（用户偏好、项目背景等）写入记忆。',
+  '- recall：检索长期记忆。',
+  '- ask_user：意图不明或缺少关键信息时直接向用户提问，不要猜。',
+  '## 每轮自动注入的上下文',
+  '- 长期记忆摘要、任务看板概览、与用户消息相关的产物摘要（标题/摘要/标签，非全文）。',
+  '- 「对话记忆（早期摘要）」：更早对话的滚动摘要；它只是索引，细节用 search_artifacts/recall 核实。',
+  '- 历史里的 [图片 …] / [附件 …] 标记表示该内容当轮已真实送达并被你查看过（回放不重发本体）；基于它的当时回答继续有效，不要因为现在看不到原图就否认或撤回当时的结论。',
+  '## 汇报与引用（硬规则）',
+  '1. 汇报任务结果只引用【产物摘要】；需要细节先 search_artifacts 再 read_artifact。',
+  '2. 引用任何产物结论时，必须同时给出来源任务 ID（source_task_id）；未经 read_artifact 核对的，注明"根据摘要"。',
+  '3. 主动引用产物：回答涉及历史工作、任务成果或文件内容时，指出对应产物（标题 + ID），让用户能直接在产物库打开核对，不要等用户追问出处。',
+  '4. 摘要不等于事实：宁可多读一次原文，也不要把摘要当结论。',
+  '5. 用户询问任务进展/进度/执行到哪了时，调用 get_task 并转述 progress（第几步/共几步、正在执行的工具、已耗时、token 消耗占预算），不要编造未在 progress 里的细节。',
+  '## 对话约定',
+  '- 用中文；先给结论，再给必要细节；简洁但有信息量。',
+  '- 需要动手就派任务，不空谈；任务创建后告诉用户任务 ID，并说明可在任务页看实时进度。',
+  '- 需要用户做选择时，用 A. B. C. … 的格式每行一项列出，用户会点选。',
+  '- 子智能体失败时如实汇报原因，并给出建议（重试、取消或调整目标重派）。',
+  '- 不向用户索要敏感信息；对话与任务记录都会保存在本地数据库。',
 ].join('\n');
 
 /** 与子智能体工具表一起导出，便于装配层/测试断言十件套。 */
@@ -150,6 +175,11 @@ export interface RunMainTurnOptions {
    * 仅在 `done` 后把完整响应交给循环；缺省时仍走 `chat`，保持 M5 行为不变。
    */
   onTextDelta?: (text: string) => void;
+  /**
+   * 思考链增量转发（M13-02）。与 onTextDelta 一样仅在流式路径生效；
+   * 缺省时思考链只随 done.response.reasoningContent 返回，不逐帧转发。
+   */
+  onReasoningDelta?: (text: string) => void;
 }
 
 interface MutableUsage {
@@ -222,7 +252,7 @@ function invalidToolArguments(tool: string, message: string): MainToolResult {
 
 /**
  * 统一 provider 调用出口：没有增量回调时沿用 chat；有回调时改用 stream，
- * 把 text_delta 转发给调用方，并等 done 事件返回完整响应。
+ * 把 text_delta / reasoning_delta 转发给调用方，并等 done 事件返回完整响应。
  *
  * 注意：不能在 stream 失败时静默退回 chat——那会让同一个用户请求可能被
  * 计费两次，也会掩盖真实的网络/鉴权错误。这里只按“是否要求流式”二选一。
@@ -231,6 +261,7 @@ async function requestProviderResponse(
   provider: LlmProvider,
   params: ChatParams,
   onTextDelta: ((text: string) => void) | undefined,
+  onReasoningDelta: ((text: string) => void) | undefined,
 ): Promise<LlmResponse> {
   if (onTextDelta === undefined) {
     return provider.chat(params);
@@ -240,6 +271,12 @@ async function requestProviderResponse(
   for await (const event of provider.stream(params)) {
     if (event.type === 'text_delta') {
       if (event.text.length > 0) onTextDelta(event.text);
+      continue;
+    }
+    if (event.type === 'reasoning_delta') {
+      if (event.text.length > 0 && onReasoningDelta !== undefined) {
+        onReasoningDelta(event.text);
+      }
       continue;
     }
     if (event.type === 'done') {
@@ -355,6 +392,8 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
 
   const usage: MutableUsage = { inputTokens: 0, cachedTokens: 0, outputTokens: 0 };
   const toolTrace: MainToolTraceEntry[] = [];
+  /** 每轮思考链各一段（M13-02）；最终以空行连接后随回复落库。 */
+  const reasoningRounds: string[] = [];
   let accumulated = '';
   let reply = '';
   let capped = false;
@@ -400,6 +439,15 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
 
     const callStartedAt = Date.now();
     let response: LlmResponse;
+    // 流式路径逐帧收集本轮思考链；非流式路径退回 done/chat 响应里的全量字段。
+    let roundReasoningViaDelta = '';
+    const onReasoningDelta =
+      options.onReasoningDelta === undefined
+        ? undefined
+        : (text: string): void => {
+            roundReasoningViaDelta += text;
+            options.onReasoningDelta!(text);
+          };
     try {
       const params: ChatParams = {
         // 快照：后续轮次追加 tool 消息不应改变本次调用记录。
@@ -413,7 +461,12 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         toolChoice: 'auto',
       };
-      response = await requestProviderResponse(provider, params, options.onTextDelta);
+      response = await requestProviderResponse(
+        provider,
+        params,
+        options.onTextDelta,
+        onReasoningDelta,
+      );
     } catch (error) {
       // SPEC §4.8：失败的调用也记账（usage 未知记 0）。
       recordLlmCall(
@@ -427,6 +480,12 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
       response.usage ?? estimateTokenUsage(messages, response.content, response.toolCalls);
     addUsage(usage, measured);
     recordLlmCall(measured, latencyMs);
+
+    const roundReasoning =
+      roundReasoningViaDelta.length > 0
+        ? roundReasoningViaDelta
+        : (response.reasoningContent ?? '');
+    if (roundReasoning.length > 0) reasoningRounds.push(roundReasoning);
 
     const text = response.content ?? '';
     if (text.length > 0) {
@@ -494,10 +553,12 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
   }
 
   // 2. 最终回复落库；tokens 记本轮 output 总量（单次调用时等于该次 usage.out）。
+  const reasoning = reasoningRounds.join('\n\n');
   appendMessage(db, {
     role: 'assistant',
     content: reply,
     tokens: usage.outputTokens,
+    ...(reasoning.length > 0 ? { reasoning } : {}),
     ts: clock(),
   });
 

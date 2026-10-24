@@ -216,6 +216,7 @@ export class DeepSeekProvider implements LlmProvider {
     const firstTokenDeadline = scope.startedAt + this.firstTokenMs;
     let buffer = "";
     let text = "";
+    let reasoning = "";
     let usageRaw: unknown;
     let finishReason: string | undefined;
     let firstTokenSeen = false;
@@ -268,6 +269,13 @@ export class DeepSeekProvider implements LlmProvider {
         if (content !== undefined && content.length > 0) {
           text += content;
           events.push({ type: "text_delta", text: content });
+        }
+
+        // M13-02：reasoning 模型的思考链先于正文产出，逐帧转发并累计。
+        const reasoningPart = asString(delta.reasoning_content);
+        if (reasoningPart !== undefined && reasoningPart.length > 0) {
+          reasoning += reasoningPart;
+          events.push({ type: "reasoning_delta", text: reasoningPart });
         }
 
         const rawCalls = delta.tool_calls;
@@ -345,7 +353,11 @@ export class DeepSeekProvider implements LlmProvider {
           const line = buffer.slice(0, newline).replace(/\r$/, "");
           buffer = buffer.slice(newline + 1);
           for (const event of emitLine(line)) {
-            if (event.type === "text_delta" || event.type === "tool_call_delta") {
+            if (
+              event.type === "text_delta" ||
+              event.type === "reasoning_delta" ||
+              event.type === "tool_call_delta"
+            ) {
               firstTokenSeen = true;
             }
             yield event;
@@ -359,7 +371,11 @@ export class DeepSeekProvider implements LlmProvider {
         const trailing = buffer.replace(/\r$/, "");
         if (trailing.trim().length > 0) {
           for (const event of emitLine(trailing)) {
-            if (event.type === "text_delta" || event.type === "tool_call_delta") {
+            if (
+              event.type === "text_delta" ||
+              event.type === "reasoning_delta" ||
+              event.type === "tool_call_delta"
+            ) {
               firstTokenSeen = true;
             }
             yield event;
@@ -385,6 +401,7 @@ export class DeepSeekProvider implements LlmProvider {
         usage,
         finishReason:
           finishReason ?? (toolCalls.length > 0 ? "tool_calls" : "stop"),
+        ...(reasoning.length > 0 ? { reasoningContent: reasoning } : {}),
       };
       yield { type: "done", response };
     } finally {
@@ -493,6 +510,7 @@ export class DeepSeekProvider implements LlmProvider {
     const content = asString(message.content) ?? null;
     const toolCalls = parseToolCalls(message.tool_calls);
     const usage = mapUsage(data.usage, params.messages, content, toolCalls);
+    const reasoningPart = asString(message.reasoning_content);
     return {
       content,
       toolCalls,
@@ -500,6 +518,9 @@ export class DeepSeekProvider implements LlmProvider {
       finishReason:
         asString(choice.finish_reason) ??
         (toolCalls.length > 0 ? "tool_calls" : "stop"),
+      ...(reasoningPart !== undefined && reasoningPart.length > 0
+        ? { reasoningContent: reasoningPart }
+        : {}),
     };
   }
 

@@ -1033,9 +1033,9 @@ test("M10-03 划选引用源码：document 监听、气泡归属、坐标钳制�
     "truncateQuoteSelection",
     "clampSelectionButtonPosition",
     "<SelectionQuoteButton",
-    "<OptionChips",
+    "<OptionCards",
     "onOptionPick",
-    "setInput(text)",
+    "void send(text)",
     "setQuote(",
     "chat-quote-stack",
     "chat-quote-source",
@@ -1062,8 +1062,9 @@ test("M10-03 划选引用源码：document 监听、气泡归属、坐标钳制�
   }
 });
 
-test("M10-03 选项 chips 源码：四种序号正则、60 字符上限、多组解析与点击填入输入框", () => {
-  const chips = read("src/web/src/components/OptionChips.tsx");
+test("M10-03 选项解析与卡片源码：四种序号正则、60 字符上限、多组解析与卡片交互（M13-03 升级后解析器在 optionParse.ts）", () => {
+  // 解析器（M13-03 起抽到 optionParse.ts，供 verify 直接导入）。
+  const parser = read("src/web/src/components/optionParse.ts");
   for (const marker of [
     "OPTION_MAX_CHARS = 60",
     "[A-F]",
@@ -1074,9 +1075,21 @@ test("M10-03 选项 chips 源码：四种序号正则、60 字符上限、多组
     "parseOptionGroups",
     "OPTION_MIN_COUNT",
     "OPTION_MAX_COUNT",
-    "disabled={isPicked}",
-    "onPick(value)",
-    "chat-option-chip",
+  ]) {
+    assert.ok(parser.includes(marker), `预期 optionParse.ts 包含 ${marker}`);
+  }
+
+  // 卡片 UI（OptionChips.tsx 保留文件名，组件升级为 OptionCards）。
+  const chips = read("src/web/src/components/OptionChips.tsx");
+  for (const marker of [
+    "OptionCards",
+    "chat-option-card",
+    "chat-option-radio",
+    "chat-option-item",
+    "chat-option-send",
+    "发送所选",
+    "optionSendValue",
+    'role="radiogroup"',
   ]) {
     assert.ok(chips.includes(marker), `预期 OptionChips.tsx 包含 ${marker}`);
   }
@@ -1380,21 +1393,16 @@ test("M10-04 主线 get_task：假 provider 询问进度 → 工具被调且回�
   });
 });
 
-test("M10-04 主线提示：规则 8 要求询问进度时调用 get_task 并转述 progress", () => {
-  assert.ok(
-    MAIN_SYSTEM_PROMPT.includes(
-      "8. 用户询问任务进展/进度/执行到哪了时，调用 get_task 并向用户转述 progress",
-    ),
-    "预期系统提示包含规则 8",
-  );
+test("M10-04 主线提示：询问进度时要求调用 get_task 并转述 progress（M13-01 重写后锚点不变）", () => {
   for (const marker of [
+    "用户询问任务进展/进度/执行到哪了时，调用 get_task 并转述 progress",
     "第几步/共几步",
     "正在执行的工具",
     "已耗时",
     "token 消耗占预算",
     "不要编造未在 progress 里的细节",
   ]) {
-    assert.ok(MAIN_SYSTEM_PROMPT.includes(marker), `预期规则 8 包含 ${marker}`);
+    assert.ok(MAIN_SYSTEM_PROMPT.includes(marker), `预期系统提示包含 ${marker}`);
   }
 });
 
@@ -1497,14 +1505,14 @@ test("M10-05 main-loop：saveSettings 自定义提示 → provider system=自定
       const secondSystem = provider.calls[1]?.messages[0];
       assert.equal(secondSystem?.content, MAIN_SYSTEM_PROMPT, "预期清回 null 后恢复内置全文");
       assert.ok(
-        String(secondSystem?.content).includes("必须调用 create_task"),
-        "预期内置提示含规则 1 关键字",
+        String(secondSystem?.content).includes("调用 create_task 派给子智能体执行"),
+        "预期内置提示含派活硬规则关键字",
       );
       assert.ok(
         String(secondSystem?.content).includes(
-          "8. 用户询问任务进展/进度/执行到哪了时，调用 get_task",
+          "用户询问任务进展/进度/执行到哪了时，调用 get_task",
         ),
-        "预期内置提示规则 8 仍在",
+        "预期内置提示进度转述规则仍在",
       );
 
       // 调用方显式传入 systemPrompt 时仍优先于设置。
