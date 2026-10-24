@@ -2,6 +2,15 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M5-01 主线 AI 循环与工具集（2026-10-25）
+
+- **`runtime/ops.ts` 是纯行为等价抽取，不是重写**：把 POST /tasks、cancel、retry 的「insert/事件/表/abort」顺序原样搬进 `createTask` / `cancelTask` / `retryTask`，server 只保留 HTTP 参数整形与响应；取消 reason 的校验也放在 ops 的任务/状态检查之后，保持 M4-02 的 404→409→400 判定顺序。事件顺序、错误码、409 文案、scheduler.cancel 时机全部照 M4-02；m4.test.ts 一字未改全绿即行为不变证明，另加三条 `app.inject` 冒烟（POST /tasks、cancel、retry）锁住路由。
+- **主线工具与执行内核彻底分线**：`main-tools.ts` 只查任务/产物/事实仓储、调 ops 和写 `memory.fact_upserted`，不 import 任何文件或子进程模块；需要动手时只能 `create_task`。`create_task`/`retry_task` 成功后同步调用注入的 `onTaskCreated`（异步返回值的失败只记日志），装配层用它接 `scheduler.tick`，主线回复不等待任务执行完。
+- **`ask_user` 是主线控制流，不是子智能体的 waiting_input**：工具执行结果直接作为本轮回复（`需要向用户澄清：…`），main-loop 立即结束、不再多叫一次模型；trace 里记 `decision='ask_user_direct_reply'`，任务表不发生任何变化。
+- **工具轮上限按「已执行的工具轮」计数，收口不抛错**：每轮先调 provider，若返回 tool_calls 且已执行满 `maxToolRounds`，保留本次文本、丢弃未执行调用，返回 `[已达工具轮上限]` 说明；执行满最后一轮后不再发下一次 provider 调用，因此“无限工具剧本”不会因为多探一次而耗尽脚本。`maxToolRounds=0` 仍允许一次纯文本调用。
+- **记账与历史**：每次 provider 调用逐条写 `llm_calls`（purpose='main'、usage 真值、失败也记 0）并追加全局 `llm.call` 事件；messages 只落 user/assistant，`task_id=NULL`、seq 按主线会话递增，content 按 SPEC 存 JSON 字符串。historyLimit 默认 12 轮（取最近 24 条消息，含本轮 user），M5-02 再替换为带摘要的滑动窗口。
+- **长期事实的取代是事务性的**：同 scope+key 当前有效记录值不同时，同一事务内插入新记录并把旧记录 `superseded_by` 指向新记录，新记录 confidence 默认 0.6；同值重复 remember 只更新来源/时间，不制造重复行。`recallFacts` 只读 `superseded_by IS NULL`，按 confidence DESC、updated_at DESC 排序，query 对 key/value 做子串匹配。`read_artifact` 在 M7-01 落正文前对已有产物返回空正文，但 offset/limit 默认 2000 的分页元数据已就位。
+
 ## M4-02 REST + SSE（2026-10-24）
 
 - **直接依赖只新增 `fastify`，日志用 `console` 结构化 JSON 而不是 pino**：服务层是薄层，只做参数校验、调 store/runtime、JSON 编解码；Fastify 自带类型，因此不装 `@types/fastify`。pino 只作为 Fastify 的传递依赖存在，没有进入 `dependencies`，也没有自定义日志器。

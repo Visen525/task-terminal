@@ -2,8 +2,8 @@
  * 服务层（SPEC §4.1 / §7 M4-02）：REST 薄层 + SSE 事件流。
  *
  * 边界：本文件只做参数校验、调用 store/runtime 既有函数、JSON 编解码。
- * 不判断状态机转移、不拼 SQL、不写事件编排——取消/重试的事件顺序也严格
- * 按任务卡：先 appendEvent，再 updateTaskStatus。
+ * 不判断状态机转移、不拼 SQL、不写事件编排——创建/取消/重试的事件顺序
+ * 统一由 runtime/ops.ts 负责（M5-01 抽取，行为与 M4-02 等价）。
  *
  * SSE 的实时源是 events 表轮询（默认 150ms）：单用户量级足够，且与
  * “事件是唯一真相源”一致；不引入 ws/额外依赖，断点续传只依赖 seq。
@@ -16,23 +16,17 @@ import Fastify, {
 } from 'fastify';
 
 import { ContractError, ERROR_CODES, type ErrorCode } from '../core/errors.ts';
-import { canTransition } from '../core/state.ts';
 import {
   PERMISSION_MODES,
   TASK_STATUSES,
   type PermissionMode,
   type Task,
 } from '../core/types.ts';
+import { cancelTask, createTask, retryTask } from '../runtime/ops.ts';
 import type { Scheduler } from '../runtime/scheduler.ts';
 import { searchArtifacts } from '../store/artifacts.ts';
-import { appendEvent, listEvents, type ListEventsOptions } from '../store/events.ts';
-import {
-  getTask,
-  insertTask,
-  listRuns,
-  listTasks,
-  updateTaskStatus,
-} from '../store/repo.ts';
+import { listEvents, type ListEventsOptions } from '../store/events.ts';
+import { getTask, listTasks } from '../store/repo.ts';
 
 export interface SseOptions {
   /** 轮询 events 表间隔；默认 150ms。 */
@@ -75,10 +69,6 @@ function invalid(message: string): never {
 
 function notFound(message: string): never {
   throw new ContractError(ERROR_CODES.E_NOT_FOUND, message);
-}
-
-function conflict(message: string): never {
-  throw new ContractError(ERROR_CODES.E_CONFLICT, message);
 }
 
 function httpStatusFor(code: ErrorCode): number {
@@ -306,28 +296,17 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     const workspace = optionalString(body.workspace, 'workspace') ?? defaultWorkspace;
     const now = clock();
 
-    const task = insertTask(db, {
-      title,
-      goal,
-      workspace,
-      ...(permission === undefined ? {} : { permission }),
-      now,
-    });
-
-    appendEvent(db, {
-      taskId: task.id,
-      type: 'task.created',
-      actor: 'user',
-      payload: { title: task.title, goal: task.goal, permission: task.permission },
-      ts: now,
-    });
-    appendEvent(db, {
-      taskId: task.id,
-      type: 'task.queued',
-      actor: 'system',
-      payload: {},
-      ts: now,
-    });
+    const task = createTask(
+      db,
+      {
+        title,
+        goal,
+        workspace,
+        ...(permission === undefined ? {} : { permission }),
+        now,
+      },
+      'user',
+    );
 
     reply.code(201).send(task);
     wakeScheduler(scheduler);
@@ -357,37 +336,10 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     const id = params.id;
     if (typeof id !== 'string' || id.length === 0) invalid('任务 id 不能为空');
 
-    const task = getTask(db, id);
-    if (task === null) notFound(`任务不存在: ${id}`);
-    if (!canTransition(task.status, 'cancelled')) {
-      conflict(
-        `仅 running 任务可取消；当前状态 ${task.status}；合法转移仅 running→cancelled`,
-      );
-    }
-
     const body = asRecord(request.body);
     const rawReason = body === null ? undefined : body.reason;
-    let reason = '用户取消';
-    if (rawReason !== undefined) {
-      if (typeof rawReason !== 'string' || rawReason.trim().length === 0) {
-        invalid('reason 必须是非空字符串');
-      }
-      reason = rawReason.trim();
-    }
 
-    const now = clock();
-    appendEvent(db, {
-      taskId: task.id,
-      type: 'task.cancelled',
-      actor: 'user',
-      payload: { reason },
-      ts: now,
-    });
-    const cancelled = updateTaskStatus(db, task.id, 'cancelled', { now });
-    // 若不是当前在跑任务（例如测试里手工伪造的 running 行），返回 false，
-    // 这里已走完纯表路径，无需再处理。
-    scheduler.cancel(task.id);
-
+    const cancelled = cancelTask(db, scheduler, id, rawReason, clock());
     reply.send(cancelled);
   });
 
@@ -396,27 +348,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     const id = params.id;
     if (typeof id !== 'string' || id.length === 0) invalid('任务 id 不能为空');
 
-    const task = getTask(db, id);
-    if (task === null) notFound(`任务不存在: ${id}`);
-    if (!canTransition(task.status, 'queued')) {
-      conflict(`仅 failed 任务可重试；当前状态 ${task.status}`);
-    }
-
-    const attempts = listRuns(db, task.id).length;
-    if (attempts >= 3) {
-      conflict(`任务已用尽 3 次尝试（attempt=${attempts}），不能再重试`);
-    }
-
-    const now = clock();
-    appendEvent(db, {
-      taskId: task.id,
-      type: 'task.queued',
-      actor: 'system',
-      payload: {},
-      ts: now,
-    });
-    const queued = updateTaskStatus(db, task.id, 'queued', { now });
-
+    const queued = retryTask(db, id, clock());
     reply.send(queued);
     wakeScheduler(scheduler);
   });
