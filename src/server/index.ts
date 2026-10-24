@@ -16,11 +16,12 @@ import {
   realpathSync,
   statSync,
 } from 'node:fs';
-import { join, parse as parsePath, resolve as resolvePath } from 'node:path';
+import { join, parse as parsePath, resolve as resolvePath, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 
 import Fastify, {
   type FastifyInstance,
+  type FastifyReply,
   type FastifyRequest,
 } from 'fastify';
 
@@ -100,6 +101,12 @@ export interface CreateAppOptions {
   requireApiKey?: boolean;
   /** 对话附件落盘根目录；默认 <cwd>/data/uploads（测试可注入临时目录）。 */
   uploadsDir?: string;
+  /**
+   * 生产静态托管根目录（M14-01），指向 `pnpm build` 产物（默认 dist/）。
+   * 提供且目录存在时注册 GET / 与 GET /assets/*，单进程即完整应用；
+   * 缺省时行为与此前完全一致（仅 API/SSE）。
+   */
+  webDir?: string;
   /** 可注入时钟；默认 Date.now。 */
   now?: () => number;
   sse?: SseOptions;
@@ -980,7 +987,96 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     closeAllSse();
   });
 
+  // ── 生产静态托管（M14-01）─────────────────────────────────────
+  // 前端是状态导航（无路径路由），GET / 与 GET /assets/* 两条精确路由即覆盖
+  // 构建产物；未知路径维持 fastify 默认 404，既有 API 语义零影响。
+  if (options.webDir !== undefined) {
+    const webRoot = resolvePath(options.webDir);
+    const assetsRoot = join(webRoot, 'assets');
+    if (existsWebIndex(webRoot)) {
+      app.get('/', async (_request, reply) => {
+        return serveWebFile(reply, join(webRoot, 'index.html'), 'no-cache');
+      });
+      app.get('/favicon.ico', async (_request, reply) => {
+        return serveWebFile(reply, join(webRoot, 'favicon.ico'), 'no-cache');
+      });
+      app.get('/assets/*', async (request, reply) => {
+        const raw =
+          (request.params as Record<string, unknown>)['*'] ?? '';
+        const relative = typeof raw === 'string' ? raw : '';
+        // fastify 已对 params 做过 URL 解码；resolve 归一化后必须仍落在
+        // assets/ 内，../ 与绝对路径形态一律 404（与 API 越界同样的语义）。
+        const target = resolvePath(join(assetsRoot, relative));
+        if (target !== assetsRoot && !target.startsWith(assetsRoot + sep)) {
+          notFound('静态资源不存在');
+        }
+        // 构建产物文件名带内容 hash，可 immutable 长缓存。
+        return serveWebFile(
+          reply,
+          target,
+          'public, max-age=31536000, immutable',
+        );
+      });
+    }
+  }
+
   return app;
+}
+
+/** 静态托管文件下发：读不到（构建缺失/路径不存在）按 404 JSON 返回。 */
+function serveWebFile(
+  reply: FastifyReply,
+  filePath: string,
+  cacheControl: string,
+): FastifyReply {
+  let body: Buffer;
+  try {
+    body = readFileSync(filePath);
+  } catch {
+    reply.code(404);
+    return reply.send({
+      error: { code: ERROR_CODES.E_NOT_FOUND, message: '静态资源不存在' },
+    });
+  }
+  reply.header('Cache-Control', cacheControl);
+  return reply.type(mimeTypeFor(filePath)).send(body);
+}
+
+function existsWebIndex(webRoot: string): boolean {
+  try {
+    accessSync(join(webRoot, 'index.html'), fsConstants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 构建产物里的扩展名 → Content-Type（覆盖 vite 输出的全部类型）。 */
+function mimeTypeFor(filePath: string): string {
+  const suffix = filePath.slice(filePath.lastIndexOf('.') + 1).toLowerCase();
+  switch (suffix) {
+    case 'html':
+      return 'text/html; charset=utf-8';
+    case 'js':
+    case 'mjs':
+      return 'text/javascript; charset=utf-8';
+    case 'css':
+      return 'text/css; charset=utf-8';
+    case 'json':
+      return 'application/json; charset=utf-8';
+    case 'svg':
+      return 'image/svg+xml';
+    case 'ico':
+      return 'image/x-icon';
+    case 'png':
+      return 'image/png';
+    case 'woff':
+      return 'font/woff';
+    case 'woff2':
+      return 'font/woff2';
+    default:
+      return 'application/octet-stream';
+  }
 }
 
 export default createApp;

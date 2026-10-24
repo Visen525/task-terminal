@@ -10,7 +10,7 @@
  *
  * 安全：.env 只解析、不回显；日志与错误信息都不包含 key 值。
  */
-import { mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,9 +26,9 @@ import {
   resolveDefaultWorkspace,
 } from './store/settings.ts';
 
-// M11-01：官方联网工具只在启动装配层加入子智能体工具表；executeTool 的
-// TOOL_SPECS 仍保持 M3 验收时的六件套，既有断言零改动。
-installWebToolSpecs(AGENT_TOOL_SPECS);
+    // M11-01：官方联网工具只在启动装配层加入子智能体工具表；executeTool 的
+    // TOOL_SPECS 仍保持 M3 验收时的六件套，既有断言零改动。
+    installWebToolSpecs(AGENT_TOOL_SPECS);
 
 /** 端口常量；SPEC 未指定端口号，取 4310 并由 PORT 覆盖。 */
 export const DEFAULT_PORT = 4310;
@@ -122,6 +122,11 @@ function logWarn(message: string, fields: Record<string, unknown> = {}): void {
 async function main(): Promise<void> {
   const config = readConfig();
 
+  // M14-01：dist/（pnpm build 产物）存在时交给 server 托管；缺失则纯 API 模式。
+  const webDir: string | null = existsSync(join(REPO_ROOT, 'dist', 'index.html'))
+    ? join(REPO_ROOT, 'dist')
+    : null;
+
   const db = openDatabase(config.dbPath);
   try {
     // 启动装配与每次请求共用同一解析顺序：settings > env WORKSPACE_DIR > <repo>/workspace。
@@ -170,6 +175,8 @@ async function main(): Promise<void> {
       mainAi: { provider },
       // 生产装配显式开启：无 key 时 /chat 直接 503，而不是把空 key 交给 provider。
       requireApiKey: true,
+      // M14-01：dist/ 存在时由本进程直接托管前端，单进程即完整应用。
+      ...(webDir === null ? {} : { webDir }),
     });
 
     if (startupApiKey === null) {
@@ -205,6 +212,7 @@ async function main(): Promise<void> {
       db: config.dbPath,
       workspace,
       ai: startupApiKey === null ? 'disabled' : 'enabled',
+      web: webDir === null ? 'off' : 'on',
     });
   } catch (error) {
     db.close();

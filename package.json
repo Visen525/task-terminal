@@ -26,7 +26,8 @@
     "verify:m10": "node --test --test-isolation=none scripts/verify/m10.test.ts",
     "verify:m11": "node --test --test-isolation=none scripts/verify/m11.test.ts",
     "verify:m12": "node --test --test-isolation=none scripts/verify/m12.test.ts",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "start": "node src/index.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

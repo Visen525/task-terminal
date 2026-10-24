@@ -10,7 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type ServerResponse } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -393,4 +393,108 @@ test("M13-03 解析器：四种序号回归（A/1/①/（一））不受升级�
   const chinese = parseOptionGroups(["（一）甲", "（二）乙"].join("\n"));
   assert.equal(chinese[0]?.kind, "chinese");
   assert.ok(latin.every((group) => group.items.length === 2));
+});
+
+// ════════════════════════════════════════════════════════════════
+// M14-01 生产静态托管（webDir）
+// ════════════════════════════════════════════════════════════════
+
+test("M14-01 静态托管：GET / 与 /assets/* 下发文件，越界 404；无 webDir 时保持 404", { timeout: 30_000 }, async () => {
+  const base = mkdtempSync(join(tmpdir(), "task-terminal-m14-"));
+  const webDir = join(base, "dist");
+  mkdirSync(join(webDir, "assets"), { recursive: true });
+  writeFileSync(join(webDir, "index.html"), "<!doctype html><title>tt</title>");
+  writeFileSync(join(webDir, "favicon.ico"), "ICOBYTES");
+  writeFileSync(join(webDir, "assets", "app-BEyc.js"), "console.log('app')");
+  writeFileSync(join(base, "secret.txt"), "no-leak");
+
+  const db = openDatabase(":memory:");
+  const scheduler: Scheduler = {
+    tick: async () => ({ started: false, reason: "empty" }),
+    runAll: async () => [],
+    shutdown: async () => undefined,
+    cancel: () => false,
+  };
+
+  const makeServer = async (withWebDir: boolean) => {
+    const app = createApp({
+      db,
+      scheduler,
+      defaultWorkspace: base,
+      ...(withWebDir ? { webDir } : {}),
+    });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    assert.ok(address !== null && typeof address === "object");
+    return { app, url: `http://127.0.0.1:${String(address.port)}` };
+  };
+
+  try {
+    // 带 webDir：三条静态路由 + 越界防护。
+    const on = await makeServer(true);
+    try {
+      const indexResponse = await fetch(`${on.url}/`);
+      assert.equal(indexResponse.status, 200);
+      assert.match(indexResponse.headers.get("content-type") ?? "", /text\/html/u);
+      assert.equal(await indexResponse.text(), "<!doctype html><title>tt</title>");
+      assert.match(indexResponse.headers.get("cache-control") ?? "", /no-cache/u);
+
+      const jsResponse = await fetch(`${on.url}/assets/app-BEyc.js`);
+      assert.equal(jsResponse.status, 200);
+      assert.match(jsResponse.headers.get("content-type") ?? "", /text\/javascript/u);
+      assert.match(jsResponse.headers.get("cache-control") ?? "", /immutable/u);
+      assert.equal(await jsResponse.text(), "console.log('app')");
+
+      const icoResponse = await fetch(`${on.url}/favicon.ico`);
+      assert.equal(icoResponse.status, 200);
+      assert.equal(await icoResponse.text(), "ICOBYTES");
+
+      // 路径逃逸：.. 形态不允许读到 assets/ 外的文件。
+      const escapeResponse = await fetch(`${on.url}/assets/..%2F..%2Fsecret.txt`);
+      assert.equal(escapeResponse.status, 404, "预期越界路径 404");
+      const escapeResponse2 = await fetch(`${on.url}/assets/%2e%2e%2fsecret.txt`);
+      assert.equal(escapeResponse2.status, 404, "预期编码越界路径 404");
+      // 不存在的 asset → 404 JSON（不是 index.html 兜底）。
+      const missingResponse = await fetch(`${on.url}/assets/nope.js`);
+      assert.equal(missingResponse.status, 404);
+      // API 行为不受影响。
+      const tasksResponse = await fetch(`${on.url}/tasks`);
+      assert.equal(tasksResponse.status, 200);
+    } finally {
+      await on.app.close();
+    }
+
+    // 不带 webDir：GET / 维持 fastify 默认 404（既有嵌入行为不变）。
+    const off = await makeServer(false);
+    try {
+      const rootResponse = await fetch(`${off.url}/`);
+      assert.equal(rootResponse.status, 404, "预期无 webDir 时 GET / 为 404");
+    } finally {
+      await off.app.close();
+    }
+  } finally {
+    db.close();
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("M14-01 装配与启动脚本：src/index.ts 注入 webDir、start.cmd 与 start 脚本存在", () => {
+  const entry = read("src/index.ts");
+  for (const marker of ["webDir", "existsSync(join(REPO_ROOT, 'dist', 'index.html'))"]) {
+    assert.ok(entry.includes(marker), `预期 src/index.ts 包含 ${marker}`);
+  }
+  const pkg = read("package.json");
+  assert.ok(pkg.includes('"start": "node src/index.ts"'), "预期 package.json 有 start 脚本");
+  const cmd = read("start.cmd");
+  for (const marker of [
+    "node src\\index.ts",
+    "dist\\index.html",
+    "pnpm install",
+    "pnpm build",
+    "start %APP_URL%",
+    "4310",
+  ]) {
+    assert.ok(cmd.includes(marker), `预期 start.cmd 包含 ${marker}`);
+  }
+  assert.ok(existsSync(join(root, "src", "web", "public", "favicon.ico")), "预期 favicon.ico 存在");
 });
