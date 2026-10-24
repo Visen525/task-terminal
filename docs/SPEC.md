@@ -497,7 +497,7 @@ MIT。仓库根放 `LICENSE`（标准 MIT 全文，版权行：`Copyright (c) 20
 
 - 任何 API key、token、账号信息
 - `data/`、`workspace/`（个人数据）
-- 个人绝对路径（如 `D:\任务终端`）写死在代码或文档里
+- 个人绝对路径（如 `D:\my-projects\task-terminal` 这类写死的本机盘符路径）出现在代码或文档里
 - 日志文件、数据库文件
 - 从来源不明或许可证不兼容的项目整段复制的代码
 
