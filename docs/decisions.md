@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M3-01 executeTool 单一出口与路径校验（2026-10-24）
+
+- **路径判定顺序固定为：权限 → UNC/设备路径预检 → resolve → 最深存在祖先 realpath → 拼回不存在尾段 → 大小写归一化前缀比较**。先 realpath 再比较，才能让 symlink、`\\?\` 扩展前缀和 8.3 短名都落在真实目标上；不存在的新文件（未来 `write_file`）用“最深存在祖先 + 剩余相对段”解析，不会因 realpath 抛 ENOENT 而误判。Windows 比较前统一转小写并归一化分隔符；工作区根由 `createToolContext` 启动时 realpath 一次并缓存。percent 解码最多三层，原文和每一层解码形态都校验，避免 `%2e%2e%2f` 类编码变体绕过。
+- **硬拒绝的判定顺序：read-only 权限 → argv 形状 → argv[0] basename 硬拒绝清单 → reg delete / cipher /w / powershell EncodedCommand → shell 命令串（管道、内层硬拒绝命令、内层删除族）→ 删除族路径参数 → cwd 路径 → spawn**。所有拒绝都在创建输出文件与 spawn 之前完成；危险命令无论 cwd 是否合法都先拒。shell 串里的管道一律拒，即使管道字符出现在引号里也保守拒绝。
+- **删除族（del/erase/rd/rmdir/rm）的保守规则**：所有非开关参数都当路径校验；Windows 的 `/s` `/q` 等开关跳过，`-` 开头按文件名校验；POSIX 的 `-rf` 等开关跳过，`--` 之后全部按路径校验。通配符和 `%VAR%`/`$VAR` 按字面量解析，能识别的 `..`、绝对路径、UNC、`\\?\` 逃逸都会拒；工作区根自身也不允许交给删除族。shell 串内对每个 token 都按硬拒绝/删除词匹配（宁可误拒 `echo format`），并额外识别 PowerShell 的 `Remove-Item`/`ri`，以覆盖 `call`/`start`/嵌套 powershell 等包装。局限：参数解析仍无法覆盖解释器（如 `node -e`、`python` 自行删文件）、复杂变量展开和未列出的删除 API；被 shell 包裹的删除族因此**一律拒绝**而不是尝试解析。硬拒绝是纵深防御，不是 OS 沙箱。
+- **超时默认 120s（SPEC 未单列工具超时，与 provider 读取超时对齐）**，到点执行 `taskkill /PID <pid> /T /F`；若受限环境 taskkill 不可用则退回 `child.kill('SIGKILL')`。stdout/stderr 用临时文件描述符收集而不是 pipe：受限执行环境可能禁止创建命名管道（本机验收时 spawn pipe 会 EPERM），且全量输出本来就要落盘到 `data/tool-outputs/<runId>/`，文件方式同时避免管道背压。
+- **返回输出 >200KB 时保留头尾并注明截断，全量原文单独落盘；事件无论成败都严格一对**（`agent.tool_call` + `agent.tool_result`，失败结果带 `code`；非零退出用本地结果码 `E_TOOL_EXIT`，不扩展 core 错误码）。本卡只内建 `read_file` / `run_command` 两个验收载体，写路径权限校验通过导出的 `resolveWorkspacePath(..., 'write')` 提供给 M3-02 的 `write_file` 等工具复用，避免提前复制六个工具。
+
 ## M2-01 DeepSeek 适配（2026-10-24）
 
 - **不引 SDK，直接用 Node 24 内置 fetch**：只有 chat / stream / balance 三个端点，适配层自己控制超时、重试和脱敏；少一个依赖面，也不会把 SDK 的默认重试行为混进我们的策略。

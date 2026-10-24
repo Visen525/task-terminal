@@ -10,10 +10,11 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "verify": "pnpm run typecheck && node --test --test-isolation=none scripts/verify/m0.test.ts scripts/verify/m1.test.ts scripts/verify/m2.test.ts",
+    "verify": "pnpm run typecheck && node --test --test-isolation=none scripts/verify/m0.test.ts scripts/verify/m1.test.ts scripts/verify/m2.test.ts scripts/verify/m3.test.ts",
     "verify:m0": "node --test --test-isolation=none scripts/verify/m0.test.ts",
     "verify:m1": "node --test --test-isolation=none scripts/verify/m1.test.ts",
     "verify:m2": "node --test --test-isolation=none scripts/verify/m2.test.ts",
+    "verify:m3": "node --test --test-isolation=none scripts/verify/m3.test.ts",
     "format": "prettier --write ."
   },
   "devDependencies": {
