@@ -16,7 +16,8 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
 import { ContractError, ERROR_CODES, type ErrorCode } from "../../src/core/errors.ts";
-import type { TaskEvent } from "../../src/core/types.ts";
+import { foldEvents } from "../../src/core/fold.ts";
+import type { LlmToolCall, TaskEvent } from "../../src/core/types.ts";
 import {
   TOOL_SPECS,
   createToolContext,
@@ -25,7 +26,21 @@ import {
   type CreateToolContextOptions,
   type ToolContext,
 } from "../../src/agent/executeTool.ts";
-import { listEvents } from "../../src/store/events.ts";
+import {
+  ASK_USER_SPEC,
+  DEFAULT_LOOP_LIMITS,
+  runLoop,
+  type LoopTask,
+  type RunLoopOptions,
+} from "../../src/agent/loop.ts";
+import { buildAgentPrompt } from "../../src/agent/prompt.ts";
+import {
+  RESULT_CONSTRAINTS,
+  SUBMIT_RESULT_SPEC,
+  validateSubmitResult,
+} from "../../src/agent/result-validator.ts";
+import { FakeProvider, type FakeStep } from "../../src/providers/fake.ts";
+import { appendEvent, listEvents } from "../../src/store/events.ts";
 import { openDatabase } from "../../src/store/migrate.ts";
 
 // ── 临时工作区夹具 ───────────────────────────────────────────────
@@ -853,4 +868,780 @@ test("M3-02 TOOL_SPECS 覆盖六件套，JSON Schema 的 required/properties/typ
   assert.ok(runSpec !== undefined);
   const runProperties = specRecord(specRecord(runSpec.parameters).properties);
   assert.equal(specRecord(runProperties.argv).type, "array");
+});
+
+// ════════════════════════════════════════════════════════════════
+// M3-03 agent loop + 假 provider
+// ════════════════════════════════════════════════════════════════
+
+function makeLoopTask(fixture: Fixture, id: string): LoopTask {
+  const task: LoopTask = {
+    id,
+    title: "loop 测试任务",
+    goal: "读取工作区数据并给出结论",
+    permission: "workspace-write",
+    workspace: fixture.workspace,
+  };
+  appendEvent(fixture.db, {
+    taskId: id,
+    type: "task.created",
+    actor: "user",
+    payload: { title: "loop 测试任务", goal: task.goal, permission: task.permission },
+  });
+  appendEvent(fixture.db, {
+    taskId: id,
+    type: "task.started",
+    actor: "system",
+    payload: { run_id: "r_loop" },
+  });
+  return task;
+}
+
+function loopCall(id: string, name: string, args: unknown): LlmToolCall {
+  return { id, type: "function", function: { name, arguments: JSON.stringify(args) } };
+}
+
+function loopLimits(overrides: Partial<RunLoopOptions["limits"]> = {}): NonNullable<RunLoopOptions["limits"]> {
+  return { maxSteps: 10, maxTokens: 1_000_000, wallMs: 30_000, ...overrides };
+}
+
+function taskEvents(fixture: Fixture, task: LoopTask): TaskEvent[] {
+  return listEvents(fixture.db, { taskId: task.id, limit: 1000 });
+}
+
+function segmentsByStep(events: readonly TaskEvent[]): TaskEvent[][] {
+  const segments: TaskEvent[][] = [];
+  for (const event of events) {
+    if (event.type === "agent.step") {
+      segments.push([event]);
+      continue;
+    }
+    const current = segments[segments.length - 1];
+    if (current !== undefined) current.push(event);
+  }
+  return segments;
+}
+
+function countType(events: readonly TaskEvent[], type: TaskEvent["type"]): number {
+  return events.filter((event) => event.type === type).length;
+}
+
+interface SchemaNode {
+  type?: string;
+  required?: string[];
+  additionalProperties?: boolean;
+  properties?: Record<string, SchemaNode>;
+  items?: SchemaNode;
+  enum?: string[];
+  minLength?: number;
+  maxLength?: number;
+  maxItems?: number;
+}
+
+function schemaChild(parent: SchemaNode, key: string): SchemaNode {
+  const properties = parent.properties;
+  assert.ok(properties !== undefined, `schema 缺少 properties`);
+  const child = properties[key];
+  assert.ok(child !== undefined, `schema 缺少 ${key}`);
+  return child;
+}
+
+// ── 15. 系统提示 ────────────────────────────────────────────────
+
+test("M3-03 系统提示包含目标、权限、只能访问工作区与四条规则", () => {
+  const prompt = buildAgentPrompt(
+    { id: "t_prompt", goal: "把 data.csv 整理成月度分析", permission: "read-only" },
+    "read-only",
+  );
+  const requiredTexts = [
+    "把 data.csv 整理成月度分析",
+    "read-only",
+    "只能访问工作区",
+    "submit_result",
+    "不要假装完成",
+    "1. 每完成一步就继续下一步，直到完成。",
+    "2. 结束时必须调用 submit_result，包含 summary / findings / artifacts。",
+    "3. 做不到就调用 submit_result 并在 summary 里说明原因，不要假装完成。",
+    "4. 不要做任务目标之外的事情。",
+  ];
+  for (const text of requiredTexts) {
+    assert.ok(prompt.includes(text), `系统提示缺少：${text}\n---\n${prompt}`);
+  }
+
+  // 显式 permission 优先于 task.permission。
+  const readOnlyPrompt = buildAgentPrompt(
+    { goal: "x", permission: "workspace-write" },
+    "read-only",
+  );
+  assert.ok(readOnlyPrompt.includes("read-only（只读）"));
+  assert.equal(readOnlyPrompt.includes("workspace-write（读写）"), false);
+});
+
+// ── 16. 校验器与 schema 防漂移 ──────────────────────────────────
+
+test("M3-03 submit_result 校验器与 schemas/result.schema.json 逐项一致", () => {
+  const schema = JSON.parse(
+    readFileSync(new URL("../../schemas/result.schema.json", import.meta.url), "utf8"),
+  ) as SchemaNode;
+
+  assert.equal(schema.type, "object");
+  assert.ok(schema.required !== undefined);
+  assert.deepEqual(schema.required, [...RESULT_CONSTRAINTS.required]);
+  assert.equal(schema.additionalProperties, RESULT_CONSTRAINTS.additionalProperties);
+
+  const summary = schemaChild(schema, "summary");
+  assert.equal(summary.type, "string");
+  assert.equal(summary.minLength, RESULT_CONSTRAINTS.summary.minLength);
+  assert.equal(summary.maxLength, RESULT_CONSTRAINTS.summary.maxLength);
+
+  const findings = schemaChild(schema, "findings");
+  assert.equal(findings.type, "array");
+  assert.equal(findings.maxItems, RESULT_CONSTRAINTS.findings.maxItems);
+  const findingItem = findings.items;
+  assert.ok(findingItem !== undefined, "findings.items 缺失");
+  assert.equal(findingItem.type, "string");
+  assert.equal(findingItem.minLength, RESULT_CONSTRAINTS.findings.item.minLength);
+  assert.equal(findingItem.maxLength, RESULT_CONSTRAINTS.findings.item.maxLength);
+
+  const artifacts = schemaChild(schema, "artifacts");
+  assert.equal(artifacts.type, "array");
+  assert.equal(artifacts.maxItems, RESULT_CONSTRAINTS.artifacts.maxItems);
+  const artifactItem = artifacts.items;
+  assert.ok(artifactItem !== undefined, "artifacts.items 缺失");
+  assert.equal(artifactItem.type, "object");
+  assert.ok(artifactItem.required !== undefined);
+  assert.deepEqual(artifactItem.required, [...RESULT_CONSTRAINTS.artifacts.required]);
+  assert.equal(
+    artifactItem.additionalProperties,
+    RESULT_CONSTRAINTS.artifacts.additionalProperties,
+  );
+
+  const kind = schemaChild(artifactItem, "kind");
+  assert.deepEqual(kind.enum, [...RESULT_CONSTRAINTS.artifacts.kinds]);
+  const title = schemaChild(artifactItem, "title");
+  assert.equal(title.minLength, RESULT_CONSTRAINTS.artifacts.title.minLength);
+  assert.equal(title.maxLength, RESULT_CONSTRAINTS.artifacts.title.maxLength);
+  const path = schemaChild(artifactItem, "path");
+  assert.equal(path.minLength, RESULT_CONSTRAINTS.artifacts.path.minLength);
+  assert.equal(path.maxLength, RESULT_CONSTRAINTS.artifacts.path.maxLength);
+  const artifactSummary = schemaChild(artifactItem, "summary");
+  assert.equal(artifactSummary.minLength, RESULT_CONSTRAINTS.artifacts.summary.minLength);
+  assert.equal(artifactSummary.maxLength, RESULT_CONSTRAINTS.artifacts.summary.maxLength);
+  const tags = schemaChild(artifactItem, "tags");
+  assert.equal(tags.maxItems, RESULT_CONSTRAINTS.artifacts.tags.maxItems);
+  const tagItem = tags.items;
+  assert.ok(tagItem !== undefined, "artifacts.tags.items 缺失");
+  assert.equal(tagItem.minLength, RESULT_CONSTRAINTS.artifacts.tags.item.minLength);
+  assert.equal(tagItem.maxLength, RESULT_CONSTRAINTS.artifacts.tags.item.maxLength);
+
+  // ToolSpec 也由同一约束生成，不能成为第二份会漂移的契约。
+  const specParameters = SUBMIT_RESULT_SPEC.parameters as SchemaNode;
+  assert.ok(specParameters.required !== undefined);
+  assert.deepEqual(specParameters.required, [...RESULT_CONSTRAINTS.required]);
+  assert.equal(schemaChild(specParameters, "summary").maxLength, RESULT_CONSTRAINTS.summary.maxLength);
+  assert.equal(schemaChild(specParameters, "findings").maxItems, RESULT_CONSTRAINTS.findings.maxItems);
+  const specArtifacts = schemaChild(specParameters, "artifacts");
+  assert.equal(specArtifacts.maxItems, RESULT_CONSTRAINTS.artifacts.maxItems);
+  const specArtifactItem = specArtifacts.items;
+  assert.ok(specArtifactItem !== undefined, "submit_result.artifacts.items 缺失");
+  assert.deepEqual(
+    schemaChild(specArtifactItem, "kind").enum,
+    [...RESULT_CONSTRAINTS.artifacts.kinds],
+  );
+});
+
+test("M3-03 submit_result 校验：合法通过，缺字段 / kind 越界 / 超长返回中文错误", () => {
+  const valid = {
+    summary: "已整理月度分析",
+    findings: ["1 月金额最高"],
+    artifacts: [
+      { kind: "file", title: "月报", path: "out/report.md", summary: "月报文件", tags: ["csv"] },
+    ],
+  };
+  const passed = validateSubmitResult(valid);
+  assert.ok(passed.ok, `合法结果被拒：${passed.ok ? "" : passed.errors.join("；")}`);
+  assert.deepEqual(passed.value, valid);
+
+  const invalidCases: Array<{ name: string; value: unknown; expected: string[] }> = [
+    { name: "缺 findings", value: { summary: "x", artifacts: [] }, expected: ["findings", "必填"] },
+    {
+      name: "kind 越界",
+      value: {
+        summary: "x",
+        findings: [],
+        artifacts: [{ kind: "video", title: "t", summary: "s" }],
+      },
+      expected: ["artifacts[0].kind", "file / note / dataset / patch"],
+    },
+    {
+      name: "summary 超长",
+      value: { summary: "a".repeat(4001), findings: [], artifacts: [] },
+      expected: ["summary", "4000"],
+    },
+    {
+      name: "多余字段",
+      value: { summary: "x", findings: [], artifacts: [], extra: true },
+      expected: ["extra", "不允许的字段"],
+    },
+    {
+      name: "findings 超限",
+      value: { summary: "x", findings: Array.from({ length: 51 }, () => "f"), artifacts: [] },
+      expected: ["findings", "最多 50 项"],
+    },
+  ];
+
+  for (const testCase of invalidCases) {
+    const result = validateSubmitResult(testCase.value);
+    assert.equal(result.ok, false, `${testCase.name} 应校验失败`);
+    if (result.ok) continue;
+    for (const expected of testCase.expected) {
+      assert.ok(
+        result.errors.some((error) => error.includes(expected)),
+        `${testCase.name}：错误列表应包含 ${expected}，实际为 ${result.errors.join(" | ")}`,
+      );
+    }
+  }
+});
+
+// ── 17. 三步剧本全链路 ──────────────────────────────────────────
+
+test("M3-03 三步剧本（文本 → read_file → submit_result）全链路，usage 累计正确", async () => {
+  await withSandbox(async (fixture) => {
+    writeFileSync(join(fixture.workspace, "report.csv"), "月份,金额\n1月,100\n2月,80\n");
+    const task = makeLoopTask(fixture, "t_loop_three");
+    const provider = new FakeProvider([
+      {
+        content: "先读取数据文件。",
+        usage: { inputTokens: 10, cachedTokens: 2, outputTokens: 4, estimated: false },
+      },
+      {
+        toolCalls: [loopCall("call_read", "read_file", { path: "report.csv" })],
+        usage: { inputTokens: 20, cachedTokens: 0, outputTokens: 6, estimated: false },
+      },
+      {
+        toolCalls: [
+          loopCall("call_submit", "submit_result", {
+            summary: "已读取并总结",
+            findings: ["金额合计 180"],
+            artifacts: [],
+          }),
+        ],
+        usage: { inputTokens: 30, cachedTokens: 1, outputTokens: 8, estimated: false },
+      },
+    ]);
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits(),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "completed", `期望 completed，实际 ${outcome.status}`);
+    assert.equal(outcome.steps, 3);
+    assert.deepEqual(outcome.usage, {
+      inputTokens: 60,
+      cachedTokens: 3,
+      outputTokens: 18,
+      totalTokens: 78,
+    });
+    assert.deepEqual(JSON.parse(outcome.resultJson), {
+      summary: "已读取并总结",
+      findings: ["金额合计 180"],
+      artifacts: [],
+    });
+
+    // 工具真的执行了：第二次调用时模型已看到 read_file 的真实内容。
+    assert.equal(provider.calls.length, 3);
+    const thirdMessages = provider.calls[2]?.messages ?? [];
+    const readToolMessage = thirdMessages.find(
+      (message) => message.role === "tool" && message.toolCallId === "call_read",
+    );
+    assert.ok(readToolMessage !== undefined, "第三次调用缺少 read_file 的 tool 结果");
+    assert.ok(readToolMessage.content.includes("月份,金额"));
+    assert.ok(readToolMessage.content.includes("2月,80"));
+
+    // 工具声明包含六件套 + ask_user + submit_result。
+    const firstCall = provider.calls[0];
+    assert.ok(firstCall !== undefined);
+    const toolNames = (firstCall.tools ?? []).map((tool) => tool.name);
+    for (const name of [...TOOL_SPECS.map((spec) => spec.name), ASK_USER_SPEC.name, "submit_result"]) {
+      assert.ok(toolNames.includes(name), `provider 未收到工具声明：${name}`);
+    }
+
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "agent.step"), 3);
+    assert.equal(countType(events, "llm.call"), 3);
+    assert.equal(countType(events, "agent.message"), 1);
+    assert.equal(countType(events, "task.failed"), 0);
+
+    const completedEvent = events.find((event) => event.type === "task.completed");
+    assert.ok(completedEvent !== undefined, "缺少 task.completed 事件");
+    assert.deepEqual(payloadOf(completedEvent).result_json, {
+      summary: "已读取并总结",
+      findings: ["金额合计 180"],
+      artifacts: [],
+    });
+
+    const folded = foldEvents(events);
+    assert.equal(folded.status, "completed");
+    assert.ok(folded.resultJson !== null);
+    assert.deepEqual(JSON.parse(folded.resultJson), JSON.parse(outcome.resultJson));
+  });
+});
+
+// ── 18. 不变量 a：每步事件 ──────────────────────────────────────
+
+test("M3-03 不变量 a：N 步恰好 N 条 agent.step，每步有 llm.call，工具步有 call/result", async () => {
+  await withSandbox(async (fixture) => {
+    writeFileSync(join(fixture.workspace, "note.txt"), "loop-step-check");
+    const task = makeLoopTask(fixture, "t_loop_steps");
+    const provider = new FakeProvider([
+      { content: "第一步先说明计划，不调用工具。" },
+      { toolCalls: [loopCall("call_read", "read_file", { path: "note.txt" })] },
+      {
+        toolCalls: [
+          loopCall("call_submit", "submit_result", {
+            summary: "完成",
+            findings: ["note.txt 内容已读"],
+            artifacts: [],
+          }),
+        ],
+      },
+    ]);
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits(),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+    assert.ok(outcome.status === "completed", `期望 completed，实际 ${outcome.status}`);
+
+    const events = taskEvents(fixture, task);
+    const segments = segmentsByStep(events);
+    assert.equal(segments.length, 3, `期望 3 步，实际 ${segments.length}`);
+    assert.equal(countType(events, "agent.step"), 3);
+    assert.equal(outcome.steps, 3);
+
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      assert.ok(segment !== undefined);
+      assert.equal(segment[0]?.type, "agent.step", `第 ${index + 1} 段未以 agent.step 开头`);
+      assert.ok(
+        segment.some((event) => event.type === "llm.call"),
+        `第 ${index + 1} 步缺少 llm.call`,
+      );
+    }
+
+    // 第 1 步是纯聊步：允许没有工具事件，但必须有 agent.message。
+    const firstSegment = segments[0];
+    assert.ok(firstSegment !== undefined);
+    assert.ok(firstSegment.some((event) => event.type === "agent.message"));
+    assert.equal(firstSegment.some((event) => event.type === "agent.tool_call"), false);
+
+    // 第 2、3 步是工具步：至少一条 tool_call + 一条 tool_result。
+    for (const index of [1, 2]) {
+      const segment = segments[index];
+      assert.ok(segment !== undefined);
+      assert.ok(
+        segment.some((event) => event.type === "agent.tool_call"),
+        `第 ${index + 1} 步缺少 agent.tool_call`,
+      );
+      assert.ok(
+        segment.some((event) => event.type === "agent.tool_result"),
+        `第 ${index + 1} 步缺少 agent.tool_result`,
+      );
+    }
+  });
+});
+
+// ── 19. 不变量 b：失败转终态 ────────────────────────────────────
+
+test("M3-03 不变量 b：provider 抛错也转成 task.failed{reason:exception}，可 fold 出 failed", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeLoopTask(fixture, "t_loop_exception");
+    const provider = new FakeProvider([
+      { error: new ContractError(ERROR_CODES.E_PROVIDER_HTTP, "provider 返回 500") },
+    ]);
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits(),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "failed", `期望 failed，实际 ${outcome.status}`);
+    assert.equal(outcome.reason, "exception");
+    assert.equal(outcome.error?.code, ERROR_CODES.E_PROVIDER_HTTP);
+
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "agent.step"), 1);
+    assert.equal(countType(events, "llm.call"), 1, "失败的 LLM 调用也要留 llm.call 事件");
+    const failedEvents = events.filter((event) => event.type === "task.failed");
+    assert.equal(failedEvents.length, 1);
+    const failedEvent = failedEvents[0];
+    assert.ok(failedEvent !== undefined);
+    assert.equal(payloadOf(failedEvent).reason, "exception");
+    assert.equal(payloadOf(failedEvent).error_code, ERROR_CODES.E_PROVIDER_HTTP);
+
+    const folded = foldEvents(events);
+    assert.equal(folded.status, "failed");
+    assert.equal(folded.error, "exception");
+  });
+});
+
+// ── 20. 不变量 c：loop.ts 不直接 IO ────────────────────────────
+
+test("M3-03 不变量 c：loop.ts 不 import node:fs / node:child_process", () => {
+  const source = readFileSync(new URL("../../src/agent/loop.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(
+    source,
+    /from\s+["']node:(?:fs|fs\/promises|child_process)["']/,
+    "loop.ts 不应静态 import IO 模块",
+  );
+  assert.doesNotMatch(
+    source,
+    /import\s*\(\s*["']node:(?:fs|fs\/promises|child_process)["']/,
+    "loop.ts 不应动态 import IO 模块",
+  );
+  assert.doesNotMatch(
+    source,
+    /require\s*\(\s*["']node:(?:fs|fs\/promises|child_process)["']/,
+    "loop.ts 不应 require IO 模块",
+  );
+});
+
+// ── 21. 不变量 d：三重上限 ─────────────────────────────────────
+
+test("M3-03 不变量 d-1：只聊不提交，maxSteps 触发 failed{max_steps}", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeLoopTask(fixture, "t_loop_max_steps");
+    const provider = new FakeProvider(
+      Array.from({ length: 5 }, (_, index): FakeStep => ({ content: `第 ${index + 1} 步闲聊` })),
+    );
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits({ maxSteps: 3 }),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "failed", `期望 failed，实际 ${outcome.status}`);
+    assert.equal(outcome.reason, "max_steps");
+    assert.equal(outcome.steps, 3);
+    assert.equal(provider.calls.length, 3, "步数上限后不得再调用 provider");
+
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "agent.step"), 3);
+    assert.equal(countType(events, "llm.call"), 3);
+    assert.equal(countType(events, "task.completed"), 0);
+    const failedEvent = events.find((event) => event.type === "task.failed");
+    assert.ok(failedEvent !== undefined);
+    assert.equal(payloadOf(failedEvent).reason, "max_steps");
+    assert.equal(foldEvents(events).status, "failed");
+
+    // 默认上限是 SPEC §4.8 的 30 / 120k / 20min。
+    assert.equal(DEFAULT_LOOP_LIMITS.maxSteps, 30);
+    assert.equal(DEFAULT_LOOP_LIMITS.maxTokens, 120_000);
+    assert.equal(DEFAULT_LOOP_LIMITS.wallMs, 20 * 60 * 1000);
+  });
+});
+
+test("M3-03 不变量 d-2：token 超限触发 failed{max_tokens}", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeLoopTask(fixture, "t_loop_max_tokens");
+    const provider = new FakeProvider([
+      {
+        content: "很贵的一次调用",
+        usage: { inputTokens: 100, cachedTokens: 0, outputTokens: 50, estimated: false },
+      },
+    ]);
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits({ maxTokens: 60 }),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "failed", `期望 failed，实际 ${outcome.status}`);
+    assert.equal(outcome.reason, "max_tokens");
+    assert.equal(outcome.usage.totalTokens, 150);
+    assert.equal(provider.calls.length, 1, "token 超限后不得再调用 provider");
+
+    const events = taskEvents(fixture, task);
+    const callEvent = events.find((event) => event.type === "llm.call");
+    assert.ok(callEvent !== undefined);
+    assert.equal(payloadOf(callEvent).in, 100);
+    assert.equal(payloadOf(callEvent).out, 50);
+    const failedEvent = events.find((event) => event.type === "task.failed");
+    assert.ok(failedEvent !== undefined);
+    assert.equal(payloadOf(failedEvent).reason, "max_tokens");
+    assert.equal(foldEvents(events).status, "failed");
+  });
+});
+
+test("M3-03 不变量 d-3：墙钟超限中止慢速调用并触发 failed{wall_clock}", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeLoopTask(fixture, "t_loop_wall_clock");
+    const provider = new FakeProvider([
+      { content: "慢脚本", delayMs: 5_000 },
+    ]);
+
+    const startedAt = Date.now();
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits({ wallMs: 50 }),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+    const elapsed = Date.now() - startedAt;
+
+    assert.ok(outcome.status === "failed", `期望 failed，实际 ${outcome.status}`);
+    assert.equal(outcome.reason, "wall_clock");
+    assert.ok(elapsed < 1_000, `墙钟上限应在 50ms 左右中止，实际耗时 ${elapsed}ms`);
+    assert.equal(outcome.steps, 1);
+
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "task.failed"), 1);
+    const failedEvent = events.find((event) => event.type === "task.failed");
+    assert.ok(failedEvent !== undefined);
+    assert.equal(payloadOf(failedEvent).reason, "wall_clock");
+    assert.equal(foldEvents(events).status, "failed");
+  });
+});
+
+// ── 22. 不变量 e：submit_result 校验 ───────────────────────────
+
+test("M3-03 不变量 e：非法提交回喂重试一次，第二次仍非法返回 result_invalid", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeLoopTask(fixture, "t_loop_invalid_result");
+    const provider = new FakeProvider([
+      {
+        toolCalls: [
+          loopCall("call_bad_1", "submit_result", {
+            summary: "忘记写 findings",
+            artifacts: [],
+          }),
+        ],
+      },
+      {
+        toolCalls: [
+          loopCall("call_bad_2", "submit_result", {
+            summary: "第二次仍然非法",
+            findings: [],
+            artifacts: [{ kind: "video", title: "t", summary: "s" }],
+          }),
+        ],
+      },
+    ]);
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits({ maxSteps: 5 }),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "failed", `期望 failed，实际 ${outcome.status}`);
+    assert.equal(outcome.reason, "result_invalid");
+    assert.equal(outcome.error?.code, ERROR_CODES.E_RESULT_INVALID);
+    assert.equal(outcome.steps, 2);
+    assert.equal(provider.calls.length, 2);
+
+    // 第一次失败的错误列表作为 tool 结果回喂给了模型。
+    const secondMessages = provider.calls[1]?.messages ?? [];
+    const feedback = secondMessages.find(
+      (message) => message.role === "tool" && message.toolCallId === "call_bad_1",
+    );
+    assert.ok(feedback !== undefined, "第一次校验失败未回喂模型");
+    assert.ok(feedback.content.includes("findings"));
+    assert.ok(feedback.content.includes("只允许再重试一次"));
+
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "task.completed"), 0);
+    const submitCalls = events.filter(
+      (event) => event.type === "agent.tool_call" && payloadOf(event).tool === "submit_result",
+    );
+    assert.equal(submitCalls.length, 2);
+    const submitResults = events.filter((event) => event.type === "agent.tool_result");
+    assert.equal(submitResults.length, 2);
+    assert.equal(payloadOf(submitResults[0]).ok, false);
+    assert.equal(payloadOf(submitResults[0]).code, ERROR_CODES.E_RESULT_INVALID);
+    assert.equal(payloadOf(submitResults[1]).ok, false);
+
+    const failedEvent = events.find((event) => event.type === "task.failed");
+    assert.ok(failedEvent !== undefined);
+    assert.equal(payloadOf(failedEvent).reason, "result_invalid");
+    assert.equal(foldEvents(events).status, "failed");
+
+    // submit_result 是控制流工具，不在 executeTool 的六件套注册表里。
+    assert.equal(TOOL_SPECS.some((spec) => spec.name === "submit_result"), false);
+  });
+});
+
+// ── 23. 工具失败 ≠ 循环失败 ────────────────────────────────────
+
+test("M3-03 run_command 非零退出（E_TOOL_EXIT）回喂后调整，最终 completed", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeLoopTask(fixture, "t_loop_tool_failure");
+    const provider = new FakeProvider([
+      {
+        toolCalls: [
+          loopCall("call_exit", "run_command", {
+            argv: [process.execPath, "-e", "console.error('boom'); process.exit(3)"],
+          }),
+        ],
+      },
+      {
+        toolCalls: [
+          loopCall("call_submit", "submit_result", {
+            summary: "命令退出码 3，已记录失败并继续",
+            findings: ["run_command 非零退出不等于任务失败"],
+            artifacts: [],
+          }),
+        ],
+      },
+    ]);
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits(),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "completed", `期望 completed，实际 ${outcome.status}`);
+    assert.equal(outcome.steps, 2);
+
+    const events = taskEvents(fixture, task);
+    const failedToolResult = events.find(
+      (event) => event.type === "agent.tool_result" && payloadOf(event).code === "E_TOOL_EXIT",
+    );
+    assert.ok(failedToolResult !== undefined, "缺少 E_TOOL_EXIT 的 tool_result");
+    assert.equal(payloadOf(failedToolResult).ok, false);
+
+    const secondMessages = provider.calls[1]?.messages ?? [];
+    const feedback = secondMessages.find(
+      (message) => message.role === "tool" && message.toolCallId === "call_exit",
+    );
+    assert.ok(feedback !== undefined, "工具失败结果未回喂模型");
+    assert.ok(feedback.content.includes("E_TOOL_EXIT"));
+    assert.ok(feedback.content.includes("command exited with code 3"));
+
+    assert.equal(countType(events, "task.failed"), 0);
+    assert.equal(foldEvents(events).status, "completed");
+  });
+});
+
+// ── 24. ask_user → waiting_input ───────────────────────────────
+
+test("M3-03 ask_user 立即返回 waiting_input，事件可 fold 出 waiting_input 且无 task.failed", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeLoopTask(fixture, "t_loop_ask");
+    const question = "按自然月还是财年统计？";
+    const provider = new FakeProvider([
+      {
+        content: "需要先确认口径。",
+        toolCalls: [loopCall("call_ask", "ask_user", { question })],
+      },
+    ]);
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits(),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "waiting_input", `期望 waiting_input，实际 ${outcome.status}`);
+    assert.equal(outcome.question, question);
+    assert.equal(provider.calls.length, 1);
+
+    const events = taskEvents(fixture, task);
+    assert.equal(countType(events, "task.failed"), 0);
+    assert.equal(countType(events, "task.completed"), 0);
+    assert.equal(countType(events, "agent.tool_result"), 0, "ask_user 不写 tool_result");
+    const askCall = events.find(
+      (event) => event.type === "agent.tool_call" && payloadOf(event).tool === "ask_user",
+    );
+    assert.ok(askCall !== undefined, "缺少 ask_user 的 tool_call");
+    assert.equal(payloadOf(askCall).question, question);
+
+    const folded = foldEvents(events);
+    assert.equal(folded.status, "waiting_input");
+    assert.equal(folded.pendingQuestion, question);
+  });
+});
+
+test("M3-03 executeTool 抛 ContractError 时只作为失败工具结果回喂，循环不终止", async () => {
+  await withSandbox(async (fixture) => {
+    const task = makeLoopTask(fixture, "t_loop_tool_throw");
+    const provider = new FakeProvider([
+      {
+        toolCalls: [loopCall("call_escape", "read_file", { path: "../outside/secret.txt" })],
+      },
+      {
+        toolCalls: [
+          loopCall("call_submit", "submit_result", {
+            summary: "越界读取被拒绝，已停止该路径并提交现状",
+            findings: ["工作区外路径不可读"],
+            artifacts: [],
+          }),
+        ],
+      },
+    ]);
+
+    const outcome = await runLoop({
+      task,
+      db: fixture.db,
+      provider,
+      runId: "r_loop",
+      limits: loopLimits(),
+      ctx: { outputDir: join(fixture.base, "outputs") },
+    });
+
+    assert.ok(outcome.status === "completed", `期望 completed，实际 ${outcome.status}`);
+    assert.equal(outcome.steps, 2);
+
+    const events = taskEvents(fixture, task);
+    const deniedResult = events.find(
+      (event) =>
+        event.type === "agent.tool_result" &&
+        payloadOf(event).code === ERROR_CODES.E_WORKSPACE_ESCAPE,
+    );
+    assert.ok(deniedResult !== undefined, "缺少 E_WORKSPACE_ESCAPE 的 tool_result");
+    assert.equal(payloadOf(deniedResult).ok, false);
+
+    const secondMessages = provider.calls[1]?.messages ?? [];
+    const feedback = secondMessages.find(
+      (message) => message.role === "tool" && message.toolCallId === "call_escape",
+    );
+    assert.ok(feedback !== undefined, "抛出的 ContractError 未回喂模型");
+    assert.ok(feedback.content.includes(ERROR_CODES.E_WORKSPACE_ESCAPE));
+
+    assert.equal(countType(events, "task.failed"), 0);
+    assert.equal(foldEvents(events).status, "completed");
+  });
 });

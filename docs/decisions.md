@@ -2,6 +2,15 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M3-03 agent loop + 假 provider（2026-10-24）
+
+- **`submit_result` 与 `ask_user` 都作为控制流工具处理，不经 `executeTool`**：前者无任何副作用，只是一次结构校验与循环出口；后者在 `foldEvents` 里靠 `agent.tool_call{tool:'ask_user'}` 进入 `waiting_input`，而 `executeTool` 会强制紧跟一条 `agent.tool_result`，折到 `waiting_input` 后会被状态机拒绝（活动事件只允许 running）。因此 loop 只给 `ask_user` 写 `tool_call`、不写 `tool_result`，给 `submit_result` 手写成对的事件；真正的文件/命令副作用仍只走 `executeTool`。
+- **`loop` 自己写终态事件，但不改 `tasks.status` 行**：`task.completed{result_json}` / `task.failed{reason,attempt,error_code?}` 由 loop 在返回前补齐，事件流是唯一真相源、可直接被 `foldEvents` 折出终态；任务表与 run 表的状态推进仍留给 M4 调度器（本卡没有 run 生命周期，提前写行会用错 queued→completed 的转移）。`task.created` / `task.started` 由调用方（或测试夹具）先写入。
+- **只聊不提交的失败语义取 `max_steps`**：模型可以连续多轮不调工具，循环仍按步计费；步数耗尽时“没有通过校验的结果”自然由步数上限先触发，比事后补判 `result_invalid` 更贴近实际发生的事。token/墙钟同理各自返回 `max_tokens` / `wall_clock`。
+- **校验器硬编码约束、测试解析 schema 防漂移**：`result-validator.ts` 不读文件、不引 zod、不实现通用 JSON Schema 引擎，避免运行期依赖 cwd/打包布局；`m3.test.ts` 直接读 `schemas/result.schema.json`，逐项断言 required、kind 枚举、长度/条数上限与 `RESULT_CONSTRAINTS` 及 `SUBMIT_RESULT_SPEC` 一致，任一侧改动都会红。
+- **墙钟上限用内部 AbortController 主动中止在途调用**：到点先 `abort` provider/工具，再按 `wall_clock` 收尾，避免“只在两步之间检查”导致慢流式调用拖过上限；工具被中止时仍需等 `executeTool` 写完成对事件，防止终态事件后混入活动事件。失败的 LLM 调用也记一条 `llm.call`（usage 记 0），保证每个 `agent.step` 都有调用留痕。
+- **工具参数 JSON 解析失败不吞**：普通工具补一对 `agent.tool_call`/`agent.tool_result{E_INVALID_ARGUMENT}` 后回喂模型；`submit_result` 的参数解析失败按一次校验失败计入重试。工具执行失败（含 `E_TOOL_EXIT`、路径拒绝）只回喂、不终止循环，只有上限、异常、`result_invalid` 才写 `task.failed`。
+
 ## M3-02 文件与命令工具（2026-10-24）
 
 - **read_file / run_command 的实现在 executeTool.ts 原地保留，fs.ts / shell.ts re-export 并注册**：这两个工具已有 M3-01 的路径校验、超时杀树、截断、事件成对等验收，搬移只会扩大回归面；`fs.ts` 负责 list_dir / glob / grep / write_file，`shell.ts` 负责白名单常量与 run_command 注册，六件套仍全部经 `executeTool` 分发。
