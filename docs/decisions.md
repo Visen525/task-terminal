@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M10-02 设置页与初始化向导（2026-10-24）
+
+- **设置页以 GET /settings 为唯一可编辑数据源，PUT 整份回写**：页面同时保留 M9-02 的 `/settings/overview` 查询，只把其中的今日用量/统计用于展示；模型、思考、采样参数、权限、工作空间、日预算都在本地 draft 中编辑，保存时一次性 PUT。这样 400 的字段路径可以直接映射回 `main.model` / `main.temperature` / `workspaceDir` 等控件，不需要每改一个控件就发一次请求，也不会出现半套设置已生效的状态。
+- **400 错误按「字段路径 + 说明」拆成行内红字，未知错误落到顶部 Alert**：后端把多个字段错误用「；」拼接，前端用固定字段白名单开头的正则识别，只有真正认识的字段才回填，其余保留为通用错误；保存成功后再刷新 overview，保证进度条与「模型」展示立即跟新设置一致。
+- **目录浏览器用同一个 `DirectoryBrowserPanel` 服务设置页与向导**：设置页包一层 Modal，向导把 Panel 直接内嵌在第二步，避免弹窗套弹窗。Panel 只消费 `/fs/browse` 实际返回的 `{path, entries:[{name, enterable}], total, limit, truncated}`；目录拼接、面包屑与上级路径都基于响应里的绝对路径计算，不写死盘符或根目录，文件与文件内容从不进入 DOM。
+- **向导跳过标记用「localStorage + sessionStorage 会话 id」而不是裸 localStorage**：任务要求「稍后再说」只跳过本次会话、下次启动再提示。把随机会话 id 放 sessionStorage，localStorage 只存最近一次跳过的 id；同一会话刷新 id 不变所以不再弹，关掉标签页/重开浏览器生成新 id，旧标记不匹配即重新提示。向导保存成功后把 PUT 返回的完整设置写回 React Query 缓存，设置页打开时直接复用。
+- **新增 antd 组件只调整 vendor 分组，不新增依赖**：`input-number` / `radio` / `segmented` / `slider` 归入 antd-form，`steps` 归入 antd-display，避免 antd-core 因本卡控件膨胀；`/fs` 只补一条 Vite 代理。`pnpm build` 仍是 0 退出码，最大 chunk 466kB，低于 500kB 告警线。
+
 ## M10-01 设置系统后端（2026-10-24）
 
 - **迁移 v2 只追加 `app_settings` 一段 DDL，版本记录仍沿用单行当前版本**：v1 的 DDL 原样保留，升级时只执行 `current < 2` 的增量；`schema_migrations` 从 1 更新为 2 而不是插入新行，是为了不破坏 m0/m1 已冻结的“版本记录恰好 1 条”断言。设置整份 JSON 存 key='app' 单行，读时与默认值深合并，新增字段不需要再加列或回填。

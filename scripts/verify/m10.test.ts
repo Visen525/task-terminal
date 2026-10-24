@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -45,9 +47,7 @@ function tempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-async function withDb(
-  fn: (db: DatabaseSync) => Promise<void> | void,
-): Promise<void> {
+async function withDb(fn: (db: DatabaseSync) => Promise<void> | void): Promise<void> {
   const dir = tempDir("task-terminal-m10-db-");
   const db = openDatabase(join(dir, "test.db"));
   try {
@@ -168,11 +168,7 @@ test("M10-01 迁移 v2：v1 库（含 artifacts）升级后数据保留、设置
     saveSettings(db, { dailyBudgetTokens: 120_000 }, 2_000);
     migrate(db);
     migrate(db);
-    assert.equal(
-      getSettings(db).dailyBudgetTokens,
-      120_000,
-      "预期重复迁移不清空已保存设置",
-    );
+    assert.equal(getSettings(db).dailyBudgetTokens, 120_000, "预期重复迁移不清空已保存设置");
   } finally {
     db.close();
     rmSync(dir, { recursive: true, force: true });
@@ -229,10 +225,7 @@ test("M10-01 settings：默认值、深合并持久化、坏 JSON E_INTERNAL、�
       assertInvalidSettings({ main: { maxTokens: 8193 } }, "main.maxTokens");
       assertInvalidSettings({ dailyBudgetTokens: 49_999 }, "dailyBudgetTokens");
       assertInvalidSettings({ main: { thinkingLevel: "ultra" } }, "main.thinkingLevel");
-      assertInvalidSettings(
-        { mainTaskDefaultPermission: "admin" },
-        "mainTaskDefaultPermission",
-      );
+      assertInvalidSettings({ mainTaskDefaultPermission: "admin" }, "mainTaskDefaultPermission");
       assertInvalidSettings({ subagentPermissionCap: "admin" }, "subagentPermissionCap");
       assertInvalidSettings({ main: { model: "" } }, "main.model");
       assertInvalidSettings({ main: { model: "m".repeat(61) } }, "main.model");
@@ -245,8 +238,7 @@ test("M10-01 settings：默认值、深合并持久化、坏 JSON E_INTERNAL、�
       db.prepare("UPDATE app_settings SET value = '{broken' WHERE key = 'app'").run();
       assert.throws(
         () => getSettings(db),
-        (error: unknown) =>
-          error instanceof ContractError && error.code === ERROR_CODES.E_INTERNAL,
+        (error: unknown) => error instanceof ContractError && error.code === ERROR_CODES.E_INTERNAL,
         "预期坏 JSON 抛 E_INTERNAL",
       );
       db.prepare("DELETE FROM app_settings").run();
@@ -261,11 +253,7 @@ test("M10-01 settings：默认值、深合并持久化、坏 JSON E_INTERNAL、�
           "预期无设置/无 env 时回退仓库 workspace",
         );
         process.env.WORKSPACE_DIR = envWorkspace;
-        assert.equal(
-          resolveDefaultWorkspace(db),
-          envWorkspace,
-          "预期环境变量优先于仓库默认",
-        );
+        assert.equal(resolveDefaultWorkspace(db), envWorkspace, "预期环境变量优先于仓库默认");
         saveSettings(db, { workspaceDir: workspace }, 4_000);
         assert.equal(
           resolveDefaultWorkspace(db),
@@ -483,10 +471,7 @@ test("M10-01 子代理每 tick 生效：scheduler 用设置组装 model/provider
   await withDb(async (db) => {
     const workspace = tempDir("task-terminal-m10-sub-ws-");
     try {
-      const provider = new FakeProvider([
-        submitStep("子代理第一轮"),
-        submitStep("子代理第二轮"),
-      ]);
+      const provider = new FakeProvider([submitStep("子代理第一轮"), submitStep("子代理第二轮")]);
       const scheduler = createScheduler({
         db,
         provider,
@@ -688,9 +673,7 @@ test("M10-01 payload 映射：temperature/top_p/max_tokens/reasoning_effort，�
     request.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
     request.on("end", () => {
       try {
-        bodies.push(
-          asRecord(JSON.parse(Buffer.concat(chunks).toString("utf8")), "request body"),
-        );
+        bodies.push(asRecord(JSON.parse(Buffer.concat(chunks).toString("utf8")), "request body"));
       } catch {
         bodies.push({});
       }
@@ -737,11 +720,7 @@ test("M10-01 payload 映射：temperature/top_p/max_tokens/reasoning_effort，�
     assert.equal("temperature" in second, false, "预期缺省不发送 temperature");
     assert.equal("top_p" in second, false, "预期缺省不发送 top_p");
     assert.equal("max_tokens" in second, false, "预期缺省不发送 max_tokens");
-    assert.equal(
-      "reasoning_effort" in second,
-      false,
-      "预期 reasoningEffort 缺省/off 时不出现",
-    );
+    assert.equal("reasoning_effort" in second, false, "预期 reasoningEffort 缺省/off 时不出现");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -797,11 +776,7 @@ test("M10-01 /fs/browse：仅目录名+可进入、文件路径 400、默认盘�
         false,
         "预期不返回文件内容",
       );
-      assert.equal(
-        JSON.stringify(listedBody).includes("secret.txt"),
-        false,
-        "预期不返回文件名",
-      );
+      assert.equal(JSON.stringify(listedBody).includes("secret.txt"), false, "预期不返回文件名");
       assert.equal(listedBody.truncated, false);
 
       const filePath = await app.inject({
@@ -811,11 +786,7 @@ test("M10-01 /fs/browse：仅目录名+可进入、文件路径 400、默认盘�
       assert.equal(filePath.statusCode, 400, "预期文件路径返回 400");
       const fileError = asRecord(asRecord(filePath.json(), "file error").error, "error");
       assert.equal(fileError.code, ERROR_CODES.E_INVALID_ARGUMENT);
-      assert.equal(
-        String(fileError.message).includes(base),
-        false,
-        "预期错误不回显本机路径",
-      );
+      assert.equal(String(fileError.message).includes(base), false, "预期错误不回显本机路径");
 
       const missing = await app.inject({
         method: "GET",
@@ -866,4 +837,173 @@ test("M10-01 脚本注册：verify 包含 m10，verify:m10 指向新测试文件
     String(scripts.verify).includes("scripts/verify/m10.test.ts"),
     "预期总 verify 追加 m10.test.ts",
   );
+});
+
+// ════════════════════════════════════════════════════════════════
+// 验收 10：M10-02 设置页源码接线
+// ════════════════════════════════════════════════════════════════
+
+test("M10-02 设置页源码：模型/思考、权限、工作空间、日预算分区与 PUT 保存调用点", () => {
+  const settings = read("src/web/src/pages/Settings.tsx");
+  for (const marker of [
+    "模型与思考",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "自定义",
+    "关闭",
+    "低",
+    "中",
+    "高",
+    "top_p",
+    "单轮输出上限",
+    "主线派任务默认权限",
+    "子代理权限上限",
+    "选只读则所有任务强制只读",
+    "工作空间",
+    "日预算",
+    "今日用量",
+    "设置即时生效（下一轮对话/下一次任务），无需重启",
+    "DirectoryBrowserModal",
+    "putSettings",
+  ]) {
+    assert.ok(settings.includes(marker), `预期 Settings.tsx 包含 ${marker}`);
+  }
+
+  // m9 的记忆/统计区块必须保留。
+  for (const marker of [
+    "/settings/overview",
+    "/facts?",
+    "DELETE",
+    "Popconfirm",
+    "Switch",
+    "Progress",
+    "显示被取代的历史版本",
+    "主 AI 还没有记住任何事。",
+    "记住…",
+    "统计",
+  ]) {
+    assert.ok(settings.includes(marker), `预期 Settings.tsx 保留 ${marker}`);
+  }
+
+  const settingsApi = read("src/web/src/settingsApi.ts");
+  for (const marker of [
+    "/settings",
+    "/fs/browse",
+    'method: "PUT"',
+    "SettingsPatch",
+    "parseSettingsFieldErrors",
+  ]) {
+    assert.ok(settingsApi.includes(marker), `预期 settingsApi.ts 包含 ${marker}`);
+  }
+});
+
+test("M10-02 目录浏览器源码：面包屑、上级/前往/复制、enterable、truncated 与确认回填", () => {
+  const browser = read("src/web/src/components/DirectoryBrowser.tsx");
+  for (const marker of [
+    "buildBreadcrumbs",
+    "pathSeparator",
+    "parentDirectory",
+    "前往",
+    "复制当前路径",
+    "使用此目录",
+    "truncated",
+    "enterable",
+    "DirectoryBrowserPanel",
+    "DirectoryBrowserModal",
+    "destroyOnHidden",
+  ]) {
+    assert.ok(browser.includes(marker), `预期 DirectoryBrowser.tsx 包含 ${marker}`);
+  }
+});
+
+test("M10-02 向导源码：App 首启判定/会话跳过，三步向导内嵌目录浏览器并 PUT 保存", () => {
+  const app = read("src/web/src/App.tsx");
+  for (const marker of [
+    'import SetupWizard from "./components/SetupWizard"',
+    "workspaceDir === null",
+    "WIZARD_SKIP_KEY",
+    "sessionStorage",
+    "localStorage",
+    "readSessionId",
+    "<SetupWizard",
+    "onSkip={dismissWizard}",
+    "onSaved={finishWizard}",
+  ]) {
+    assert.ok(app.includes(marker), `预期 App.tsx 包含 ${marker}`);
+  }
+
+  const wizard = read("src/web/src/components/SetupWizard.tsx");
+  for (const marker of [
+    "欢迎使用任务终端",
+    "选择工作空间",
+    "开始使用",
+    "稍后再说",
+    "DirectoryBrowserPanel",
+    "putSettings({ workspaceDir })",
+    "workspaceDir",
+    "上一步",
+  ]) {
+    assert.ok(wizard.includes(marker), `预期 SetupWizard.tsx 包含 ${marker}`);
+  }
+
+  const vite = read("src/web/vite.config.ts");
+  assert.ok(vite.includes('"/fs"'), "预期 Vite 代理包含 /fs");
+  assert.ok(vite.includes('"/settings"'), "预期 Vite 代理仍包含 /settings");
+});
+
+test("M10-02 依赖纪律：package.json 依赖清单与 M10-01 一致，零新增", () => {
+  const pkg = asRecord(JSON.parse(read("package.json")) as unknown, "package.json");
+  const dependencies = asRecord(pkg.dependencies, "dependencies");
+  const devDependencies = asRecord(pkg.devDependencies, "devDependencies");
+  assert.deepEqual(
+    Object.keys(dependencies).sort(),
+    [
+      "@ant-design/icons",
+      "@tanstack/react-query",
+      "@tanstack/react-virtual",
+      "antd",
+      "fastify",
+      "react",
+      "react-dom",
+      "react-markdown",
+    ].sort(),
+  );
+  assert.deepEqual(
+    Object.keys(devDependencies).sort(),
+    [
+      "@types/node",
+      "@types/react",
+      "@types/react-dom",
+      "@vitejs/plugin-react",
+      "prettier",
+      "typescript",
+      "vite",
+    ].sort(),
+  );
+});
+
+// ════════════════════════════════════════════════════════════════
+// 验收 11：M10-02 前端构建
+// ════════════════════════════════════════════════════════════════
+
+test("M10-02 构建：pnpm build 退出码 0 且 dist/index.html 存在", { timeout: 240_000 }, () => {
+  const buildResult =
+    process.platform === "win32"
+      ? spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "pnpm build"], {
+          cwd: root,
+          stdio: "inherit",
+          env: process.env,
+        })
+      : spawnSync("pnpm", ["build"], {
+          cwd: root,
+          stdio: "inherit",
+          env: process.env,
+        });
+
+  assert.equal(
+    buildResult.status,
+    0,
+    `预期 pnpm build 退出码 0，实际 ${String(buildResult.status)}（error=${buildResult.error?.message ?? "none"}）`,
+  );
+  assert.ok(existsSync(join(root, "dist", "index.html")), "预期 dist/index.html 存在");
 });

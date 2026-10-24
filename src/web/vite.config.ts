@@ -17,13 +17,17 @@ const ANTD_FORM_COMPONENTS = new Set([
   "dropdown",
   "form",
   "input",
+  "input-number",
   "menu",
   "modal",
   "pagination",
   "popconfirm",
   "popover",
   "progress",
+  "radio",
+  "segmented",
   "select",
+  "slider",
   "switch",
   "tooltip",
 ]);
@@ -48,6 +52,7 @@ const ANTD_DISPLAY_COMPONENTS = new Set([
   "space",
   "spin",
   "statistic",
+  "steps",
   "tag",
   "typography",
 ]);
@@ -113,6 +118,7 @@ export default defineConfig({
       "/uploads": { target: backendTarget, changeOrigin: true },
       "/facts": { target: backendTarget, changeOrigin: true },
       "/settings": { target: backendTarget, changeOrigin: true },
+      "/fs": { target: backendTarget, changeOrigin: true },
     },
   },
 });

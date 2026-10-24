@@ -1,18 +1,25 @@
 /**
- * 设置面板（M9-02）：模型与预算概览、长期记忆管理、全库统计。
+ * 设置面板（M10-02）：模型与思考、权限、工作空间、日预算、长期记忆与统计。
  *
- * 入口是侧边栏底部的齿轮；本页只走相对路径请求 /settings/overview 与 /facts，
- * 不直接接触数据库。长期记忆默认只看当前有效版本，打开开关后追加显示被取代的
- * 历史版本；删除统一走 DELETE /facts/:id，成功后失效 facts 与 overview 两个查询。
+ * 设置读写走 settingsApi.ts 的 GET/PUT /settings；PUT 的 400 字段错误按
+ * `字段路径 + 说明` 拆开后回填到对应控件下方。记忆与统计仍是 M9-02 的行为：
+ * 默认只看当前有效版本，打开开关后追加历史版本，删除成功同时失效 facts/overview。
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
   App as AntdApp,
   Button,
+  Card,
+  Input,
+  InputNumber,
   Popconfirm,
   Progress,
+  Radio,
+  Segmented,
+  Select,
+  Slider,
   Spin,
   Statistic,
   Switch,
@@ -22,12 +29,25 @@ import {
 import {
   DatabaseOutlined,
   DeleteOutlined,
+  FolderOpenOutlined,
+  InfoCircleOutlined,
   LinkOutlined,
   ReloadOutlined,
+  SaveOutlined,
 } from "@ant-design/icons";
 
+import type { PermissionMode } from "../api";
+import DirectoryBrowserModal from "../components/DirectoryBrowser";
 import EmptyState from "../components/EmptyState";
 import PageHeader from "../components/PageHeader";
+import {
+  getSettings,
+  parseSettingsFieldErrors,
+  putSettings,
+  type AppSettings,
+  type RoleModelSettings,
+  type ThinkingLevel,
+} from "../settingsApi";
 
 const NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN");
 const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
@@ -75,12 +95,42 @@ interface SettingsProps {
   onOpenTask: (taskId: string) => void;
 }
 
+const CUSTOM_MODEL = "__custom__";
+const MODEL_OPTIONS = [
+  { value: "deepseek-chat", label: "deepseek-chat" },
+  { value: "deepseek-reasoner", label: "deepseek-reasoner" },
+  { value: CUSTOM_MODEL, label: "自定义…" },
+];
+const KNOWN_MODELS = new Set(["deepseek-chat", "deepseek-reasoner"]);
+const THINKING_OPTIONS: Array<{ label: string; value: ThinkingLevel }> = [
+  { label: "关闭", value: "off" },
+  { label: "低", value: "low" },
+  { label: "中", value: "medium" },
+  { label: "高", value: "high" },
+];
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isThinkingLevel(value: string): value is ThinkingLevel {
+  return value === "off" || value === "low" || value === "medium" || value === "high";
+}
+
+function isPermissionMode(value: unknown): value is PermissionMode {
+  return value === "read-only" || value === "workspace-write";
+}
+
+function cloneAppSettings(settings: AppSettings): AppSettings {
+  return {
+    ...settings,
+    main: { ...settings.main },
+    subagent: { ...settings.subagent },
+  };
 }
 
 async function readErrorMessage(response: Response): Promise<string> {
@@ -184,6 +234,226 @@ function LoadingPanel({ text }: { text: string }) {
     >
       <Spin />
       <span>{text}</span>
+    </div>
+  );
+}
+
+interface RoleCardProps {
+  role: "main" | "subagent";
+  title: string;
+  badge: string;
+  value: RoleModelSettings;
+  errors: Record<string, string>;
+  onChange: (patch: Partial<RoleModelSettings>) => void;
+}
+
+/** 主 AI / 子智能体各一张并列卡片；字段错误以 `main.xxx` / `subagent.xxx` 定位。 */
+function RoleCard({ role, title, badge, value, errors, onChange }: RoleCardProps) {
+  const [customModel, setCustomModel] = useState(() => !KNOWN_MODELS.has(value.model));
+
+  useEffect(() => {
+    setCustomModel(!KNOWN_MODELS.has(value.model));
+  }, [value.model]);
+
+  const errorFor = (field: string): string | undefined => errors[`${role}.${field}`];
+  const modelError = errorFor("model");
+  const thinkingError = errorFor("thinkingLevel");
+  const temperatureError = errorFor("temperature");
+  const topPError = errorFor("topP");
+  const maxTokensError = errorFor("maxTokens");
+  const reasoner = value.model.includes("reasoner");
+
+  return (
+    <Card
+      className="settings-card"
+      title={
+        <span className="settings-role-title">
+          <span className="settings-role-title-text">{title}</span>
+          <Tag className="soft-tag">{badge}</Tag>
+        </span>
+      }
+    >
+      <div className="settings-field">
+        <div className="settings-field-head">
+          <span className="settings-field-label">模型</span>
+        </div>
+        <Select
+          className="settings-model-select"
+          value={customModel ? CUSTOM_MODEL : value.model}
+          options={MODEL_OPTIONS}
+          onChange={(next) => {
+            if (next === CUSTOM_MODEL) {
+              setCustomModel(true);
+              return;
+            }
+            setCustomModel(false);
+            onChange({ model: next });
+          }}
+        />
+        {customModel ? (
+          <Input
+            value={value.model}
+            maxLength={60}
+            placeholder="输入模型名，例如 deepseek-chat"
+            aria-label={`${title}自定义模型`}
+            onChange={(event) => {
+              onChange({ model: event.target.value });
+            }}
+          />
+        ) : null}
+        {modelError === undefined ? null : (
+          <span className="settings-field-error">{modelError}</span>
+        )}
+      </div>
+
+      <div className="settings-field">
+        <div className="settings-field-head">
+          <span className="settings-field-label">思考等级</span>
+        </div>
+        <Segmented
+          value={value.thinkingLevel}
+          options={THINKING_OPTIONS}
+          onChange={(next) => {
+            if (typeof next === "string" && isThinkingLevel(next)) {
+              onChange({ thinkingLevel: next });
+            }
+          }}
+        />
+        <span className="settings-field-help">
+          等级越高思考越充分，但会消耗更多 token
+          {reasoner ? "；reasoner 模型本身消耗更高。" : "。"}
+        </span>
+        {thinkingError === undefined ? null : (
+          <span className="settings-field-error">{thinkingError}</span>
+        )}
+      </div>
+
+      <div className="settings-field">
+        <div className="settings-field-head">
+          <span className="settings-field-label">温度</span>
+          <span className="settings-field-value">{value.temperature.toFixed(1)}</span>
+        </div>
+        <div className="settings-slider-row">
+          <Slider
+            min={0}
+            max={2}
+            step={0.1}
+            value={value.temperature}
+            onChange={(next) => {
+              if (typeof next === "number") {
+                onChange({ temperature: Math.round(next * 10) / 10 });
+              }
+            }}
+          />
+          <InputNumber
+            min={0}
+            max={2}
+            step={0.1}
+            precision={1}
+            value={value.temperature}
+            aria-label={`${title}温度`}
+            onChange={(next) => {
+              if (typeof next === "number") onChange({ temperature: next });
+            }}
+          />
+        </div>
+        <span className="settings-field-help">越低越稳定，越高越发散；范围 0–2。</span>
+        {temperatureError === undefined ? null : (
+          <span className="settings-field-error">{temperatureError}</span>
+        )}
+      </div>
+
+      <div className="settings-field">
+        <div className="settings-field-head">
+          <span className="settings-field-label">top_p</span>
+          <span className="settings-field-value">{value.topP.toFixed(2)}</span>
+        </div>
+        <div className="settings-slider-row">
+          <Slider
+            min={0}
+            max={1}
+            step={0.05}
+            value={value.topP}
+            onChange={(next) => {
+              if (typeof next === "number") {
+                onChange({ topP: Math.round(next * 100) / 100 });
+              }
+            }}
+          />
+          <InputNumber
+            min={0}
+            max={1}
+            step={0.05}
+            precision={2}
+            value={value.topP}
+            aria-label={`${title}top_p`}
+            onChange={(next) => {
+              if (typeof next === "number") onChange({ topP: next });
+            }}
+          />
+        </div>
+        <span className="settings-field-help">核采样范围 0–1，默认 1。</span>
+        {topPError === undefined ? null : <span className="settings-field-error">{topPError}</span>}
+      </div>
+
+      <div className="settings-field" style={{ marginBottom: 0 }}>
+        <div className="settings-field-head">
+          <span className="settings-field-label">单轮输出上限</span>
+        </div>
+        <InputNumber
+          min={256}
+          max={8192}
+          step={256}
+          precision={0}
+          value={value.maxTokens}
+          addonAfter="tokens"
+          aria-label={`${title}单轮输出上限`}
+          style={{ width: 200 }}
+          onChange={(next) => {
+            if (typeof next === "number") onChange({ maxTokens: next });
+          }}
+        />
+        <span className="settings-field-help">256–8192 tokens。</span>
+        {maxTokensError === undefined ? null : (
+          <span className="settings-field-error">{maxTokensError}</span>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+interface PermissionCardProps {
+  label: string;
+  description: string;
+  value: PermissionMode;
+  error?: string | undefined;
+  onChange: (value: PermissionMode) => void;
+}
+
+function PermissionCard({ label, description, value, error, onChange }: PermissionCardProps) {
+  return (
+    <div className="info-panel settings-permission-card">
+      <span className="info-label">{label}</span>
+      <Radio.Group
+        value={value}
+        onChange={(event) => {
+          const next: unknown = event.target.value;
+          if (isPermissionMode(next)) onChange(next);
+        }}
+      >
+        <div className="permission-option">
+          <Radio value="read-only">只读</Radio>
+          <p className="permission-option-desc">
+            只能读取工作区文件，不能写入或执行会改文件的命令。
+          </p>
+        </div>
+        <div className="permission-option">
+          <Radio value="workspace-write">可写</Radio>
+          <p className="permission-option-desc">可在工作区内写入文件、创建产物；越界仍会被拦截。</p>
+        </div>
+      </Radio.Group>
+      <p className="settings-field-help">{description}</p>
+      {error === undefined ? null : <span className="settings-field-error">{error}</span>}
     </div>
   );
 }
@@ -308,15 +578,29 @@ export default function Settings({ onOpenTask }: SettingsProps) {
   const { message } = AntdApp.useApp();
   const queryClient = useQueryClient();
   const [includeSuperseded, setIncludeSuperseded] = useState(false);
+  const [draft, setDraft] = useState<AppSettings | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [browserOpen, setBrowserOpen] = useState(false);
 
   const overviewQuery = useQuery({
     queryKey: ["settings", "overview"],
     queryFn: getSettingsOverview,
   });
+  const settingsQuery = useQuery({
+    queryKey: ["settings", "current"],
+    queryFn: getSettings,
+  });
   const factsQuery = useQuery({
     queryKey: ["settings", "facts", includeSuperseded],
     queryFn: () => getFacts(includeSuperseded),
   });
+
+  useEffect(() => {
+    if (settingsQuery.data !== undefined) {
+      setDraft(cloneAppSettings(settingsQuery.data));
+    }
+  }, [settingsQuery.data]);
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => deleteFact(id),
@@ -336,20 +620,64 @@ export default function Settings({ onOpenTask }: SettingsProps) {
     },
   });
 
+  const saveMutation = useMutation({
+    mutationFn: (settings: AppSettings) =>
+      putSettings({
+        workspaceDir: settings.workspaceDir,
+        main: settings.main,
+        subagent: settings.subagent,
+        mainTaskDefaultPermission: settings.mainTaskDefaultPermission,
+        subagentPermissionCap: settings.subagentPermissionCap,
+        dailyBudgetTokens: settings.dailyBudgetTokens,
+      }),
+    onSuccess: async (saved) => {
+      setDraft(cloneAppSettings(saved));
+      setFieldErrors({});
+      setSaveError(null);
+      message.success("设置已保存，下一轮对话/下一次任务生效");
+      queryClient.setQueryData(["settings", "current"], saved);
+      await queryClient.invalidateQueries({ queryKey: ["settings", "overview"] });
+    },
+    onError: (error: Error) => {
+      const parsed = parseSettingsFieldErrors(error.message);
+      setFieldErrors(parsed.fieldErrors);
+      const hasFieldError = Object.keys(parsed.fieldErrors).length > 0;
+      if (parsed.general.length > 0) {
+        setSaveError(parsed.general.join("；"));
+      } else if (!hasFieldError) {
+        setSaveError(error.message);
+      } else {
+        setSaveError(null);
+      }
+    },
+  });
+
   const overview = overviewQuery.data;
   const facts = factsQuery.data ?? [];
-  const currentFacts = useMemo(
-    () => facts.filter((fact) => fact.superseded_by === null),
-    [facts],
-  );
+  const currentFacts = useMemo(() => facts.filter((fact) => fact.superseded_by === null), [facts]);
   const historicalFacts = useMemo(
     () => facts.filter((fact) => fact.superseded_by !== null),
     [facts],
   );
 
   const refreshAll = (): void => {
+    void settingsQuery.refetch();
     void overviewQuery.refetch();
     void factsQuery.refetch();
+  };
+
+  const updateDraft = (patch: Partial<AppSettings>): void => {
+    setDraft((current) => (current === null ? current : { ...current, ...patch }));
+  };
+
+  const updateRole = (role: "main" | "subagent", patch: Partial<RoleModelSettings>): void => {
+    setDraft((current) => {
+      if (current === null) return current;
+      if (role === "main") {
+        return { ...current, main: { ...current.main, ...patch } };
+      }
+      return { ...current, subagent: { ...current.subagent, ...patch } };
+    });
   };
 
   const usage = overview?.todayUsage;
@@ -364,17 +692,71 @@ export default function Settings({ onOpenTask }: SettingsProps) {
       <PageHeader
         eyebrow="Settings"
         title="设置"
-        subtitle="查看主 AI 的模型与今日预算，管理它记住的长期事实。"
+        subtitle="配置模型与思考、任务权限、工作空间和日预算；下方仍可管理长期记忆与查看统计。"
         extra={
-          <Button
-            icon={<ReloadOutlined />}
-            loading={overviewQuery.isFetching || factsQuery.isFetching}
-            onClick={refreshAll}
-          >
-            刷新
-          </Button>
+          <>
+            <Button
+              icon={<ReloadOutlined />}
+              loading={
+                settingsQuery.isFetching || overviewQuery.isFetching || factsQuery.isFetching
+              }
+              onClick={refreshAll}
+            >
+              刷新
+            </Button>
+            <Button
+              type="primary"
+              icon={<SaveOutlined />}
+              loading={saveMutation.isPending}
+              disabled={draft === null}
+              onClick={() => {
+                if (draft !== null) saveMutation.mutate(draft);
+              }}
+            >
+              保存设置
+            </Button>
+          </>
         }
       />
+
+      <div className="settings-notice">
+        <InfoCircleOutlined />
+        <span>设置即时生效（下一轮对话/下一次任务），无需重启</span>
+      </div>
+
+      {saveError === null ? null : (
+        <Alert
+          type="error"
+          showIcon
+          message="设置保存失败"
+          description={saveError}
+          closable
+          onClose={() => {
+            setSaveError(null);
+          }}
+          style={{ marginBottom: 16 }}
+        />
+      )}
+
+      {settingsQuery.error === null ? null : (
+        <Alert
+          type="error"
+          showIcon
+          message="设置加载失败"
+          description={settingsQuery.error.message}
+          action={
+            <Button
+              size="small"
+              onClick={() => {
+                void settingsQuery.refetch();
+              }}
+            >
+              重试
+            </Button>
+          }
+          style={{ marginBottom: 16 }}
+        />
+      )}
 
       {overviewQuery.error === null ? null : (
         <Alert
@@ -396,69 +778,173 @@ export default function Settings({ onOpenTask }: SettingsProps) {
         />
       )}
 
-      <section style={{ marginBottom: 28 }}>
-        <div className="section-heading">
-          <h2 className="section-title">模型与预算</h2>
-          <span className="section-hint">本地时间今日 00:00 起 · 缓存命中不重复计入合计</span>
-        </div>
-
-        {overviewQuery.isLoading ? (
-          <LoadingPanel text="加载模型与预算…" />
-        ) : overview === undefined || usage === undefined ? null : (
-          <div className="info-panel">
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 12,
-                flexWrap: "wrap",
-              }}
-            >
-              <div>
-                <span className="info-label">当前模型</span>
-                <Typography.Text strong style={{ fontSize: 16 }}>
-                  {overview.model}
-                </Typography.Text>
-              </div>
-              <Tag className="soft-tag" style={{ marginInlineEnd: 0 }}>
-                主线模型
-              </Tag>
+      {settingsQuery.isLoading ? (
+        <LoadingPanel text="加载设置…" />
+      ) : draft === null ? null : (
+        <>
+          <section style={{ marginBottom: 28 }}>
+            <div className="section-heading">
+              <h2 className="section-title">模型与思考</h2>
+              <span className="section-hint">主 AI 与子智能体各自独立配置</span>
             </div>
-
-            <div className="token-row" style={{ marginTop: 16 }}>
-              <span>
-                输入 <strong>{formatNumber(usage.input)}</strong>
-              </span>
-              <span>
-                缓存命中 <strong>{formatNumber(usage.cached)}</strong>
-              </span>
-              <span>
-                输出 <strong>{formatNumber(usage.output)}</strong>
-              </span>
-              <span>
-                合计 <strong>{formatNumber(usage.total)}</strong>
-              </span>
-            </div>
-
-            <div className="budget-line">
-              <div className="budget-top">
-                <span>
-                  日预算 {formatNumber(usage.total)} / {formatNumber(overview.dailyBudgetTokens)}
-                </span>
-                <span>{dailyPercent}%</span>
-              </div>
-              <Progress
-                percent={dailyPercent}
-                showInfo={false}
-                strokeColor={budgetColor}
-                size="small"
-                style={{ margin: 0 }}
+            <div className="settings-role-grid">
+              <RoleCard
+                role="main"
+                title="主 AI"
+                badge="主线对话"
+                value={draft.main}
+                errors={fieldErrors}
+                onChange={(patch) => {
+                  updateRole("main", patch);
+                }}
+              />
+              <RoleCard
+                role="subagent"
+                title="子智能体"
+                badge="任务执行"
+                value={draft.subagent}
+                errors={fieldErrors}
+                onChange={(patch) => {
+                  updateRole("subagent", patch);
+                }}
               />
             </div>
-          </div>
-        )}
-      </section>
+          </section>
+
+          <section style={{ marginBottom: 28 }}>
+            <div className="section-heading">
+              <h2 className="section-title">权限</h2>
+              <span className="section-hint">只读 &lt; 可写；子代理上限会钳制所有任务</span>
+            </div>
+            <div className="settings-permission-grid">
+              <PermissionCard
+                label="主线派任务默认权限"
+                description="主 AI 创建任务时，未指定权限就使用这一项。"
+                value={draft.mainTaskDefaultPermission}
+                error={fieldErrors.mainTaskDefaultPermission}
+                onChange={(value) => {
+                  updateDraft({ mainTaskDefaultPermission: value });
+                }}
+              />
+              <PermissionCard
+                label="子代理权限上限"
+                description="选只读则所有任务强制只读；即使主 AI 请求可写也会被钳制。"
+                value={draft.subagentPermissionCap}
+                error={fieldErrors.subagentPermissionCap}
+                onChange={(value) => {
+                  updateDraft({ subagentPermissionCap: value });
+                }}
+              />
+            </div>
+          </section>
+
+          <section style={{ marginBottom: 28 }}>
+            <div className="section-heading">
+              <h2 className="section-title">工作空间</h2>
+              <span className="section-hint">任务默认在这个目录内执行</span>
+            </div>
+            <div className="info-panel settings-workspace">
+              <div className="settings-workspace-row">
+                <div className="settings-workspace-path">
+                  <span className="info-label">当前路径</span>
+                  <Typography.Text
+                    code={draft.workspaceDir !== null}
+                    className="settings-path"
+                    copyable={draft.workspaceDir === null ? false : { text: draft.workspaceDir }}
+                  >
+                    {draft.workspaceDir ?? "尚未设置（使用默认工作区）"}
+                  </Typography.Text>
+                </div>
+                <Button
+                  icon={<FolderOpenOutlined />}
+                  onClick={() => {
+                    setBrowserOpen(true);
+                  }}
+                >
+                  更改
+                </Button>
+              </div>
+              <span className="settings-field-help">
+                更改后点击保存即时生效；下一个任务会使用新目录。
+              </span>
+              {fieldErrors.workspaceDir === undefined ? null : (
+                <span className="settings-field-error">{fieldErrors.workspaceDir}</span>
+              )}
+            </div>
+          </section>
+
+          <section style={{ marginBottom: 28 }}>
+            <div className="section-heading">
+              <h2 className="section-title">日预算</h2>
+              <span className="section-hint">本地时间今日 00:00 起 · 缓存命中不重复计入合计</span>
+            </div>
+            <div className="info-panel">
+              <div className="settings-budget-row">
+                <div className="settings-budget-input">
+                  <span className="info-label">每日 token 上限</span>
+                  <InputNumber
+                    min={50_000}
+                    step={10_000}
+                    precision={0}
+                    value={draft.dailyBudgetTokens}
+                    addonAfter="tokens"
+                    aria-label="每日 token 上限"
+                    style={{ width: 240 }}
+                    onChange={(next) => {
+                      if (typeof next === "number") {
+                        updateDraft({ dailyBudgetTokens: next });
+                      }
+                    }}
+                  />
+                  <span className="settings-field-help">至少 50,000；达到后暂停派新任务。</span>
+                  {fieldErrors.dailyBudgetTokens === undefined ? null : (
+                    <span className="settings-field-error">{fieldErrors.dailyBudgetTokens}</span>
+                  )}
+                </div>
+
+                <div className="settings-budget-usage">
+                  {usage === undefined || overview === undefined ? (
+                    <span className="settings-field-help">正在读取今日用量…</span>
+                  ) : (
+                    <>
+                      <div className="token-row">
+                        <span>
+                          输入 <strong>{formatNumber(usage.input)}</strong>
+                        </span>
+                        <span>
+                          缓存命中 <strong>{formatNumber(usage.cached)}</strong>
+                        </span>
+                        <span>
+                          输出 <strong>{formatNumber(usage.output)}</strong>
+                        </span>
+                        <span>
+                          合计 <strong>{formatNumber(usage.total)}</strong>
+                        </span>
+                      </div>
+                      <div className="budget-line">
+                        <div className="budget-top">
+                          <span>
+                            今日用量 {formatNumber(usage.total)} /{" "}
+                            {formatNumber(overview.dailyBudgetTokens)}
+                          </span>
+                          <span>{dailyPercent}%</span>
+                        </div>
+                        <Progress
+                          percent={dailyPercent}
+                          showInfo={false}
+                          strokeColor={budgetColor}
+                          size="small"
+                          style={{ margin: 0 }}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          </section>
+        </>
+      )}
 
       <section>
         <div className="section-heading">
@@ -516,9 +1002,7 @@ export default function Settings({ onOpenTask }: SettingsProps) {
                     key={fact.id}
                     fact={fact}
                     historical={false}
-                    deleting={
-                      deleteMutation.isPending && deleteMutation.variables === fact.id
-                    }
+                    deleting={deleteMutation.isPending && deleteMutation.variables === fact.id}
                     onDelete={() => {
                       deleteMutation.mutate(fact.id);
                     }}
@@ -544,9 +1028,7 @@ export default function Settings({ onOpenTask }: SettingsProps) {
                       key={fact.id}
                       fact={fact}
                       historical
-                      deleting={
-                        deleteMutation.isPending && deleteMutation.variables === fact.id
-                      }
+                      deleting={deleteMutation.isPending && deleteMutation.variables === fact.id}
                       onDelete={() => {
                         deleteMutation.mutate(fact.id);
                       }}
@@ -600,6 +1082,24 @@ export default function Settings({ onOpenTask }: SettingsProps) {
           </div>
         )}
       </section>
+
+      <DirectoryBrowserModal
+        open={browserOpen}
+        initialPath={draft?.workspaceDir ?? null}
+        onClose={() => {
+          setBrowserOpen(false);
+        }}
+        onConfirm={(path) => {
+          setDraft((current) => (current === null ? current : { ...current, workspaceDir: path }));
+          setFieldErrors((current) => {
+            const next = { ...current };
+            delete next.workspaceDir;
+            return next;
+          });
+          setBrowserOpen(false);
+          message.success("已回填工作空间，点击「保存设置」生效");
+        }}
+      />
     </>
   );
 }
