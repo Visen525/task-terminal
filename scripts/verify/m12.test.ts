@@ -8,6 +8,16 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
 import { ContractError, ERROR_CODES } from "../../src/core/errors.ts";
+import { llmContentText } from "../../src/core/types.ts";
+import {
+  buildMainContext,
+  gatherMainContext,
+} from "../../src/agent/context.ts";
+import {
+  formatSummaryBlock,
+  maybeCompactSummary,
+} from "../../src/agent/conversation-summary.ts";
+import { runMainTurn } from "../../src/agent/main-loop.ts";
 import { DeepSeekProvider } from "../../src/providers/deepseek.ts";
 import { FakeProvider } from "../../src/providers/fake.ts";
 import type {
@@ -18,7 +28,9 @@ import type {
 } from "../../src/providers/types.ts";
 import { createScheduler, type Scheduler } from "../../src/runtime/scheduler.ts";
 import { createApp } from "../../src/server/index.ts";
+import { upsertFact } from "../../src/store/facts.ts";
 import { openDatabase } from "../../src/store/migrate.ts";
+import { appendMessage } from "../../src/store/messages.ts";
 import {
   DEFAULT_SETTINGS,
   getEffectiveApiKey,
@@ -73,6 +85,52 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
     `预期 ${label} 是对象，实际 ${String(value)}`,
   );
   return value as Record<string, unknown>;
+}
+
+/** 轮询等待 fire-and-forget 的摘要任务落库/告警，避免用固定 sleep 猜时序。 */
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (!predicate()) {
+    if (Date.now() > deadline) assert.fail(`等待超时：${label}`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function promptOf(call: ChatParams | undefined): string {
+  assert.ok(call !== undefined, "provider 调用不存在");
+  return call.messages.map((message) => llmContentText(message.content)).join("\n");
+}
+
+/** 预写 N 轮主线对话；第 2 轮带唯一标记，第 9 轮带窗口标记。 */
+function seedMainTurns(db: DatabaseSync, total: number): void {
+  for (let turn = 1; turn <= total; turn += 1) {
+    const marker = turn === 2 ? "原始第2轮问题" : `第${turn}轮用户原文`;
+    appendMessage(db, {
+      role: "user",
+      content: `${marker}：用户内容 ${turn}`,
+      ts: turn * 2,
+    });
+    appendMessage(db, {
+      role: "assistant",
+      content: `第${turn}轮助手原文：助手内容 ${turn}`,
+      ts: turn * 2 + 1,
+    });
+  }
+}
+
+function summaryRows(
+  db: DatabaseSync,
+): Array<{ purpose: string; model: string; input_tokens: number; output_tokens: number }> {
+  return db
+    .prepare(
+      "SELECT purpose, model, input_tokens, output_tokens FROM llm_calls WHERE purpose = 'summary' ORDER BY ts ASC",
+    )
+    .all() as unknown as Array<{
+    purpose: string;
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+  }>;
 }
 
 function assertInvalidApiKey(value: unknown): void {
@@ -481,4 +539,229 @@ test("M12-01 provider：apiKey 接受解析函数，每次请求用当前 key；
       });
     });
   }
+});
+
+// ════════════════════════════════════════════════════════════════
+// 7. 主对话滚动摘要继承（M12-02）
+// ════════════════════════════════════════════════════════════════
+
+test("M12-02 滚动摘要：20 轮历史触发压缩、purpose=summary 落库、下一轮注入摘要块", async () => {
+  await withDb(async (db) => {
+    seedMainTurns(db, 20);
+    const summaryText = "1. 用户偏好简洁。\n2. 关键结论：历史任务已派发。";
+    const provider = new FakeProvider([
+      { content: summaryText }, // 首轮开头的摘要调用
+      { content: "第一轮回复" },
+      { content: summaryText }, // 下一轮开头追平 turn 9 的摘要调用
+      { content: "第二轮回复" },
+    ]);
+
+    const first = await runMainTurn({
+      db,
+      provider,
+      userMessage: "第21轮问题",
+      now: () => 5_000,
+    });
+    assert.equal(first.reply, "第一轮回复");
+    await waitFor(
+      () => getSettings(db).mainConversationSummary?.upToSeq === 16,
+      "首轮摘要落库",
+    );
+    // 等单飞 promise 的 finally 清空，确保下一轮会真正再触发一次摘要。
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const summary = getSettings(db).mainConversationSummary;
+    assert.ok(summary !== null, "超过 12 轮必须生成摘要");
+    assert.equal(summary.upToSeq, 16, "20 轮省略前 8 轮，边界应是第 8 轮 assistant 的 seq");
+    assert.equal(summary.updatedAt, 5_000, "updatedAt 应使用注入时钟");
+    assert.ok(summary.text.includes("简洁"), "摘要应保留用户偏好");
+
+    const rows = summaryRows(db);
+    assert.equal(rows.length, 1, "应恰好有一条 purpose='summary' 记账");
+    assert.equal(rows[0]?.purpose, "summary");
+    assert.equal(rows[0]?.model, "deepseek-chat", "摘要应使用 settings.main.model");
+
+    // 首轮 prompt 还没有摘要（摘要异步生成），但 12 轮窗口必须全文保留。
+    assert.equal(provider.calls.length, 2, "一次摘要 + 一次主线调用");
+    const firstPrompt = promptOf(provider.calls[1]);
+    assert.match(firstPrompt, /\[已省略 8 轮更早对话\]/u);
+    assert.ok(firstPrompt.includes("第9轮用户原文"), "最近 12 轮的第一轮应全文保留");
+    assert.ok(firstPrompt.includes("第20轮助手原文"), "窗口最后一条也应保留");
+    assert.ok(!firstPrompt.includes("原始第2轮问题"), "窗口外旧轮不应再全文进入 prompt");
+
+    // 下一轮：摘要块 + 最近 12 轮全文；压缩 lag 的 turn 9 用省略标记兜底。
+    const second = await runMainTurn({
+      db,
+      provider,
+      userMessage: "第22轮问题",
+      now: () => 5_001,
+    });
+    assert.equal(second.reply, "第二轮回复");
+    await waitFor(
+      () => getSettings(db).mainConversationSummary?.upToSeq === 18,
+      "第二轮摘要追平 turn 9",
+    );
+    assert.equal(provider.calls.length, 4, "第二轮同样是一次摘要 + 一次主线调用");
+
+    const secondSummaryPrompt = promptOf(provider.calls[2]);
+    assert.ok(
+      secondSummaryPrompt.includes("第9轮用户原文"),
+      "第二轮摘要应只新增 turn 9",
+    );
+    assert.ok(secondSummaryPrompt.includes("用户偏好简洁"), "应把旧摘要一起带上");
+
+    const secondPrompt = promptOf(provider.calls[3]);
+    assert.match(secondPrompt, /## 对话记忆（早期摘要，截至第 8 轮）/u);
+    assert.ok(secondPrompt.includes("简洁"), "摘要文本必须进入下一轮 prompt");
+    assert.ok(secondPrompt.includes("第10轮用户原文"), "最近 12 轮仍应全文");
+    assert.ok(secondPrompt.includes("第20轮助手原文"), "窗口最后一条仍应全文");
+    assert.ok(secondPrompt.includes("第一轮回复"), "本轮之前刚完成的回答也应全文");
+    assert.ok(!secondPrompt.includes("原始第2轮问题"), "第 2 轮原文应已被摘要替代");
+    assert.match(secondPrompt, /\[已省略 1 轮更早对话\]/u, "lag 的 1 轮应保留省略标记");
+  });
+});
+
+test("M12-02 有摘要的上下文：摘要块在长期事实之后、12 轮全文、旧轮不再全文", async () => {
+  await withDb((db) => {
+    seedMainTurns(db, 20);
+    upsertFact(db, {
+      key: "user.tone",
+      value: "简洁",
+      confidence: 0.9,
+      now: 1_000,
+    });
+    const summary = {
+      text: "- 用户偏好：简洁\n- 关键结论：保持 12 轮全文",
+      upToSeq: 16,
+      updatedAt: 1_234,
+    };
+    saveSettings(db, { mainConversationSummary: summary }, 1_234);
+
+    const gathered = gatherMainContext(db, { userMessage: "继续" });
+    assert.equal(gathered.omittedHistoryTurns, 0, "摘要已覆盖窗口外旧轮，无省略标记");
+    assert.equal(gathered.history.length, 24, "窗口仍是最近 12 轮 = 24 条");
+    assert.equal(gathered.history[0]?.content, "第9轮用户原文：用户内容 9");
+    assert.equal(
+      gathered.history[gathered.history.length - 1]?.content,
+      "第20轮助手原文：助手内容 20",
+    );
+
+    const messages = buildMainContext(db, { ...gathered, systemPrompt: "SYS" });
+    const prompt = messages.map((message) => llmContentText(message.content)).join("\n");
+    assert.equal(
+      formatSummaryBlock(summary),
+      "## 对话记忆（早期摘要，截至第 8 轮）\n- 用户偏好：简洁\n- 关键结论：保持 12 轮全文",
+    );
+    const factAt = prompt.indexOf("## 长期事实");
+    const summaryAt = prompt.indexOf("## 对话记忆（早期摘要，截至第 8 轮）");
+    assert.ok(factAt >= 0 && summaryAt > factAt, "摘要块必须放在长期事实之后");
+    assert.ok(prompt.includes(summary.text), "缺少摘要正文");
+    assert.ok(prompt.includes("第9轮用户原文"), "窗口内第 9 轮必须全文");
+    assert.ok(prompt.includes("第10轮助手原文"), "窗口内第 10 轮必须全文");
+    assert.ok(prompt.includes("第20轮助手原文"), "窗口最后一条必须全文");
+    assert.ok(!prompt.includes("原始第2轮问题"), "已摘要的第 2 轮不应再全文出现");
+    assert.ok(!prompt.includes("[已省略"), "无 lag 时不应再出现省略标记");
+  });
+});
+
+test("M12-02 摘要失败：WARN 不静默、settings 不变、下一轮回退省略标记", async () => {
+  await withDb(async (db) => {
+    seedMainTurns(db, 13);
+    const provider = new FakeProvider([
+      { error: new Error("mock summary 失败") },
+      { content: "主回复继续" },
+    ]);
+
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...args: unknown[]): void => {
+      warnings.push(args.map((value) => String(value)).join(" "));
+    };
+    try {
+      const result = await runMainTurn({
+        db,
+        provider,
+        userMessage: "触发摘要失败",
+        now: () => 7_000,
+      });
+      assert.equal(result.reply, "主回复继续", "摘要失败不得影响本轮主线回复");
+      await waitFor(() => warnings.length > 0, "摘要失败 WARN");
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.ok(
+      warnings.some((line) => line.includes("滚动摘要生成失败")),
+      `失败必须记 WARN，实际：${warnings.join("\n")}`,
+    );
+    assert.equal(
+      getSettings(db).mainConversationSummary,
+      null,
+      "失败不得写入半成品摘要",
+    );
+    const rows = summaryRows(db);
+    assert.equal(rows.length, 1, "失败调用也应记账");
+    assert.equal(rows[0]?.input_tokens, 0, "失败的 usage 记 0");
+
+    // 下一轮 prompt：没有摘要块，回退旧的省略标记（窗口外 2 轮未摘要）。
+    const gathered = gatherMainContext(db, { userMessage: "下一轮" });
+    assert.equal(gathered.summary, null);
+    const prompt = buildMainContext(db, {
+      ...gathered,
+      systemPrompt: "SYS",
+    })
+      .map((message) => llmContentText(message.content))
+      .join("\n");
+    assert.ok(!prompt.includes("## 对话记忆"), "失败后不得注入空摘要");
+    assert.match(prompt, /\[已省略 2 轮更早对话\]/u);
+    assert.ok(!prompt.includes("原始第2轮问题"), "旧轮仍应被省略");
+  });
+});
+
+test("M12-02 不足/恰好 12 轮：不触发摘要调用，窗口内始终全文", async () => {
+  await withDb(async (db) => {
+    seedMainTurns(db, 11);
+    const provider = new FakeProvider([
+      { content: "第一轮回复" },
+      { content: "第二轮回复" },
+    ]);
+
+    // 第 1 轮前 11 轮、第 2 轮前恰好 12 轮：都不应触发摘要。
+    await runMainTurn({ db, provider, userMessage: "第12轮问题" });
+    await runMainTurn({ db, provider, userMessage: "第13轮问题" });
+
+    assert.equal(provider.calls.length, 2, "只有两次主线调用，没有摘要调用");
+    assert.equal(
+      getSettings(db).mainConversationSummary,
+      null,
+      "12 轮内不得生成摘要",
+    );
+    assert.equal(summaryRows(db).length, 0, "不得出现 purpose='summary' 行");
+
+    const gathered = gatherMainContext(db, { userMessage: "第13轮问题" });
+    assert.equal(gathered.omittedHistoryTurns, 1, "13 轮只省略窗口外的第 1 轮");
+    assert.equal(gathered.history.length, 24, "窗口恰好 12 轮 = 24 条");
+    const prompt = buildMainContext(db, {
+      ...gathered,
+      systemPrompt: "SYS",
+    })
+      .map((message) => llmContentText(message.content))
+      .join("\n");
+    assert.ok(prompt.includes("原始第2轮问题"), "窗口内旧轮必须全文");
+    assert.ok(prompt.includes("第一轮回复"), "窗口内刚完成的轮次必须全文");
+    assert.ok(prompt.includes("第二轮回复"), "窗口最后一条必须全文");
+    assert.match(prompt, /\[已省略 1 轮更早对话\]/u);
+    assert.ok(!prompt.includes("## 对话记忆"), "无摘要时维持现状");
+  });
+});
+
+test("M12-02 maybeCompactSummary：可单独调用，不足窗口时 no-op 不调 provider", async () => {
+  await withDb(async (db) => {
+    seedMainTurns(db, 12);
+    const provider = new FakeProvider([]);
+    const result = await maybeCompactSummary(db, provider, { now: () => 1_000 });
+    assert.equal(result, null);
+    assert.equal(provider.calls.length, 0, "12 轮内应为 no-op");
+    assert.equal(getSettings(db).mainConversationSummary, null);
+  });
 });

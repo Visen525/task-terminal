@@ -35,6 +35,7 @@ import { insertLlmCall } from '../store/llm-calls.ts';
 import { appendMessage, type MessageAttachment } from '../store/messages.ts';
 import { getSettings, resolveDefaultWorkspace } from '../store/settings.ts';
 import { buildMainContext, gatherMainContext } from './context.ts';
+import { maybeCompactSummary } from './conversation-summary.ts';
 import {
   executeMainTool,
   MAIN_TOOL_SPECS,
@@ -289,6 +290,16 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
     : options.userMessage!;
   // 落库文本优先用调用方给的展示文本；否则取分片的纯文本视图（图片折 [图片]）。
   const currentText = options.userText ?? llmContentText(currentContent);
+
+  // 滚动摘要（M12-02）：在写本轮 user 之前 fire-and-forget，既不阻塞本轮，
+  // 也不会把刚写入的半轮算进摘要。失败必须留 WARN，并让本轮继续使用旧的
+  // 「[已省略 N 轮更早对话]」标记（不静默吞掉）。
+  void maybeCompactSummary(db, provider, { now: clock }).catch((error: unknown) => {
+    console.warn(
+      '[summary] 滚动摘要生成失败，本轮回退省略标记:',
+      error instanceof Error ? error.message : String(error),
+    );
+  });
 
   const toolOptions: MainToolOptions = {
     db,

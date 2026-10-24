@@ -40,6 +40,18 @@ export interface SubagentSettings extends RoleModelSettings {
 /** API Key 的来源：界面写入（优先）或 .env / process.env 回退。 */
 export type ApiKeySource = 'settings' | 'env';
 
+/**
+ * 主线滚动摘要（M12-02）。
+ *
+ * `upToSeq` 是已并入摘要的最后一条主线消息 seq（总是某个 assistant 轮末），
+ * 生成/读取摘要时都以它为边界，保证不会把同一轮重复摘要。
+ */
+export interface MainConversationSummary {
+  text: string;
+  upToSeq: number;
+  updatedAt: number;
+}
+
 export interface AppSettings {
   workspaceDir: string | null;
   /**
@@ -60,6 +72,11 @@ export interface AppSettings {
    * serializeSettings() 显式拼装，仍会把 key 写进 app_settings。
    */
   apiKey: string | null;
+  /**
+   * 12 轮窗口外的旧主对话压缩摘要（M12-02）。null = 尚未生成，
+   * 上下文仍只用「[已省略 N 轮更早对话]」标记。
+   */
+  mainConversationSummary: MainConversationSummary | null;
   /** 以下三项是读时派生的视图字段，不落库，供 GET /settings 与界面使用。 */
   hasApiKey: boolean;
   apiKeyTail: string | null;
@@ -76,6 +93,8 @@ export interface SettingsPatch {
   subagentPermissionCap?: PermissionMode;
   dailyBudgetTokens?: number;
   apiKey?: string | null;
+  /** 内部字段（M12-02）；随 GET /settings 返回，允许客户端整份回写。 */
+  mainConversationSummary?: MainConversationSummary | null;
 }
 
 export const SETTINGS_ROW_KEY = 'app';
@@ -105,6 +124,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   subagentPermissionCap: 'workspace-write',
   dailyBudgetTokens: 2_000_000,
   apiKey: null,
+  mainConversationSummary: null,
   hasApiKey: false,
   apiKeyTail: null,
   apiKeySource: null,
@@ -123,6 +143,7 @@ const TOP_LEVEL_KEYS = new Set([
   'subagentPermissionCap',
   'dailyBudgetTokens',
   'apiKey',
+  'mainConversationSummary',
 ]);
 /** GET /settings 的派生字段；客户端把整份响应 PUT 回来时忽略，不落库。 */
 const DERIVED_KEYS = new Set(['hasApiKey', 'apiKeyTail', 'apiKeySource']);
@@ -153,6 +174,9 @@ const SUBAGENT_WALL_MINUTES_MIN = 1;
 const SUBAGENT_WALL_MINUTES_MAX = 240;
 const API_KEY_MIN_CHARS = 8;
 const API_KEY_MAX_CHARS = 200;
+/** M12-02：摘要正文上限按 Unicode 码点计，与 conversation-summary 的截断一致。 */
+const SUMMARY_MAX_CHARS = 2000;
+const SUMMARY_FIELDS = new Set(['text', 'upToSeq', 'updatedAt']);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -208,6 +232,10 @@ function cloneSettings(settings: AppSettings): AppSettings {
     subagentPermissionCap: settings.subagentPermissionCap,
     dailyBudgetTokens: settings.dailyBudgetTokens,
     apiKey: settings.apiKey,
+    mainConversationSummary:
+      settings.mainConversationSummary === null
+        ? null
+        : { ...settings.mainConversationSummary },
     hasApiKey: settings.hasApiKey,
     apiKeyTail: settings.apiKeyTail,
     apiKeySource: settings.apiKeySource,
@@ -265,6 +293,45 @@ function parseSettingsPatch(raw: unknown, errors: string[]): SettingsPatch {
         errors.push('apiKey 不能包含空白字符');
       } else {
         patch.apiKey = key;
+      }
+    }
+  }
+
+  if ('mainConversationSummary' in raw) {
+    const value = raw.mainConversationSummary;
+    if (value === null) {
+      patch.mainConversationSummary = null;
+    } else if (!isRecord(value)) {
+      errors.push('mainConversationSummary 必须是对象或 null');
+    } else {
+      for (const field of Object.keys(value)) {
+        if (!SUMMARY_FIELDS.has(field)) {
+          errors.push(`mainConversationSummary.${field} 不是可配置字段`);
+        }
+      }
+      const text = value.text;
+      const upToSeq = value.upToSeq;
+      const updatedAt = value.updatedAt;
+      if (typeof text !== 'string' || text.trim().length === 0) {
+        errors.push('mainConversationSummary.text 必须是非空字符串');
+      } else if ([...text].length > SUMMARY_MAX_CHARS) {
+        errors.push(
+          `mainConversationSummary.text 长度不能超过 ${SUMMARY_MAX_CHARS} 个字符`,
+        );
+      } else if (
+        typeof upToSeq !== 'number' ||
+        !Number.isInteger(upToSeq) ||
+        upToSeq < 0
+      ) {
+        errors.push('mainConversationSummary.upToSeq 必须是非负整数');
+      } else if (
+        typeof updatedAt !== 'number' ||
+        !Number.isInteger(updatedAt) ||
+        updatedAt < 0
+      ) {
+        errors.push('mainConversationSummary.updatedAt 必须是非负整数');
+      } else {
+        patch.mainConversationSummary = { text, upToSeq, updatedAt };
       }
     }
   }
@@ -477,6 +544,12 @@ function mergeSettings(base: AppSettings, patch: SettingsPatch): AppSettings {
   if ('apiKey' in patch) {
     merged.apiKey = patch.apiKey ?? null;
   }
+  if ('mainConversationSummary' in patch) {
+    const summary = patch.mainConversationSummary;
+    merged.mainConversationSummary = summary === undefined || summary === null
+      ? null
+      : { ...summary };
+  }
   // 派生字段始终由「当前 settings + env」重新计算，绝不信任落库值。
   applyApiKeyView(merged);
   return merged;
@@ -562,6 +635,7 @@ function serializeSettings(settings: AppSettings): string {
     subagentPermissionCap: settings.subagentPermissionCap,
     dailyBudgetTokens: settings.dailyBudgetTokens,
     apiKey: settings.apiKey,
+    mainConversationSummary: settings.mainConversationSummary,
   });
 }
 

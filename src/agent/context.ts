@@ -10,8 +10,9 @@
  *   2. 看板每任务一行；活动任务超过 30 个时退化为一条按状态汇总的线。
  *   3. 子智能体只看自己那摊事：不携带主线上文，上游摘要硬上限 3 条。
  *
- * 历史窗口的偏差（见 docs/decisions.md）：超出 12 轮的旧对话不做 LLM 摘要，
- * 只折成一行「[已省略 N 轮更早对话]」标记；这是可逆决策，将来可替换为摘要调用。
+ * 历史窗口的约定（M12-02 起）：最近 12 轮保持全文；更早的完整轮次由
+ * settings.mainConversationSummary 继承，压缩尚未追上时仍保留
+ * 「[已省略 N 轮更早对话]」标记（N 只统计未摘要的旧轮）。
  */
 import type { DatabaseSync } from 'node:sqlite';
 
@@ -26,6 +27,11 @@ import { searchArtifacts } from '../store/artifacts.ts';
 import { recallFacts, type Fact } from '../store/facts.ts';
 import { listRecentMessages, type Message, type MessageAttachment } from '../store/messages.ts';
 import { getTask } from '../store/repo.ts';
+import {
+  getSettings,
+  type MainConversationSummary,
+} from '../store/settings.ts';
+import { formatSummaryBlock } from './conversation-summary.ts';
 import { buildAgentPrompt } from './prompt.ts';
 
 export const DEFAULT_MAIN_HISTORY_LIMIT = 12;
@@ -80,8 +86,10 @@ export interface GatherMainContextOptions {
 export interface GatheredMainContext {
   /** 已按轮数裁剪后的最近对话，只含 user / assistant。 */
   history: Message[];
-  /** >0 时在系统提示里输出一行省略标记。 */
+  /** >0 时在系统提示里输出一行省略标记（只含尚未摘要的旧轮）。 */
   omittedHistoryTurns: number;
+  /** 已并入滚动摘要的早期对话；null = 尚未生成。 */
+  summary: MainConversationSummary | null;
   facts: Fact[];
   board: BoardContext;
   related: RelatedArtifactBrief[];
@@ -95,6 +103,8 @@ export interface BuildMainContextInput {
   systemPrompt: string;
   /** 由 gatherMainContext 提供；省略视为没有更早对话。 */
   omittedHistoryTurns?: number;
+  /** 由 gatherMainContext 提供；有值时注入「对话记忆（早期摘要）」块。 */
+  summary?: MainConversationSummary | null;
 }
 
 export interface BuildAgentContextOptions {
@@ -232,15 +242,53 @@ function gatherRelated(
   );
 }
 
+interface ConversationTurn {
+  startSeq: number;
+  endSeq: number;
+  messages: [Message, Message];
+}
+
 /**
- * 取最近 historyLimit 轮对话；总轮数与窗口轮数之差就是省略的轮数。
- * 只统计 user / assistant（主线 messages 也只落这两种角色）。
+ * 把按 seq 正序的消息折成完整轮次；落单的 user（本轮刚写入、assistant 尚未
+ * 回复）单独返回，永远不把半轮算进摘要/省略计数。
+ */
+function groupConversationTurns(messages: readonly Message[]): {
+  turns: ConversationTurn[];
+  trailingUser: Message | null;
+} {
+  const turns: ConversationTurn[] = [];
+  let pendingUser: Message | null = null;
+  for (const message of messages) {
+    if (message.role === 'user') {
+      pendingUser = message;
+      continue;
+    }
+    if (message.role === 'assistant' && pendingUser !== null) {
+      turns.push({
+        startSeq: pendingUser.seq,
+        endSeq: message.seq,
+        messages: [pendingUser, message],
+      });
+      pendingUser = null;
+    }
+  }
+  return { turns, trailingUser: pendingUser };
+}
+
+/**
+ * 取最近 historyLimit 个完整轮次（外加本轮尚未回复的 user），并计算
+ * summaryUpToSeq 之后、窗口之前仍未摘要的完整轮数。
+ *
+ * 有摘要时不再回头展示已摘要的消息，避免摘要块与全文重复；压缩 lag 时
+ * 窗口外的未摘要轮仍通过省略标记计数。
  */
 function gatherHistory(
   db: DatabaseSync,
   historyLimit: number,
+  summaryUpToSeq: number,
 ): { history: Message[]; omittedHistoryTurns: number } {
   const limit = Math.max(1, historyLimit);
+  const afterSeq = Math.max(0, Math.floor(summaryUpToSeq));
   const totalRow = db
     .prepare(
       `SELECT COUNT(*) AS n FROM messages
@@ -248,14 +296,41 @@ function gatherHistory(
     )
     .get() as unknown as CountRow | undefined;
   const totalMessages = Number(totalRow?.n ?? 0);
-  const history = listRecentMessages(db, limit * 2).filter(
-    (message) => message.role === 'user' || message.role === 'assistant',
-  );
-  const totalTurns = Math.ceil(totalMessages / 2);
-  const keptTurns = Math.ceil(history.length / 2);
+
+  // 多取 2 条兜底：窗口可能以 assistant 开头（本轮 user 让总数变成奇数），
+  // 分组时会丢掉这半轮，仍要保证够 limit 个完整轮。
+  const fetchLimit = Math.min(totalMessages, limit * 2 + 2);
+  const recent =
+    fetchLimit === 0
+      ? []
+      : listRecentMessages(db, fetchLimit).filter(
+          (message) =>
+            (message.role === 'user' || message.role === 'assistant') &&
+            message.seq > afterSeq,
+        );
+  const grouped = groupConversationTurns(recent);
+  const keptTurns = grouped.turns.slice(-limit);
+
+  const history: Message[] = [];
+  for (const turn of keptTurns) {
+    history.push(turn.messages[0], turn.messages[1]);
+  }
+  if (grouped.trailingUser !== null) history.push(grouped.trailingUser);
+
+  const keptStartSeq =
+    keptTurns[0]?.startSeq ?? grouped.trailingUser?.seq ?? afterSeq + 1;
+  const omittedRow = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM messages
+        WHERE task_id IS NULL AND role IN ('user', 'assistant')
+          AND seq > ? AND seq < ?`,
+    )
+    .get(afterSeq, keptStartSeq) as unknown as CountRow | undefined;
+  const omittedMessages = Number(omittedRow?.n ?? 0);
   return {
     history,
-    omittedHistoryTurns: Math.max(0, totalTurns - keptTurns),
+    // 窗口前的消息都是成对的完整轮；若数据里有落单 user，向下取整不虚报。
+    omittedHistoryTurns: Math.floor(omittedMessages / 2),
   };
 }
 
@@ -269,10 +344,12 @@ export function gatherMainContext(
 ): GatheredMainContext {
   const historyLimit = normalizeLimit(options.historyLimit, DEFAULT_MAIN_HISTORY_LIMIT);
   const factsLimit = normalizeLimit(options.factsLimit, DEFAULT_MAIN_FACTS_LIMIT);
-  const history = gatherHistory(db, historyLimit);
+  const summary = getSettings(db).mainConversationSummary;
+  const history = gatherHistory(db, historyLimit, summary?.upToSeq ?? 0);
   return {
     history: history.history,
     omittedHistoryTurns: history.omittedHistoryTurns,
+    summary,
     facts: recallFacts(db, { limit: factsLimit }),
     board: gatherBoard(db),
     related: gatherRelated(db, options.userMessage),
@@ -340,6 +417,10 @@ export function buildMainContext(
   const blocks: string[] = [];
   if (input.facts.length > 0) {
     blocks.push(`## 长期事实\n${formatFacts(input.facts)}`);
+  }
+
+  if (input.summary !== null && input.summary !== undefined) {
+    blocks.push(formatSummaryBlock(input.summary));
   }
 
   const board = formatBoard(input.board);

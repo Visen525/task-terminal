@@ -2,6 +2,15 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M12-02 主对话滚动摘要继承（2026-10-24）
+
+- **每轮开头 fire-and-forget，不阻塞本轮**：`runMainTurn` 在写入本轮 user 之前触发 `maybeCompactSummary`，失败只 `console.warn` 并继续。此时历史是完整轮（不会把刚写入的半轮算进摘要），而本轮 `gatherMainContext` 仍用上一版摘要；摘要异步落库后，下一轮立即生效。若改成本轮结束后台跑，摘要会晚一轮且仍受“本轮已追加 assistant”影响，故选择开头触发。
+- **摘要边界只认 `upToSeq`，窗口按完整轮分组**：`upToSeq` 是已并入摘要的最后一条 assistant seq；之后只取 user+assistant 成对轮次，落单 user（当前轮）不参与摘要。上下文窗口保留最近 12 个完整轮 + 当前未回复 user；`upToSeq` 之后仍超出窗口的旧轮（压缩 lag）继续用 `[已省略 N 轮更早对话]` 标记，N 只统计未摘要轮，避免重复。
+- **单飞用模块级 promise**：`maybeCompactSummary` 发现已有压缩在跑时直接复用同一个 promise，完成后清空。这样并发对话/重复触发不会对同一段历史重复调用模型、重复写 summary；代价是触发时若已有任务，新消息留到下一轮再压缩。
+- **失败绝不静默**：provider 异常、空输出都原样抛出；`main-loop` catch 后 WARN，settings 保持旧摘要（或 null），下一轮上下文自动回退省略标记。成功才 `saveSettings({mainConversationSummary})`，正文按 Unicode 码点截到 2000 字，`updatedAt` 用注入时钟。
+- **`purpose='summary'` 的记账类型**：`llm_calls` 的 DDL 是自由文本（无 CHECK），但本卡禁改 `src/store/llm-calls.ts` 的联合类型，故在 `conversation-summary.ts` 用一次显式断言写入；`llm_calls` 行与主线一样在失败时也记 0 usage。settings 新字段随 GET /settings 返回、允许客户端整份回写，深合并与默认 null 已补齐。
+- **测试全部 FakeProvider + 临时库**：覆盖 20 轮触发、upToSeq/摘要正文、下一轮注入、12 轮全文、失败回退与 WARN、≤12 轮 no-op、purpose 行；不读 `.env`、不打真 API。
+
 ## M12-01 API Key 界面化与优雅启动（2026-10-24）
 
 - **key 只在落库时显式写出，内存对象里不可枚举**：`apiKey` 存 `app_settings` 单行 JSON；`serializeSettings()` 显式拼装后写库，而内存中的 `settings.apiKey` 用 `defineProperty(enumerable:false)` 隐藏，因此 `JSON.stringify(settings)` / GET / 日志/错误消息都不可能顺手带出明文。`getEffectiveApiKey` 每次调用重读 settings > env，不缓存，所以设置页保存后下一轮对话/下一 tick 立即生效。
@@ -135,7 +144,7 @@
 ## M5-02 上下文组装与记忆注入（2026-10-25）
 
 - **组装与采集分离**：`gatherMainContext` 只读库（facts / board / related / history），`buildMainContext` 纯拼接 provider 入参；`main-loop.ts` 只把原来的「系统提示 + 最近历史」两段替换为这两个调用，循环、工具分发、记账、终态收口一行未改，M5-01 的 m5 用例零改动全绿作为行为不变证明。空上下文时系统提示与 `MAIN_SYSTEM_PROMPT` 逐字相同，避免改变既有提示契约。
-- **滑动窗口不做 LLM 摘要（已定偏差）**：超出 12 轮的旧对话只折成一行 `[已省略 N 轮更早对话]`，不额外调用模型。理由是多一次调用换来的摘要收益不抵成本；将来需要时可在 `gatherHistory` 内替换为摘要，属可逆决策。`N` 按 user+assistant 两条一轮计算（15 轮 → 省略 3 轮）。
+- **滑动窗口不做 LLM 摘要（已定偏差，M12-02 已升级）**：超出 12 轮的旧对话只折成一行 `[已省略 N 轮更早对话]`，不额外调用模型。理由是多一次调用换来的摘要收益不抵成本；将来需要时可在 `gatherHistory` 内替换为摘要，属可逆决策。`N` 按 user+assistant 两条一轮计算（15 轮 → 省略 3 轮）。M12-02 已按新契约替换为滚动摘要，失败时才回退本标记。
 - **看板超过 30 个活动任务改为状态汇总**：活动任务 = 非 completed / cancelled（failed 仍可重试，按活动处理）。≤30 时每任务一行 `[id] title | status | 产物 N`，产物数用一条按 task_id 分组的 COUNT 查询；>30 时只输出一行 `[看板汇总] 活动任务 N 个 | queued x | running y …`，不展开 id/title。阈值取 30 是为了在“看板一眼可读”和“不把任务表塞进上下文”之间折中，后续可配置化。
 - **related 的 query 就是最近一条用户消息的前 50 个字符**（按 Unicode 码点截断后 trim），直接交给既有 `searchArtifacts(..., limit=5)`。命中结果只映射 `title` / `summary` / `tags`：path、sha256、findings 与正文全部在 `gatherRelated` 丢弃，正文只能经显式 `read_artifact` 进入上下文。既有 FTS 对中文按 trigram 匹配，因此 query 与摘要需要共享至少 3 字的连续片段；这是检索层现状，不在本卡扩大范围。
 - **子智能体上下文只导出不强接线**：`buildAgentContext` 复用 `prompt.ts` 的 goal/工作区/权限卡，再追加父任务最近 3 条产物 summary；`gatherAgentContext` 在无 parent 或 parent 不存在时返回空。`loop.ts` 本卡未改，接入留给 M6+。
