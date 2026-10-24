@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M6-03 产物库与对话（2026-10-27）
+
+- **POST /chat 的流式错误放在 HTTP 200 的流内**：路由先 `reply.hijack()` 写 `text/event-stream` 头，成功发 `event: delta`（`{text}`）与一条 `event: done`（`{reply, usage}`）；运行期错误发 `event: error`（`{code, message}`）后结束，不再改成 500 JSON。这样前端只需处理一种响应形态，已收到的 delta 不会因状态码切换而丢失；参数错误仍发生在建流之前，由全局错误处理器返回 400 JSON。建流后立即写一行 `: connected` 注释，既冲刷响应头让 fetch 在首 token 前拿到流，也让代理/客户端确认连接已建立。
+- **main-loop 只在提供 `onTextDelta` 时改走 `provider.stream`，否则保留 `provider.chat`**：M5 既有测试里有一个只实现 chat、stream 直接抛 `stream not used` 的动态 provider；若无条件切换会破坏“M5 测试零改动全绿”。流式路径只转发 `text_delta`，完整响应仍以 `done.response` 为准，工具执行、记账、上限收口与终态语义全部复用原循环；不提供流式回调时行为与 M5 逐字一致。
+- **前端 24ms 字符串缓冲合批，`done.reply` 兜底替换**：SSE 回调只做 `deltaBufferRef.current += delta`，由 24ms `setTimeout` 合并成一次 `setMessages`；`done` 到达时再 flush 一次并用服务端落库的完整 `reply` 覆盖本地拼接结果，避免跨工具轮次的换行差异。请求中禁用输入与发送，assistant 气泡为空且仍在请求时显示「思考中…」。
+- **对话页用自己的 `chatApi.ts`/`artifactApi.ts`，不改 M6-01 的 `api.ts`**：两者都只走相对路径；chat 的 SSE 解析放在 `chatApi.ts`（fetch + `ReadableStream.getReader`，EventSource 不支持 POST），产物页的检索/详情也独立成文件，保持既有 API 模块不再膨胀。
+- **在途对话流纳入优雅退出**：`createApp` 维护 `activeChats` 集合，每个 POST /chat 持有 AbortController；`preClose`/`onClose` 对全部在途流先 `abort()` 再 `end()`，runMainTurn 的 provider 流被中止后不再写 done，`app.close()` 不会被长对话拖住。新增 GET /messages（默认 50 条）与 GET /artifacts/:id；服务层仍只做参数整形与调用 store/agent，不写业务判断。
+
 ## M6-02 执行时间线（2026-10-26）
 
 - **SSE 用命名事件 + `addEventListener`，不是只写 `onmessage`**：M4-02 的帧是 `event: <type>` + `data: <payload>`，浏览器不会把命名事件派发给 `onmessage`；因此对 SPEC §4.4 的 15 种类型逐个注册监听，同时保留 `onmessage` 兜底未命名帧。线上帧不含 `actor`/`ts`，增量事件按类型推导 actor、时间戳取接收时刻；首屏历史来自 `GET /tasks/:id`，字段完整。

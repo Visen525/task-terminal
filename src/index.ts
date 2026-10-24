@@ -136,6 +136,7 @@ async function main(): Promise<void> {
       db,
       scheduler,
       defaultWorkspace: config.workspace,
+      mainAi: { provider },
     });
 
     let shuttingDown = false;

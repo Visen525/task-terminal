@@ -1,6 +1,8 @@
 import { useState, type ReactNode } from "react";
 import { Empty, Layout, Menu, Space, Typography } from "antd";
 
+import Artifacts from "./pages/Artifacts";
+import Chat from "./pages/Chat";
 import TaskBoard from "./pages/TaskBoard";
 import TaskDetail from "./pages/TaskDetail";
 
@@ -56,9 +58,9 @@ export default function App() {
         />
       );
   } else if (activeKey === "artifacts") {
-    content = <Placeholder title="产物库" description="产物列表与详情将在 M6-03 交付。" />;
+    content = <Artifacts onOpenTask={openTask} />;
   } else {
-    content = <Placeholder title="对话" description="主 AI 对话界面将在 M6-03 交付。" />;
+    content = <Chat />;
   }
 
   return (

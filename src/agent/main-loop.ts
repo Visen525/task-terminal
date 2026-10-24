@@ -15,7 +15,7 @@
  */
 import type { DatabaseSync } from 'node:sqlite';
 
-import { ERROR_CODES } from '../core/errors.ts';
+import { ContractError, ERROR_CODES } from '../core/errors.ts';
 import type {
   LlmMessage,
   LlmResponse,
@@ -25,6 +25,7 @@ import type {
 } from '../core/types.ts';
 import {
   estimateTokenUsage,
+  type ChatParams,
   type LlmProvider,
 } from '../providers/types.ts';
 import type { TaskCanceller } from '../runtime/ops.ts';
@@ -110,6 +111,11 @@ export interface RunMainTurnOptions {
   now?: () => number;
   /** 模型名；默认 MAIN_MODEL。 */
   model?: string;
+  /**
+   * 文本增量转发（M6-03）。提供时本轮 provider 调用走 `stream`，
+   * 仅在 `done` 后把完整响应交给循环；缺省时仍走 `chat`，保持 M5 行为不变。
+   */
+  onTextDelta?: (text: string) => void;
 }
 
 interface MutableUsage {
@@ -178,6 +184,38 @@ function invalidToolArguments(tool: string, message: string): MainToolResult {
     output: `[工具失败] ${ERROR_CODES.E_INVALID_ARGUMENT}: ${tool} ${message}`,
     error: { code: ERROR_CODES.E_INVALID_ARGUMENT, message: `${tool} ${message}` },
   };
+}
+
+/**
+ * 统一 provider 调用出口：没有增量回调时沿用 chat；有回调时改用 stream，
+ * 把 text_delta 转发给调用方，并等 done 事件返回完整响应。
+ *
+ * 注意：不能在 stream 失败时静默退回 chat——那会让同一个用户请求可能被
+ * 计费两次，也会掩盖真实的网络/鉴权错误。这里只按“是否要求流式”二选一。
+ */
+async function requestProviderResponse(
+  provider: LlmProvider,
+  params: ChatParams,
+  onTextDelta: ((text: string) => void) | undefined,
+): Promise<LlmResponse> {
+  if (onTextDelta === undefined) {
+    return provider.chat(params);
+  }
+
+  let response: LlmResponse | null = null;
+  for await (const event of provider.stream(params)) {
+    if (event.type === 'text_delta') {
+      if (event.text.length > 0) onTextDelta(event.text);
+      continue;
+    }
+    if (event.type === 'done') {
+      response = event.response;
+    }
+  }
+  if (response === null) {
+    throw new ContractError(ERROR_CODES.E_INTERNAL, 'provider.stream 未返回 done 事件');
+  }
+  return response;
 }
 
 /**
@@ -266,14 +304,15 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
     const callStartedAt = Date.now();
     let response: LlmResponse;
     try {
-      response = await provider.chat({
+      const params: ChatParams = {
         // 快照：后续轮次追加 tool 消息不应改变本次调用记录。
         messages: [...messages],
         tools: MAIN_TOOL_SPECS,
         model,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         toolChoice: 'auto',
-      });
+      };
+      response = await requestProviderResponse(provider, params, options.onTextDelta);
     } catch (error) {
       // SPEC §4.8：失败的调用也记账（usage 未知记 0）。
       recordLlmCall(

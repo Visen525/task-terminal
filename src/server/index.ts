@@ -22,10 +22,13 @@ import {
   type PermissionMode,
   type Task,
 } from '../core/types.ts';
+import { runMainTurn } from '../agent/main-loop.ts';
+import type { LlmProvider } from '../providers/types.ts';
 import { cancelTask, createTask, retryTask } from '../runtime/ops.ts';
 import type { Scheduler } from '../runtime/scheduler.ts';
-import { searchArtifacts } from '../store/artifacts.ts';
+import { getArtifact, searchArtifacts } from '../store/artifacts.ts';
 import { listEvents, type ListEventsOptions } from '../store/events.ts';
+import { listRecentMessages } from '../store/messages.ts';
 import { getTask, listTasks } from '../store/repo.ts';
 
 export interface SseOptions {
@@ -44,6 +47,11 @@ export interface CreateAppOptions {
   scheduler: Scheduler;
   /** POST /tasks 未带 workspace 时的默认工作区（由启动装配注入）。 */
   defaultWorkspace: string;
+  /**
+   * 主线 AI 依赖（M6-03）；缺省时 POST /chat 返回 500。
+   * 只注入 provider，db / scheduler / workspace 仍由本层持有。
+   */
+  mainAi?: { provider: LlmProvider };
   /** 可注入时钟；默认 Date.now。 */
   now?: () => number;
   sse?: SseOptions;
@@ -52,6 +60,7 @@ export interface CreateAppOptions {
 const DEFAULT_POLL_INTERVAL_MS = 150;
 const DEFAULT_HEARTBEAT_MS = 15_000;
 const DEFAULT_SSE_PAGE_SIZE = 500;
+const DEFAULT_MESSAGES_LIMIT = 50;
 const RECENT_EVENT_LIMIT = 20;
 const EVENT_PAGE_SIZE = 500;
 
@@ -210,6 +219,12 @@ interface SseConnection {
   close(): void;
 }
 
+/** 在途对话流：优雅退出时需要主动中止并结束 HTTP 响应。 */
+interface ActiveChatStream {
+  abort(): void;
+  end(): void;
+}
+
 export function createApp(options: CreateAppOptions): FastifyInstance {
   const { db, scheduler, defaultWorkspace } = options;
   const clock = options.now ?? Date.now;
@@ -221,6 +236,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
   const app = Fastify({ logger: false, bodyLimit: 1_048_576 });
   const connections = new Set<SseConnection>();
+  const activeChats = new Set<ActiveChatStream>();
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ContractError) {
@@ -365,6 +381,135 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     return searchArtifacts(db, rawQuery ?? '', limit);
   });
 
+  app.get('/artifacts/:id', async (request, reply) => {
+    const params = asRecord(request.params) ?? {};
+    const id = params.id;
+    if (typeof id !== 'string' || id.length === 0) invalid('产物 id 不能为空');
+    const artifact = getArtifact(db, id);
+    if (artifact === null) notFound(`产物不存在: ${id}`);
+    reply.send(artifact);
+  });
+
+  // ── 主线对话 ───────────────────────────────────────────────────
+
+  app.get('/messages', async (request) => {
+    const query = readQuery(request);
+    const limit = parseOptionalLimit(query.limit, DEFAULT_MESSAGES_LIMIT);
+    return listRecentMessages(db, limit);
+  });
+
+  /**
+   * POST /chat：SSE 流式主线对话（M6-03）。
+   *
+   * 协议：HTTP 200 + text/event-stream
+   *   event: delta  data: {text}
+   *   event: done   data: {reply, usage}
+   *   event: error  data: {code, message}（随后结束，HTTP 仍是 200）
+   * 参数错误在建立流之前由全局错误处理器返回 400 JSON。
+   */
+  app.post('/chat', async (request, reply) => {
+    const body = readJsonBody(request);
+    const message = requiredString(body, 'message');
+    const mainAi = options.mainAi;
+    if (mainAi === undefined) {
+      throw new ContractError(ERROR_CODES.E_INTERNAL, '主线 AI 未装配，POST /chat 不可用');
+    }
+
+    const raw = reply.raw;
+    reply.hijack();
+    raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',
+      Connection: 'keep-alive',
+    });
+    // 立即吐注释行：既冲刷响应头（fetch 在首 token 前即可拿到流），也让客户端确认已连上。
+    raw.write(': connected\n\n');
+
+    const controller = new AbortController();
+    let closed = false;
+
+    const write = (chunk: string): void => {
+      if (closed || raw.writableEnded || raw.destroyed) return;
+      raw.write(chunk);
+    };
+
+    const writeDelta = (text: string): void => {
+      write(`event: delta\ndata: ${JSON.stringify({ text })}\n\n`);
+    };
+
+    const writeDone = (data: unknown): void => {
+      write(`event: done\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    const writeStreamError = (data: unknown): void => {
+      write(`event: error\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    const finish = (): void => {
+      if (closed) return;
+      closed = true;
+      activeChats.delete(stream);
+      if (!raw.writableEnded && !raw.destroyed) raw.end();
+    };
+
+    const stream: ActiveChatStream = {
+      abort: () => {
+        if (!controller.signal.aborted) {
+          controller.abort(new Error('服务关闭，已结束在途对话'));
+        }
+      },
+      end: finish,
+    };
+
+    const handleDisconnect = (): void => {
+      if (closed) return;
+      closed = true;
+      activeChats.delete(stream);
+      if (!controller.signal.aborted) {
+        controller.abort(new Error('客户端连接已断开'));
+      }
+    };
+    activeChats.add(stream);
+    raw.on('close', handleDisconnect);
+    raw.on('error', handleDisconnect);
+
+    try {
+      const result = await runMainTurn({
+        db,
+        provider: mainAi.provider,
+        userMessage: message,
+        workspace: defaultWorkspace,
+        signal: controller.signal,
+        onTextDelta: (text) => {
+          writeDelta(text);
+        },
+        onTaskCreated: () => {
+          wakeScheduler(scheduler);
+        },
+      });
+      writeDone({ reply: result.reply, usage: result.usage });
+    } catch (error) {
+      if (!closed) {
+        const contract = error instanceof ContractError ? error : null;
+        const code: ErrorCode = contract?.code ?? ERROR_CODES.E_INTERNAL;
+        // 只记录错误码与脱敏后的消息；provider 层已保证不回显 key/Authorization。
+        logError('chat stream failed', {
+          code,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        writeStreamError({
+          code,
+          message: contract?.message ?? '对话失败，请稍后重试',
+        });
+      }
+    } finally {
+      raw.removeListener('close', handleDisconnect);
+      raw.removeListener('error', handleDisconnect);
+      finish();
+    }
+  });
+
   // ── SSE ────────────────────────────────────────────────────────
 
   app.get('/events', async (request, reply) => {
@@ -463,11 +608,19 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   const closeAllSse = (): void => {
     for (const connection of [...connections]) connection.close();
   };
-  // preClose 先于 http server 关闭执行，避免 keep-alive/SSE 连接拖住 app.close()。
+  const closeAllChats = (): void => {
+    for (const stream of [...activeChats]) {
+      stream.abort();
+      stream.end();
+    }
+  };
+  // preClose 先于 http server 关闭执行，避免 keep-alive/SSE/对话流拖住 app.close()。
   app.addHook('preClose', async () => {
+    closeAllChats();
     closeAllSse();
   });
   app.addHook('onClose', async () => {
+    closeAllChats();
     closeAllSse();
   });
 
