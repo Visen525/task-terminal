@@ -445,11 +445,12 @@ workspace/
 | --- | --- |
 | `fastify`、`better-sqlite3`、`zod`、`ulid`、`pino`、`dotenv`、`yaml` | `langchain`、`llama-index`、`openai` SDK、`express`、`prisma`、`typeorm`、`next`、`electron`、`redux` |
 | `react`、`react-dom`、`antd`、`@tanstack/react-query`、`@tanstack/react-virtual`、`react-markdown` | 任何 GPL 系依赖 |
-| `typescript`、`@types/node`、`prettier` | 任何需要 native 编译且无 win-x64 prebuilt 的包 |
+| `typescript`、`@types/node`、`prettier`、`@types/react`、`@types/react-dom` | 任何需要 native 编译且无 win-x64 prebuilt 的包 |
+| `vite`、`@vitejs/plugin-react`（仅限 `src/web/` 前端构建，M6 起生效） | 在后端 `src/` 使用打包器 |
 
 需要白名单外的依赖：先提问，不许先装。
 
-**不需要** `tsx` / `vitest` / 打包器：Node 24 原生运行 `.ts`，测试用内置 `node:test`。
+**后端不需要** `tsx` / `vitest` / 打包器：Node 24 原生运行 `.ts`，测试用内置 `node:test`。前端（`src/web/`）自 M6 起用 Vite 构建到 `dist/`（任务卡 M6-01 指定；`v0.1.0` 后经 `[contract]` 修订补入白名单）。
 
 **调用 DeepSeek 不用 SDK**：Node 24 内置 `fetch`，自己写约 200 行适配（见附录 A）。
 

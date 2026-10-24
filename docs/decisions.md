@@ -133,3 +133,7 @@
 - **长度上限是防滥用约束**：summary≤4000、findings≤50 条、artifacts≤20 项（kind/title/summary 必填，path 仅 note 可省，tags≤10）。数值为工程默认，无 SPEC 依据，调整需 [contract] 提交。
 - **artifacts.kind 与 tasks 表 §4.2 的四值一致**（file|note|dataset|patch）；path 为工作区相对路径，M7-01 落盘与 sha256 以它为准。
 - **校验实现**：M3-03 用针对本 schema 的专用结构校验器（约百行），不引入 zod、不实现通用 JSON Schema 引擎——契约层保持零依赖哲学（与 node:sqlite/自研 ULID 同一决策线）。
+
+## 契约 · §5.6 白名单补 Vite（2026-10-24，随 M6-01 前置修订）
+
+- M6-01 任务卡指定 "Vite + React + AntD"，但 §5.6 白名单表漏列 Vite——属 SPEC 内部不一致，按契约流程修订补入（vite、@vitejs/plugin-react、@types/react、@types/react-dom），并注明仅限 src/web/ 前端构建；后端仍零打包器。
