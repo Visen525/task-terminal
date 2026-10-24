@@ -109,6 +109,7 @@ export function throwIfAborted(signal?: AbortSignal): void {
 /**
  * usage 缺失时的估算（SPEC §4.8：tokens ≈ 字符数 / 2）。
  * 输入取消息正文 + tool_call 参数；输出取正文 + tool_call 参数。
+ * 多模态图片按每张 800 token 估算（v1.1），文本分片仍按字符数 / 2。
  */
 export function estimateTokenUsage(
   messages: LlmMessage[],
@@ -116,8 +117,16 @@ export function estimateTokenUsage(
   toolCalls: LlmToolCall[],
 ): TokenUsage {
   let inputChars = 0;
+  let imageTokens = 0;
   for (const message of messages) {
-    inputChars += message.content.length;
+    if (typeof message.content === 'string') {
+      inputChars += message.content.length;
+    } else {
+      for (const part of message.content) {
+        if (part.type === 'text') inputChars += part.text.length;
+        else imageTokens += 800;
+      }
+    }
     if (message.toolCallId !== undefined) {
       inputChars += message.toolCallId.length;
     }
@@ -133,7 +142,7 @@ export function estimateTokenUsage(
   }
 
   return {
-    inputTokens: Math.ceil(inputChars / 2),
+    inputTokens: Math.ceil(inputChars / 2) + imageTokens,
     cachedTokens: 0,
     outputTokens: Math.ceil(outputChars / 2),
     estimated: true,

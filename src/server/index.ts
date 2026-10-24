@@ -8,6 +8,8 @@
  * SSE 的实时源是 events 表轮询（默认 150ms）：单用户量级足够，且与
  * “事件是唯一真相源”一致；不引入 ws/额外依赖，断点续传只依赖 seq。
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 
 import Fastify, {
@@ -34,9 +36,19 @@ import { getArtifact, searchArtifacts } from '../store/artifacts.ts';
 import { deleteFact, listFacts } from '../store/facts.ts';
 import { listEvents, type ListEventsOptions } from '../store/events.ts';
 import { getDailyUsage } from '../store/llm-calls.ts';
-import { listRecentMessages } from '../store/messages.ts';
+import {
+  findAttachmentById,
+  listRecentMessages,
+} from '../store/messages.ts';
 import { getTask, listTasks } from '../store/repo.ts';
 import { isUlid } from '../store/ulid.ts';
+import {
+  buildChatUserContent,
+  CHAT_BODY_LIMIT_BYTES,
+  findUploadById,
+  guessMimeFromFilename,
+  saveChatAttachments,
+} from './uploads.ts';
 
 export interface SseOptions {
   /** 轮询 events 表间隔；默认 150ms。 */
@@ -59,6 +71,8 @@ export interface CreateAppOptions {
    * 只注入 provider，db / scheduler / workspace 仍由本层持有。
    */
   mainAi?: { provider: LlmProvider };
+  /** 对话附件落盘根目录；默认 <cwd>/data/uploads（测试可注入临时目录）。 */
+  uploadsDir?: string;
   /** 可注入时钟；默认 Date.now。 */
   now?: () => number;
   sse?: SseOptions;
@@ -129,6 +143,21 @@ function requiredString(body: Record<string, unknown>, field: string): string {
     invalid(`${field} 必须是非空字符串`);
   }
   return value.trim();
+}
+
+/**
+ * POST /chat 的 message：普通消息仍必须非空；只带附件（如单发一张图）时
+ * 允许空文本。非字符串一律 400；错误文案不回显输入。
+ */
+function parseChatMessage(raw: unknown, hasAttachments: boolean): string {
+  if (raw === undefined) {
+    if (hasAttachments) return '';
+    invalid('message 必须是非空字符串');
+  }
+  if (typeof raw !== 'string') invalid('message 必须是字符串');
+  const message = raw.trim();
+  if (message.length === 0 && !hasAttachments) invalid('message 必须是非空字符串');
+  return message;
 }
 
 function optionalString(raw: unknown, name: string): string | undefined {
@@ -254,6 +283,7 @@ interface ActiveChatStream {
 export function createApp(options: CreateAppOptions): FastifyInstance {
   const { db, scheduler, defaultWorkspace } = options;
   const clock = options.now ?? Date.now;
+  const uploadsDir = options.uploadsDir ?? join(process.cwd(), 'data', 'uploads');
   const sseOptions = options.sse ?? {};
   const pollIntervalMs = positiveOr(sseOptions.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
   const heartbeatMs = positiveOr(sseOptions.heartbeatMs, DEFAULT_HEARTBEAT_MS);
@@ -478,7 +508,47 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   app.get('/messages', async (request) => {
     const query = readQuery(request);
     const limit = parseOptionalLimit(query.limit, DEFAULT_MESSAGES_LIMIT);
-    return listRecentMessages(db, limit);
+    return listRecentMessages(db, limit).map((message) => ({
+      id: message.id,
+      taskId: message.taskId,
+      seq: message.seq,
+      role: message.role,
+      // v1.1 契约字段；content 保留给 M6 起的既有前端/断言，值相同。
+      text: message.content,
+      content: message.content,
+      tokens: message.tokens,
+      ts: message.ts,
+      ...(message.attachments === undefined
+        ? {}
+        : { attachments: message.attachments }),
+    }));
+  });
+
+  /**
+   * GET /uploads/:id（M9-03）：按 ULID 前缀在 uploads 根目录定位并内联下发。
+   * 参数只允许 Crockford Base32，文件路径 resolve 后必须仍在 uploads 内；
+   * 任何不合法/不存在/越界路径统一 404，不泄露本机路径。
+   */
+  app.get('/uploads/:id', async (request, reply) => {
+    const params = asRecord(request.params) ?? {};
+    const rawId = params.id;
+    if (typeof rawId !== 'string') notFound('附件不存在');
+    const located = findUploadById(uploadsDir, rawId);
+    if (located === null) notFound('附件不存在');
+
+    const meta = findAttachmentById(db, located.id);
+    const mime = meta?.mime ?? guessMimeFromFilename(located.filename);
+    let data: Buffer;
+    try {
+      data = readFileSync(located.fullPath);
+    } catch {
+      notFound('附件不存在');
+    }
+    reply
+      .header('Content-Disposition', 'inline')
+      .header('X-Content-Type-Options', 'nosniff')
+      .type(mime);
+    return reply.send(data);
   });
 
   /**
@@ -490,13 +560,19 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
    *   event: error  data: {code, message}（随后结束，HTTP 仍是 200）
    * 参数错误在建立流之前由全局错误处理器返回 400 JSON。
    */
-  app.post('/chat', async (request, reply) => {
+  app.post('/chat', { bodyLimit: CHAT_BODY_LIMIT_BYTES }, async (request, reply) => {
     const body = readJsonBody(request);
-    const message = requiredString(body, 'message');
+    const rawAttachments = body.attachments;
+    const hasAttachments = Array.isArray(rawAttachments) && rawAttachments.length > 0;
+    const message = parseChatMessage(body.message, hasAttachments);
     const mainAi = options.mainAi;
     if (mainAi === undefined) {
       throw new ContractError(ERROR_CODES.E_INTERNAL, '主线 AI 未装配，POST /chat 不可用');
     }
+
+    // 附件校验/落盘在建立 SSE 之前完成：违规直接走全局 400 JSON。
+    const saved = saveChatAttachments(rawAttachments, uploadsDir, clock());
+    const userContent = buildChatUserContent(message, saved);
 
     const raw = reply.raw;
     reply.hijack();
@@ -561,7 +637,13 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       const result = await runMainTurn({
         db,
         provider: mainAi.provider,
-        userMessage: message,
+        ...(saved.length === 0
+          ? { userMessage: message }
+          : {
+              userContent: userContent.parts,
+              userText: userContent.text,
+              userAttachments: saved.map((item) => item.attachment),
+            }),
         workspace: defaultWorkspace,
         signal: controller.signal,
         onTextDelta: (text) => {

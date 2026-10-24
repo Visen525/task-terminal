@@ -682,10 +682,19 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * v1.1 多模态：字符串 content 与 LlmContentPart[] 分片都原样透传。
+ * DeepSeek 的 /chat/completions 接受 OpenAI 兼容的 image_url 分片；
+ * 这里不改写 data URL，也不把数组重新拼成字符串。
+ */
+function toApiContent(content: LlmMessage['content']): LlmMessage['content'] {
+  return content;
+}
+
 function toApiMessage(message: LlmMessage): Record<string, unknown> {
   const result: Record<string, unknown> = {
     role: message.role,
-    content: message.content,
+    content: toApiContent(message.content),
   };
   if (message.toolCallId !== undefined) {
     result.tool_call_id = message.toolCallId;

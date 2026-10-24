@@ -2,6 +2,15 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M9-03 对话附件与引用（2026-10-24）
+
+- **附件校验/落盘集中在 `src/server/uploads.ts`，且在 `reply.hijack()` 之前完成**：数量 ≤5、单个 ≤8MB、总量 ≤16MB、base64 合法性、文件名净化（取 basename、去 `/` `\` 与 Windows 非法字符、≤120 码点）全部先于建流判定，违规统一走全局错误处理器返回 400 JSON；POST /chat 单独把 bodyLimit 提到 64MiB，否则 5×8MB 的 base64 外壳会先被 Fastify 默认 1MiB 拦成 413。写入与读取都做 `resolve` 后的目录包含校验，GET /uploads 只接受 Crockford Base32 的 ULID 前缀，越界/非法 id/文件不存在一律 404，错误信息不含本机路径。
+- **消息只落附件元数据，不落正文**：user 消息按 v1.1 `JSON.stringify({text, attachments:[{id,name,mime,size,path}]})` 存储，path 固定为逻辑路径 `data/uploads/<ulid>__<safeName>`，不写绝对路径；文本附件正文只在当前轮 provider content 里内联（>64KB 截断），图片只生成当前轮 data URL 分片，二进制只给“已存档、模型无法直接读取”的文本说明。下一轮组装时历史内容统一经 `llmContentText()` 折纯文本（图片折 `[图片]`），既避免历史图片反复计费，也避免把 64KB 文件正文每轮重发；`GET /messages` 以 `text` 为纯文本视图，保留 `content` 同值字段兼容 M6 起的既有断言。
+- **runMainTurn 的 `userMessage` / `userContent` 严格二选一**：两者都给或都不给都抛 `E_INVALID_ARGUMENT`，不做静默兜底；附加可选 `userText`（落库/展示文本）与 `userAttachments`（元数据），均只在服务端装配时传入，纯文本调用路径行为不变。当前轮最后一条 user 恢复为原始 content（可能是分片数组），其余消息全部折字符串；provider 的 `toApiContent` 对数组原样透传，usage 缺失时图片每张按 800 token 估算。
+- **前端图片在选中/粘贴/拖拽时就用 canvas 预处理**：长边 ≤1568px，非透明图统一 JPEG 0.85，PNG 先扫 alpha、含透明则保持 PNG；压缩失败会 toast 并跳过该文件，不会把未压缩原图静默发出。图片气泡用 antd `Image` 预览：本地刚发送用 object URL，落库后统一 `/uploads/:id`；为此 Vite 代理仅追加一条 `/uploads`。
+- **引用是纯前端文本协议，不改后端**：发送时把原文逐行加 `> ` 前缀，头部固定 `> 引用：`；用户气泡只解析开头连续的 `>` 行渲染成灰色引用块，正文保持纯文本。这样模型天然按 blockquote 理解上下文，历史消息与后端无需新增字段；引用条只显示空白折叠后的前 80 个字符。
+- **验收测试全部使用 FakeProvider，不碰 `.env` 与真 API**：注入级断言覆盖图片 data URL/文本内联/二进制说明/64KB 截断、四类超限与文件名净化、GET /uploads 的 mime/inline/前缀定位/路径穿越 404、新旧消息格式兼容、runMainTurn 当前轮数组与历史折纯文本，以及 800 token 估算；真图识色、真文件问答与引用追问留给 Manager 手测。
+
 ## M9-02 设置面板与记忆管理（2026-10-24）
 
 - **事实列表与删除放在 `store/facts.ts` 的两个新函数里，路由只做整形**：`listFacts` 默认 `superseded_by IS NULL`，开关打开时返回全部，并固定按 `scope/key` 排序，界面不依赖 `recallFacts` 的 confidence 排序；`deleteFact` 返回真实删除行数，`0` 由路由映射为 404。事实 id 统一为 `f_` + 26 位 ULID，非法格式在进入 SQL 前直接 400，错误文案不回显输入。

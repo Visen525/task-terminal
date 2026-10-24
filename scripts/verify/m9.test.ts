@@ -1,16 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
+import { runMainTurn } from "../../src/agent/main-loop.ts";
+import { ContractError, ERROR_CODES } from "../../src/core/errors.ts";
+import type { LlmContentPart, LlmMessage } from "../../src/core/types.ts";
+import { FakeProvider, type FakeStep } from "../../src/providers/fake.ts";
+import { estimateTokenUsage } from "../../src/providers/types.ts";
 import { DEFAULT_DAILY_BUDGET_TOKENS, getLocalDayRange } from "../../src/runtime/watchdog.ts";
 import type { Scheduler } from "../../src/runtime/scheduler.ts";
 import { createApp } from "../../src/server/index.ts";
 import { insertArtifact } from "../../src/store/artifacts.ts";
 import { upsertFact } from "../../src/store/facts.ts";
 import { insertLlmCall } from "../../src/store/llm-calls.ts";
+import { appendMessage, listRecentMessages } from "../../src/store/messages.ts";
 import { openDatabase } from "../../src/store/migrate.ts";
 import { insertTask } from "../../src/store/repo.ts";
 
@@ -417,4 +430,633 @@ test("M9-02 脚本与依赖：verify 注册 m9，package.json 依赖零新增", 
       "vite",
     ].sort(),
   );
+});
+
+// ── M9-03 对话附件与引用 ────────────────────────────────────────
+
+const PNG_1X1_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+function attachmentOf(name: string, mime: string, bytes: Buffer) {
+  return { name, mime, dataBase64: bytes.toString("base64") };
+}
+
+function textAttachment(name: string, mime: string, text: string) {
+  return attachmentOf(name, mime, Buffer.from(text, "utf8"));
+}
+
+function listUploadFiles(uploadsDir: string): string[] {
+  return existsSync(uploadsDir) ? readdirSync(uploadsDir) : [];
+}
+
+async function postChat(baseUrl: string, body: unknown): Promise<Response> {
+  return fetch(`${baseUrl}/chat`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+async function getChatMessages(
+  baseUrl: string,
+): Promise<Array<Record<string, unknown>>> {
+  const response = await fetch(`${baseUrl}/messages?limit=50`);
+  assert.equal(response.status, 200, "预期 GET /messages 返回 200");
+  const body: unknown = await response.json();
+  return asArray(body, "GET /messages").map((row) => asRecord(row, "message"));
+}
+
+function textPartOf(content: LlmMessage["content"]): string {
+  assert.ok(Array.isArray(content), "预期 content 是多模态分片数组");
+  const parts = content as readonly LlmContentPart[];
+  const text = parts.find(
+    (part): part is Extract<LlmContentPart, { type: "text" }> =>
+      part.type === "text",
+  );
+  assert.ok(text !== undefined, "预期分片里存在 text 部分");
+  return text.text;
+}
+
+function imagePartsOf(content: LlmMessage["content"]): string[] {
+  assert.ok(Array.isArray(content), "预期 content 是多模态分片数组");
+  return (content as readonly LlmContentPart[])
+    .filter(
+      (part): part is Extract<LlmContentPart, { type: "image_url" }> =>
+        part.type === "image_url",
+    )
+    .map((part) => part.image_url.url);
+}
+
+async function withChatApp(
+  script: FakeStep[],
+  fn: (context: {
+    base: string;
+    db: DatabaseSync;
+    app: ReturnType<typeof createApp>;
+    baseUrl: string;
+    uploadsDir: string;
+    provider: FakeProvider;
+  }) => Promise<void>,
+): Promise<void> {
+  const base = mkdtempSync(join(tmpdir(), "task-terminal-m9-chat-"));
+  const uploadsDir = join(base, "uploads");
+  const db = openDatabase(":memory:");
+  const provider = new FakeProvider(script);
+  const app = createApp({
+    db,
+    scheduler: stubScheduler(),
+    defaultWorkspace: workspace,
+    mainAi: { provider },
+    uploadsDir,
+    now: () => 1_000,
+  });
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  assert.ok(
+    address !== null && typeof address === "object",
+    "预期测试服务器返回端口",
+  );
+  const baseUrl = `http://127.0.0.1:${String(address.port)}`;
+  try {
+    await fn({ base, db, app, baseUrl, uploadsDir, provider });
+  } finally {
+    await app.close();
+    db.close();
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+test(
+  "M9-03 POST /chat 附件：图片 data URL 分片 + 文本内联 + attachments 元数据落库 + GET /messages 纯文本",
+  { timeout: 30_000 },
+  async () => {
+    await withChatApp(
+      [{ content: "收到图片和文件" }],
+      async ({ baseUrl, db, uploadsDir, provider }) => {
+        const textBytes = Buffer.from("# 笔记\n这是附件里的文字", "utf8");
+        const response = await postChat(baseUrl, {
+          message: "请看图并读文件",
+          attachments: [
+            { name: "red.png", mime: "image/png", dataBase64: PNG_1X1_BASE64 },
+            attachmentOf("notes.md", "text/markdown", textBytes),
+          ],
+        });
+        assert.equal(response.status, 200, "预期带附件对话建立 SSE 流");
+        const sse = await response.text();
+        assert.ok(sse.includes("event: done"), "预期流正常结束于 done");
+
+        const firstCallMessages = provider.calls[0]?.messages ?? [];
+        const currentUser = firstCallMessages.at(-1);
+        assert.equal(currentUser?.role, "user");
+        const text = textPartOf(currentUser?.content ?? []);
+        assert.ok(text.includes("请看图并读文件"), "预期文本部分保留用户消息");
+        assert.ok(
+          text.includes("【附件 notes.md】\n# 笔记\n这是附件里的文字"),
+          `预期文本附件内联到文本部分，实际 ${text}`,
+        );
+        assert.deepEqual(
+          imagePartsOf(currentUser?.content ?? []),
+          [`data:image/png;base64,${PNG_1X1_BASE64}`],
+          "预期图片以 data URL 进入 image_url 分片",
+        );
+
+        const rows = await getChatMessages(baseUrl);
+        const userRow = rows.find((row) => row.role === "user");
+        assert.ok(userRow !== undefined, "预期历史含 user 消息");
+        assert.equal(userRow.text, "请看图并读文件", "预期 text 只保留用户输入");
+        assert.equal(
+          userRow.content,
+          "请看图并读文件",
+          "预期保留 content 兼容字段且与 text 相同",
+        );
+        const metadata = asArray(userRow.attachments, "user.attachments").map(
+          (item) => asRecord(item, "attachment"),
+        );
+        assert.equal(metadata.length, 2, "预期两个附件元数据");
+        const imageMeta = metadata.find((item) => item.name === "red.png");
+        const fileMeta = metadata.find((item) => item.name === "notes.md");
+        assert.ok(imageMeta !== undefined && fileMeta !== undefined);
+        assert.equal(imageMeta.mime, "image/png");
+        assert.equal(imageMeta.size, Buffer.from(PNG_1X1_BASE64, "base64").length);
+        assert.match(String(imageMeta.path), /^data\/uploads\//u);
+        assert.equal(typeof imageMeta.id, "string");
+        assert.equal(readdirSync(uploadsDir).length, 2, "预期两个文件落盘");
+
+        const stored = listRecentMessages(db, 10);
+        assert.equal(stored[0]?.content, "请看图并读文件");
+        assert.deepEqual(
+          stored[0]?.attachments?.map((item) => item.name),
+          ["red.png", "notes.md"],
+        );
+
+        const imageId = String(imageMeta.id);
+        const imageResponse = await fetch(`${baseUrl}/uploads/${imageId}`);
+        assert.equal(imageResponse.status, 200);
+        assert.equal(imageResponse.headers.get("content-type"), "image/png");
+        assert.equal(imageResponse.headers.get("content-disposition"), "inline");
+        assert.equal(
+          Buffer.from(await imageResponse.arrayBuffer()).toString("base64"),
+          PNG_1X1_BASE64,
+          "预期 GET /uploads 原样下发图片字节",
+        );
+
+        const prefixResponse = await fetch(
+          `${baseUrl}/uploads/${imageId.slice(0, 10)}`,
+        );
+        assert.equal(prefixResponse.status, 200, "预期按 ULID 前缀也能定位");
+
+        // 附件正文只进当前轮 provider content，不写进 messages.content。
+        assert.equal(
+          stored[0]?.content.includes("这是附件里的文字"),
+          false,
+          "预期落库文本不含附件正文",
+        );
+      },
+    );
+  },
+);
+
+test(
+  "M9-03 POST /chat：文本附件超 64KB 截断注明，二进制附件只注明元信息",
+  { timeout: 30_000 },
+  async () => {
+    await withChatApp(
+      [{ content: "已处理" }],
+      async ({ baseUrl, provider }) => {
+        const big = "A".repeat(64 * 1024 + 32);
+        const response = await postChat(baseUrl, {
+          message: "处理这些附件",
+          attachments: [
+            textAttachment("big.txt", "text/plain", big),
+            attachmentOf("data.bin", "application/octet-stream", Buffer.from("bin")),
+            textAttachment("script.ps1", "application/octet-stream", "Write-Host hi"),
+          ],
+        });
+        assert.equal(response.status, 200);
+        await response.text();
+
+        const current = provider.calls[0]?.messages.at(-1);
+        const text = textPartOf(current?.content ?? []);
+        assert.ok(text.includes("【附件 big.txt】\nAAAA"), "预期超长文本仍内联前缀");
+        assert.ok(text.includes("内容超过 64KB，已截断"), "预期截断有明确注明");
+        assert.equal(
+          text.includes("A".repeat(64 * 1024 + 1)),
+          false,
+          "预期超过 64KB 的部分不进入上下文",
+        );
+        assert.ok(
+          text.includes(
+            "已收到二进制附件 data.bin（3 B，已存档，模型无法直接读取）",
+          ),
+          `预期二进制附件只给元信息，实际 ${text}`,
+        );
+        assert.ok(
+          text.includes("【附件 script.ps1】\nWrite-Host hi"),
+          "预期扩展名可识别的文本文件（即使 mime 是 octet-stream）也内联",
+        );
+        assert.equal(
+          imagePartsOf(current?.content ?? []).length,
+          0,
+          "预期没有图片分片",
+        );
+      },
+    );
+  },
+);
+
+test(
+  "M9-03 POST /chat 附件限制：>5 个、单个 >8MB、总量 >16MB、非法 base64 均 400 且不落盘",
+  { timeout: 60_000 },
+  async () => {
+    await withChatApp([{ content: "只允许一次有效请求" }], async ({ app, baseUrl, uploadsDir }) => {
+      const errorCode = async (response: Response): Promise<unknown> => {
+        assert.equal(response.status, 400, "预期附件违规返回 400");
+        const body = asRecord(await response.json(), "error body");
+        return asRecord(body.error, "error").code;
+      };
+
+      const six = await postChat(baseUrl, {
+        message: "太多",
+        attachments: Array.from({ length: 6 }, (_value, index) =>
+          textAttachment(`f${String(index)}.txt`, "text/plain", "x"),
+        ),
+      });
+      assert.equal(await errorCode(six), ERROR_CODES.E_INVALID_ARGUMENT);
+
+      const tooLargeSingle = await postChat(baseUrl, {
+        message: "单个太大",
+        attachments: [
+          attachmentOf(
+            "big.bin",
+            "application/octet-stream",
+            Buffer.alloc(8 * 1024 * 1024 + 1),
+          ),
+        ],
+      });
+      assert.equal(await errorCode(tooLargeSingle), ERROR_CODES.E_INVALID_ARGUMENT);
+
+      const tooLargeTotal = await postChat(baseUrl, {
+        message: "总量太大",
+        attachments: [
+          attachmentOf("a.bin", "application/octet-stream", Buffer.alloc(8 * 1024 * 1024)),
+          attachmentOf("b.bin", "application/octet-stream", Buffer.alloc(8 * 1024 * 1024)),
+          attachmentOf("c.bin", "application/octet-stream", Buffer.from("x")),
+        ],
+      });
+      assert.equal(await errorCode(tooLargeTotal), ERROR_CODES.E_INVALID_ARGUMENT);
+
+      const badBase64 = await postChat(baseUrl, {
+        message: "非法内容",
+        attachments: [
+          { name: "x.txt", mime: "text/plain", dataBase64: "!!!not-base64" },
+        ],
+      });
+      assert.equal(await errorCode(badBase64), ERROR_CODES.E_INVALID_ARGUMENT);
+
+      assert.deepEqual(
+        listUploadFiles(uploadsDir),
+        [],
+        "预期所有违规请求都在写文件前被拒绝",
+      );
+
+      // 净化文件名：取 basename、去掉分隔符，且长度 ≤120 个码点。
+      const longName = `${"长".repeat(130)}.txt`;
+      const valid = await postChat(baseUrl, {
+        message: "净化文件名",
+        attachments: [
+          textAttachment("..\\..\\evil/../../secret.txt", "text/plain", "secret"),
+          textAttachment(longName, "text/plain", "long"),
+        ],
+      });
+      assert.equal(valid.status, 200);
+      await valid.text();
+      const rows = (await app.inject({ method: "GET", url: "/messages?limit=5" })).json();
+      const userRow = asArray(rows, "messages")
+        .map((row) => asRecord(row, "message"))
+        .find((row) => row.role === "user");
+      assert.ok(userRow !== undefined);
+      const names = asArray(userRow.attachments, "attachments")
+        .map((item) => asRecord(item, "attachment").name)
+        .map((name) => String(name));
+      assert.equal(names[0], "secret.txt", "预期路径分隔符被剥离");
+      assert.equal([...(names[1] ?? "")].length, 120, "预期文件名截到 120 个码点");
+      for (const name of names) {
+        assert.equal(name.includes("/"), false);
+        assert.equal(name.includes("\\"), false);
+      }
+    });
+  },
+);
+
+test(
+  "M9-03 GET /uploads/:id：按存储 mime 内联下发；路径穿越/非法 id/不存在统一 404",
+  { timeout: 30_000 },
+  async () => {
+    await withChatApp(
+      [{ content: "ok" }],
+      async ({ base, baseUrl }) => {
+        const secretPath = join(base, "secret.txt");
+        writeFileSync(secretPath, "TOP-SECRET", "utf8");
+        const response = await postChat(baseUrl, {
+          message: "附件",
+          attachments: [
+            { name: "dot.png", mime: "image/png", dataBase64: PNG_1X1_BASE64 },
+            textAttachment("note.txt", "text/plain", "hello"),
+            attachmentOf("raw.bin", "application/octet-stream", Buffer.from("raw")),
+          ],
+        });
+        assert.equal(response.status, 200);
+        await response.text();
+
+        const rows = await getChatMessages(baseUrl);
+        const user = rows.find((row) => row.role === "user");
+        assert.ok(user !== undefined);
+        const metadata = asArray(user.attachments, "attachments").map((row) =>
+          asRecord(row, "attachment"),
+        );
+        const byName = new Map(metadata.map((item) => [String(item.name), item]));
+
+        const textResponse = await fetch(
+          `${baseUrl}/uploads/${String(byName.get("note.txt")?.id)}`,
+        );
+        assert.equal(textResponse.status, 200);
+        assert.match(
+          textResponse.headers.get("content-type") ?? "",
+          /^text\/plain/u,
+          "预期以 messages 中存储的 mime 下发",
+        );
+        assert.equal(
+          await textResponse.text(),
+          "hello",
+          "预期下发上传时的原始字节",
+        );
+
+        const binaryResponse = await fetch(
+          `${baseUrl}/uploads/${String(byName.get("raw.bin")?.id)}`,
+        );
+        assert.equal(binaryResponse.status, 200);
+        assert.equal(
+          binaryResponse.headers.get("content-type"),
+          "application/octet-stream",
+        );
+
+        for (const url of [
+          "/uploads/..%2F..%2Fsecret.txt",
+          "/uploads/%2e%2e%2fsecret.txt",
+          `/uploads/${encodeURIComponent("../secret.txt")}`,
+          "/uploads/not-a-ulid",
+          `/uploads/${"0".repeat(26)}`,
+          "/uploads/%2e%2e%5cwindows%5cwin.ini",
+        ]) {
+          const missing = await fetch(`${baseUrl}${url}`);
+          assert.equal(missing.status, 404, `预期 ${url} 返回 404`);
+          const body = asRecord(await missing.json(), "404 body");
+          assert.equal(
+            asRecord(body.error, "404 error").code,
+            ERROR_CODES.E_NOT_FOUND,
+          );
+        }
+      },
+    );
+  },
+);
+
+test("M9-03 messages 读写兼容：旧版 JSON 字符串与新 {text,attachments} 都能读，GET /messages 给 text", async () => {
+  await withApp(
+    () => 1_000,
+    async ({ db, app }) => {
+      appendMessage(db, { role: "user", content: "旧格式消息", ts: 1 });
+      appendMessage(db, {
+        role: "user",
+        content: "新格式消息",
+        ts: 2,
+        attachments: [
+          {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            name: "a.txt",
+            mime: "text/plain",
+            size: 3,
+            path: "data/uploads/01ARZ3NDEKTSV4RRFFQ69G5FAV__a.txt",
+          },
+        ],
+      });
+
+      const rawRows = db
+        .prepare("SELECT content FROM messages ORDER BY seq ASC")
+        .all() as unknown as Array<{ content: string }>;
+      assert.equal(
+        JSON.parse(rawRows[0]?.content ?? "null"),
+        "旧格式消息",
+        "预期旧消息仍是 JSON 字符串",
+      );
+      const newRaw = asRecord(
+        JSON.parse(rawRows[1]?.content ?? "null") as unknown,
+        "new content",
+      );
+      assert.equal(newRaw.text, "新格式消息");
+      assert.equal(
+        asArray(newRaw.attachments, "new attachments").length,
+        1,
+        "预期新消息落库为 {text,attachments}",
+      );
+
+      const listed = listRecentMessages(db, 10);
+      assert.deepEqual(
+        listed.map((message) => message.content),
+        ["旧格式消息", "新格式消息"],
+      );
+      assert.equal(listed[0]?.attachments, undefined);
+      assert.equal(listed[1]?.attachments?.[0]?.name, "a.txt");
+
+      const response = await app.inject({ method: "GET", url: "/messages" });
+      assert.equal(response.statusCode, 200);
+      const rows = asArray(response.json(), "GET /messages").map((row) =>
+        asRecord(row, "message"),
+      );
+      assert.deepEqual(
+        rows.map((row) => row.text),
+        ["旧格式消息", "新格式消息"],
+        "预期 v1.1 text 字段",
+      );
+      assert.deepEqual(
+        rows.map((row) => row.content),
+        ["旧格式消息", "新格式消息"],
+        "预期旧 content 字段仍保留",
+      );
+      assert.equal(rows[0]?.attachments, undefined);
+      assert.equal(
+        asArray(rows[1]?.attachments, "attachments")[0] !== undefined,
+        true,
+      );
+    },
+  );
+});
+
+test(
+  "M9-03 runMainTurn 多模态：当前轮分片原样进 provider，历史轮折纯文本；二选一冲突抛 E_INVALID_ARGUMENT",
+  { timeout: 30_000 },
+  async () => {
+    const db = openDatabase(":memory:");
+    try {
+      const provider = new FakeProvider([
+        { content: "第一轮回复" },
+        { content: "第二轮回复" },
+      ]);
+      const firstContent: LlmContentPart[] = [
+        { type: "text", text: "这是什么颜色" },
+        {
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,AAAA" },
+        },
+      ];
+      await runMainTurn({
+        db,
+        provider,
+        userContent: firstContent,
+        now: () => 1_000,
+      });
+
+      const firstMessages = provider.calls[0]?.messages ?? [];
+      const firstUser = firstMessages.at(-1);
+      assert.equal(firstUser?.role, "user");
+      assert.deepEqual(
+        firstUser?.content,
+        firstContent,
+        "预期当前轮图片分片原样进 provider",
+      );
+
+      await runMainTurn({
+        db,
+        provider,
+        userMessage: "第二轮",
+        now: () => 2_000,
+      });
+      const secondMessages = provider.calls[1]?.messages ?? [];
+      const historyUser = secondMessages.find((message) => message.role === "user");
+      assert.ok(historyUser !== undefined, "预期第二轮仍带历史 user 消息");
+      assert.equal(
+        typeof historyUser.content,
+        "string",
+        "预期历史轮 content 折成纯文本而不是数组",
+      );
+      assert.equal(
+        historyUser.content,
+        "这是什么颜色[图片]",
+        "预期 llmContentText 用占位符代替历史图片",
+      );
+      assert.equal(
+        secondMessages.at(-1)?.content,
+        "第二轮",
+        "预期当前轮纯文本原样进入 provider",
+      );
+
+      const stored = listRecentMessages(db, 10);
+      assert.equal(stored[0]?.content, "这是什么颜色[图片]");
+
+      await assert.rejects(
+        () =>
+          runMainTurn({
+            db,
+            provider: new FakeProvider([]),
+            userMessage: "文本",
+            userContent: "也传了",
+          }),
+        (error: unknown) =>
+          error instanceof ContractError &&
+          error.code === ERROR_CODES.E_INVALID_ARGUMENT,
+        "预期同时给 userMessage/userContent 抛 E_INVALID_ARGUMENT",
+      );
+      await assert.rejects(
+        () => runMainTurn({ db, provider: new FakeProvider([]) }),
+        (error: unknown) =>
+          error instanceof ContractError &&
+          error.code === ERROR_CODES.E_INVALID_ARGUMENT,
+        "预期两者都不给也抛 E_INVALID_ARGUMENT",
+      );
+    } finally {
+      db.close();
+    }
+  },
+);
+
+test("M9-03 token 估算：图片每张 800，文本仍按字符数/2，数组 content 不再按分片数计数", () => {
+  const usage = estimateTokenUsage(
+    [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "1234" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,AA" } },
+          { type: "image_url", image_url: { url: "data:image/png;base64,BB" } },
+        ],
+      },
+    ],
+    null,
+    [],
+  );
+  assert.equal(usage.inputTokens, 2 + 800 * 2);
+  assert.equal(usage.estimated, true);
+});
+
+test("M9-03 前端接线：回形针/拖拽/粘贴、canvas 压缩参数、引用条与用户气泡 blockquote、/uploads 代理", () => {
+  for (const path of [
+    "src/web/src/components/ChatAttachmentViews.tsx",
+    "src/web/src/components/ChatQuoteBar.tsx",
+  ]) {
+    assert.ok(existsSync(join(root, path)), `预期组件存在：${path}`);
+  }
+
+  const chat = read("src/web/src/pages/Chat.tsx");
+  for (const marker of [
+    "onPaste={handlePaste}",
+    "onDrop={handleDrop}",
+    "onDragOver={handleDragOver}",
+    "compressImageFile(",
+    "readFileBase64(",
+    "<ChatQuoteBar",
+    "<MessageAttachments",
+    "buildQuotedMessage",
+    "type=\"file\"",
+    "multiple",
+  ]) {
+    assert.ok(chat.includes(marker), `预期 Chat.tsx 包含 ${marker}`);
+  }
+
+  const attachmentView = read("src/web/src/components/ChatAttachmentViews.tsx");
+  for (const marker of [
+    "MAX_IMAGE_EDGE = 1568",
+    "JPEG_QUALITY = 0.85",
+    "canvas.toDataURL(mime, JPEG_QUALITY)",
+    "keepPng",
+    "/uploads/",
+    "<Image",
+    "preview={{ mask",
+  ]) {
+    assert.ok(
+      attachmentView.includes(marker),
+      `预期附件组件包含 ${marker}`,
+    );
+  }
+
+  const quoteView = read("src/web/src/components/ChatQuoteBar.tsx");
+  for (const marker of ["> 引用：", "splitQuotedMessage", "QUOTE_PREVIEW_CHARS = 80"]) {
+    assert.ok(quoteView.includes(marker), `预期引用组件包含 ${marker}`);
+  }
+
+  const server = read("src/server/index.ts");
+  for (const marker of [
+    "app.get('/uploads/:id'",
+    "bodyLimit: CHAT_BODY_LIMIT_BYTES",
+    "Content-Disposition",
+    "saveChatAttachments(",
+    "buildChatUserContent(",
+  ]) {
+    assert.ok(server.includes(marker), `预期 server 包含 ${marker}`);
+  }
+
+  const vite = read("src/web/vite.config.ts");
+  assert.ok(vite.includes('"/uploads"'), "预期 Vite 代理包含 /uploads");
 });

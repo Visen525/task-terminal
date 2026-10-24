@@ -16,12 +16,13 @@
 import type { DatabaseSync } from 'node:sqlite';
 
 import { ContractError, ERROR_CODES } from '../core/errors.ts';
-import type {
-  LlmMessage,
-  LlmResponse,
-  Task,
-  TokenUsage,
-  ToolSpec,
+import {
+  llmContentText,
+  type LlmMessage,
+  type LlmResponse,
+  type Task,
+  type TokenUsage,
+  type ToolSpec,
 } from '../core/types.ts';
 import {
   estimateTokenUsage,
@@ -31,7 +32,7 @@ import {
 import type { TaskCanceller } from '../runtime/ops.ts';
 import { appendEvent } from '../store/events.ts';
 import { insertLlmCall } from '../store/llm-calls.ts';
-import { appendMessage } from '../store/messages.ts';
+import { appendMessage, type MessageAttachment } from '../store/messages.ts';
 import { buildMainContext, gatherMainContext } from './context.ts';
 import {
   executeMainTool,
@@ -96,7 +97,23 @@ export interface MainTurnResult {
 export interface RunMainTurnOptions {
   db: DatabaseSync;
   provider: LlmProvider;
-  userMessage: string;
+  /**
+   * 纯文本入参；与 userContent 二选一。
+   * 都给/都不给时抛 E_INVALID_ARGUMENT（参数契约错误，不是 500）。
+   */
+  userMessage?: string;
+  /**
+   * 多模态入参（M9-03）：当前轮原样进 provider；历史轮统一折纯文本。
+   * 传字符串与 userMessage 等价，传数组时用于图片 data URL 分片。
+   */
+  userContent?: LlmMessage['content'];
+  /**
+   * 落库/展示用纯文本；缺省取 llmContentText(userContent)。
+   * 附件正文只进当前轮 provider content，不进 messages（避免历史重复计价）。
+   */
+  userText?: string;
+  /** 当前轮附件元数据；只落库，不进入 provider 上下文。 */
+  userAttachments?: readonly MessageAttachment[];
   /** 最近历史轮数（user+assistant 为一轮）；默认 12。 */
   historyLimit?: number;
   /** 工具调用轮上限；默认 10，防止失控。 */
@@ -233,6 +250,22 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
   const model = options.model ?? MAIN_MODEL;
   const maxToolRounds = normalizeMaxToolRounds(options.maxToolRounds);
   const historyTurns = normalizeHistoryTurns(options.historyLimit);
+
+  // userMessage / userContent 严格二选一：调用方拼错参数时不能静默选一个。
+  const hasUserMessage = options.userMessage !== undefined;
+  const hasUserContent = options.userContent !== undefined;
+  if (hasUserMessage === hasUserContent) {
+    throw new ContractError(
+      ERROR_CODES.E_INVALID_ARGUMENT,
+      'userMessage 与 userContent 必须二选一提供',
+    );
+  }
+  const currentContent: LlmMessage['content'] = hasUserContent
+    ? options.userContent!
+    : options.userMessage!;
+  // 落库文本优先用调用方给的展示文本；否则取分片的纯文本视图（图片折 [图片]）。
+  const currentText = options.userText ?? llmContentText(currentContent);
+
   const toolOptions: MainToolOptions = {
     db,
     workspace: options.workspace ?? process.cwd(),
@@ -247,18 +280,43 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
   // 1. 用户消息先落库；历史窗口包含本条消息。
   appendMessage(db, {
     role: 'user',
-    content: options.userMessage,
+    content: currentText,
+    ...(options.userAttachments === undefined || options.userAttachments.length === 0
+      ? {}
+      : { attachments: options.userAttachments }),
     ts: clock(),
   });
 
   const gathered = gatherMainContext(db, {
-    userMessage: options.userMessage,
+    userMessage: currentText,
     historyLimit: historyTurns,
   });
   const messages: LlmMessage[] = buildMainContext(db, {
     ...gathered,
     systemPrompt: MAIN_SYSTEM_PROMPT,
   });
+
+  // 历史只保留纯文本：非当前轮即使存了图片分片也不再重发（控 token）。
+  // 当前轮（最后一条 user）恢复调用方给的原样 content（可能含图片分片）。
+  const lastIndex = messages.length - 1;
+  const last = messages[lastIndex];
+  if (last !== undefined && last.role === 'user') {
+    for (let index = 0; index < lastIndex; index += 1) {
+      const message = messages[index];
+      if (message !== undefined) {
+        messages[index] = { ...message, content: llmContentText(message.content) };
+      }
+    }
+    messages[lastIndex] = { ...last, content: currentContent };
+  } else {
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      if (message !== undefined) {
+        messages[index] = { ...message, content: llmContentText(message.content) };
+      }
+    }
+    messages.push({ role: 'user', content: currentContent });
+  }
 
   const usage: MutableUsage = { inputTokens: 0, cachedTokens: 0, outputTokens: 0 };
   const toolTrace: MainToolTraceEntry[] = [];

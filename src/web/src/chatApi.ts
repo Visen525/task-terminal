@@ -7,12 +7,31 @@
 
 export type ChatRole = "user" | "assistant" | "tool";
 
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  /** 服务端逻辑路径；前端不依赖它取文件。 */
+  path?: string;
+  /** 本地待发送/刚发送时的 object URL 预览；服务端不返回。 */
+  previewUrl?: string;
+}
+
+export interface ChatAttachmentInput {
+  name: string;
+  mime: string;
+  dataBase64: string;
+}
+
 export interface ChatMessage {
   id: string;
   taskId: string | null;
   seq: number;
   role: ChatRole;
-  content: string;
+  /** 纯文本视图（v1.1 GET /messages）；附件另见 attachments。 */
+  text: string;
+  attachments?: ChatAttachment[];
   tokens: number | null;
   ts: number;
 }
@@ -72,7 +91,16 @@ export async function listMessages(limit = 50): Promise<ChatMessage[]> {
   if (!Array.isArray(body)) {
     throw new Error("GET /messages 返回格式不合法");
   }
-  return body as ChatMessage[];
+  // 兼容旧后端（只有 content）：新字段 text 为准，缺省时回退。
+  return (body as Array<ChatMessage & { content?: unknown }>).map((row) => ({
+    ...row,
+    text:
+      typeof row.text === "string"
+        ? row.text
+        : typeof row.content === "string"
+          ? row.content
+          : "",
+  }));
 }
 
 interface ParsedFrame {
@@ -141,19 +169,23 @@ function handleFrame(frame: ParsedFrame, handlers: ChatStreamHandlers): void {
 /**
  * POST /chat 并消费 SSE。
  * 正常结束 resolve；HTTP 非 2xx 或网络错误 reject；流内 error 事件走 onError。
+ * attachments 只在非空时进入 body，保持纯文本请求与 M6 行为一致。
  */
 export async function streamChat(
   message: string,
+  attachments: readonly ChatAttachmentInput[],
   handlers: ChatStreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
+  const payload: Record<string, unknown> = { message };
+  if (attachments.length > 0) payload.attachments = attachments;
   const response = await fetch("/chat", {
     method: "POST",
     headers: {
       Accept: "text/event-stream",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify(payload),
     ...(signal === undefined ? {} : { signal }),
   });
 
