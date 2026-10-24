@@ -23,12 +23,17 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
 import { ContractError, ERROR_CODES, type ErrorCode } from "../core/errors.ts";
 import type { PermissionMode, ToolSpec } from "../core/types.ts";
 import { appendEvent } from "../store/events.ts";
+import { registerFsTools } from "./tools/fs.ts";
+import { DEFAULT_ALLOWED_COMMANDS, registerShellTools } from "./tools/shell.ts";
+
+// shell.ts 是白名单常量的归属地；这里一并导出，调用方不必跨模块猜测。
+export { DEFAULT_ALLOWED_COMMANDS };
 
 // ── 常量 ─────────────────────────────────────────────────────────
 
@@ -86,6 +91,11 @@ export interface ToolContext {
   maxOutputBytes?: number;
   /** 子进程环境变量，默认 process.env（测试可注入）。 */
   env?: NodeJS.ProcessEnv;
+  /**
+   * 命令白名单（argv[0] 的 commandStem 形式）；缺省用 DEFAULT_ALLOWED_COMMANDS。
+   * 注入空数组 = 拒绝所有命令。
+   */
+  allowedCommands?: readonly string[];
 }
 
 export interface CreateToolContextOptions {
@@ -99,6 +109,7 @@ export interface CreateToolContextOptions {
   outputDir?: string;
   maxOutputBytes?: number;
   env?: NodeJS.ProcessEnv;
+  allowedCommands?: readonly string[];
 }
 
 export interface ToolResult {
@@ -118,42 +129,119 @@ export interface ToolResult {
   truncated: boolean;
   fullOutputPath?: string;
   fullOutputBytes?: number;
+  /** write_file 写入内容的 sha256（写前计算；事件 payload 同步记录）。 */
+  sha256?: string;
+  /** write_file 写入内容的 UTF-8 字节数。 */
+  bytes?: number;
 }
 
-/** 两个内建工具的声明；M3-02 注册其余工具时沿用 ToolSpec。 */
+// ── 工具声明（SPEC §4.6；六件套完整 JSON Schema，M3-03 直接喂给 provider）──
+
+export const READ_FILE_SPEC: ToolSpec = {
+  name: "read_file",
+  description: "读取工作区内文件的文本内容，可按字符分页。",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "工作区内的相对或绝对路径" },
+      offset: { type: "integer", minimum: 0, description: "起始字符偏移（从 0 开始）" },
+      limit: { type: "integer", minimum: 0, description: "最多返回的字符数" },
+    },
+    required: ["path"],
+    additionalProperties: false,
+  },
+};
+
+export const LIST_DIR_SPEC: ToolSpec = {
+  name: "list_dir",
+  description: "列出工作区内目录的直接子项（名称、是否目录、字节大小），最多 500 条。",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "工作区内要列出的目录路径" },
+    },
+    required: ["path"],
+    additionalProperties: false,
+  },
+};
+
+export const GLOB_SPEC: ToolSpec = {
+  name: "glob",
+  description:
+    "从工作区根递归匹配文件路径；支持 *（段内任意字符）、?（段内单个字符）、**（跨目录）。结果按相对路径排序，最多 200 条。",
+  parameters: {
+    type: "object",
+    properties: {
+      pattern: {
+        type: "string",
+        description: "相对工作区根的 glob 模式，例如 **/*.ts 或 src/*",
+      },
+    },
+    required: ["pattern"],
+    additionalProperties: false,
+  },
+};
+
+export const GREP_SPEC: ToolSpec = {
+  name: "grep",
+  description:
+    "按行正则搜索工作区内的文件，返回 文件:行号: 行内容；默认递归工作区根，最多 200 条命中，跳过大于 2MB 的文件。",
+  parameters: {
+    type: "object",
+    properties: {
+      pattern: { type: "string", description: "JavaScript 正则表达式（不携带 flags）" },
+      path: {
+        type: "string",
+        description: "工作区内的文件或目录路径；省略时递归工作区根",
+      },
+    },
+    required: ["pattern"],
+    additionalProperties: false,
+  },
+};
+
+export const WRITE_FILE_SPEC: ToolSpec = {
+  name: "write_file",
+  description:
+    "写入工作区内文件（创建父目录，可覆盖）；写前计算 content 的 sha256，返回字节数与 sha256。",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "工作区内的目标文件路径" },
+      content: { type: "string", description: "要写入的完整 UTF-8 文本" },
+    },
+    required: ["path", "content"],
+    additionalProperties: false,
+  },
+};
+
+export const RUN_COMMAND_SPEC: ToolSpec = {
+  name: "run_command",
+  description: "以 argv 数组执行工作区内命令；绝不经过 shell。argv[0] 必须在命令白名单内。",
+  parameters: {
+    type: "object",
+    properties: {
+      argv: {
+        type: "array",
+        items: { type: "string" },
+        minItems: 1,
+        description: '命令与参数数组，例如 ["node","-e","console.log(1)"]',
+      },
+      cwd: { type: "string", description: "工作区内的工作目录" },
+    },
+    required: ["argv"],
+    additionalProperties: false,
+  },
+};
+
+/** 子智能体六件套工具声明（read_file / list_dir / glob / grep / write_file / run_command）。 */
 export const TOOL_SPECS: ToolSpec[] = [
-  {
-    name: "read_file",
-    description: "读取工作区内文件的文本内容，可按字符分页。",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "工作区内的相对或绝对路径" },
-        offset: { type: "integer", minimum: 0, description: "起始字符偏移（从 0 开始）" },
-        limit: { type: "integer", minimum: 0, description: "最多返回的字符数" },
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "run_command",
-    description: "以 argv 数组执行工作区内命令；绝不经过 shell。",
-    parameters: {
-      type: "object",
-      properties: {
-        argv: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-          description: '命令与参数数组，例如 ["node","-e","console.log(1)"]',
-        },
-        cwd: { type: "string", description: "工作区内的工作目录" },
-      },
-      required: ["argv"],
-      additionalProperties: false,
-    },
-  },
+  READ_FILE_SPEC,
+  LIST_DIR_SPEC,
+  GLOB_SPEC,
+  GREP_SPEC,
+  WRITE_FILE_SPEC,
+  RUN_COMMAND_SPEC,
 ];
 
 // ── 上下文与工作区根 ─────────────────────────────────────────────
@@ -200,6 +288,18 @@ function canonicalizeWorkspace(workspace: string): RootInfo {
   return { path: real, key: normalizeKey(real) };
 }
 
+/** 白名单条目归一化：允许注入 "node.exe" 或 "C:\...\node.exe" 这类写法。 */
+function normalizeAllowedCommands(input: readonly string[] | undefined): readonly string[] {
+  const source = input ?? DEFAULT_ALLOWED_COMMANDS;
+  const normalized = new Set<string>();
+  for (const item of source) {
+    if (typeof item !== "string") continue;
+    const stem = commandStem(item);
+    if (stem.length > 0) normalized.add(stem);
+  }
+  return [...normalized];
+}
+
 /** 创建工具上下文：工作区根在这里 realpath 一次。 */
 export function createToolContext(options: CreateToolContextOptions): ToolContext {
   const root = canonicalizeWorkspace(options.workspace);
@@ -214,6 +314,7 @@ export function createToolContext(options: CreateToolContextOptions): ToolContex
     outputDir: options.outputDir,
     maxOutputBytes: options.maxOutputBytes,
     env: options.env,
+    allowedCommands: normalizeAllowedCommands(options.allowedCommands),
   };
   rootCache.set(ctx, root);
   return ctx;
@@ -511,6 +612,19 @@ function assertDeletionTargetsInside(ctx: ToolContext, argv: string[]): void {
   }
 }
 
+/**
+ * 绝对路径命令不存在时交给 spawn 报 ENOENT，以保留 M3-01 的 E_NOT_FOUND 语义。
+ * 不存在的命令不可能产生副作用，因此不算绕过白名单。
+ */
+function isMissingAbsoluteCommand(command: string): boolean {
+  if (!isAbsolute(command)) return false;
+  try {
+    return !statSync(command).isFile();
+  } catch {
+    return true;
+  }
+}
+
 /** argv 级硬拒绝：全部检查通过才允许 spawn。 */
 function assertCommandAllowed(ctx: ToolContext, argv: string[]): void {
   const first = argv[0];
@@ -518,6 +632,12 @@ function assertCommandAllowed(ctx: ToolContext, argv: string[]): void {
     throw new ContractError(ERROR_CODES.E_INVALID_ARGUMENT, "argv must not be empty");
   }
   const stem = commandStem(first);
+
+  // 白名单是第一道闸；清单内命令仍需过下面的既有硬拒绝与 shell 串检查。
+  const allowed = new Set((ctx.allowedCommands ?? DEFAULT_ALLOWED_COMMANDS).map(commandStem));
+  if (!allowed.has(stem) && !isMissingAbsoluteCommand(first)) {
+    throw deny(`command is not in the allowlist: ${stem}`);
+  }
 
   if (DENIED_COMMAND_STEMS.has(stem)) throw deny(`${stem} is not allowed`);
   if (stem === "reg" && argv.slice(1).some((token) => token.toLowerCase() === "delete")) {
@@ -654,13 +774,15 @@ function appendToolResult(ctx: ToolContext, result: ToolResult): void {
       preview: clip(result.preview, MAX_EVENT_PREVIEW_CHARS),
       ms: result.ms,
       ...(result.code === undefined ? {} : { code: result.code }),
+      ...(result.sha256 === undefined ? {} : { sha256: result.sha256 }),
+      ...(result.bytes === undefined ? {} : { bytes: result.bytes }),
     },
   });
 }
 
 // ── 内建工具实现 ─────────────────────────────────────────────────
 
-interface ToolExecution {
+export interface ToolExecution {
   ok: boolean;
   output: string;
   preview?: string;
@@ -669,6 +791,26 @@ interface ToolExecution {
   truncated?: boolean;
   fullOutputPath?: string;
   fullOutputBytes?: number;
+  sha256?: string;
+  bytes?: number;
+}
+
+export interface ToolHandler {
+  (ctx: ToolContext, args: unknown): Promise<ToolExecution> | ToolExecution;
+}
+
+export interface ToolRegistration {
+  spec: ToolSpec;
+  handler: ToolHandler;
+}
+
+const toolRegistry = new Map<string, ToolRegistration>();
+
+/** 工具模块向唯一注册表登记；同名工具保留先登记者。 */
+export function registerTool(registration: ToolRegistration): void {
+  if (!toolRegistry.has(registration.spec.name)) {
+    toolRegistry.set(registration.spec.name, registration);
+  }
 }
 
 function asRecord(args: unknown): Record<string, unknown> | null {
@@ -680,7 +822,7 @@ function invalid(message: string): ToolExecution {
   return { ok: false, code: ERROR_CODES.E_INVALID_ARGUMENT, output: message, preview: message };
 }
 
-function readFileTool(ctx: ToolContext, args: unknown): ToolExecution {
+export function readFileTool(ctx: ToolContext, args: unknown): ToolExecution {
   const record = asRecord(args);
   if (record === null) return invalid("read_file expects an object argument");
 
@@ -994,7 +1136,7 @@ function runCommandProcess(ctx: ToolContext, argv: string[], cwd: string): Promi
   });
 }
 
-function runCommandTool(ctx: ToolContext, args: unknown): Promise<ToolExecution> {
+export function runCommandTool(ctx: ToolContext, args: unknown): Promise<ToolExecution> {
   if (ctx.permission !== "workspace-write") {
     throw new ContractError(
       ERROR_CODES.E_COMMAND_DENIED,
@@ -1042,14 +1184,28 @@ function runCommandTool(ctx: ToolContext, args: unknown): Promise<ToolExecution>
   return runCommandProcess(ctx, commandArgv, cwd);
 }
 
+/**
+ * 首次调用时才登记内建工具，避免模块循环求值期间读取未初始化的常量。
+ * 注册表是唯一的分发依据；executeTool 仍是唯一出口。
+ */
+let toolsRegistered = false;
+
+function ensureToolsRegistered(): void {
+  if (toolsRegistered) return;
+  registerFsTools();
+  registerShellTools();
+  toolsRegistered = true;
+}
+
 function dispatchTool(
   ctx: ToolContext,
   name: string,
   args: unknown,
 ): Promise<ToolExecution> | ToolExecution {
-  if (name === "read_file") return readFileTool(ctx, args);
-  if (name === "run_command") return runCommandTool(ctx, args);
-  return invalid("unknown tool");
+  ensureToolsRegistered();
+  const registration = toolRegistry.get(name);
+  if (registration === undefined) return invalid("unknown tool");
+  return registration.handler(ctx, args);
 }
 
 // ── 单一出口 ─────────────────────────────────────────────────────
@@ -1150,6 +1306,8 @@ export async function executeTool(
     ...(execution.fullOutputBytes === undefined
       ? {}
       : { fullOutputBytes: execution.fullOutputBytes }),
+    ...(execution.sha256 === undefined ? {} : { sha256: execution.sha256 }),
+    ...(execution.bytes === undefined ? {} : { bytes: execution.bytes }),
   };
   appendToolResult(ctx, result);
   return result;

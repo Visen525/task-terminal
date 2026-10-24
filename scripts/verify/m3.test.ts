@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -7,6 +8,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +18,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { ContractError, ERROR_CODES, type ErrorCode } from "../../src/core/errors.ts";
 import type { TaskEvent } from "../../src/core/types.ts";
 import {
+  TOOL_SPECS,
   createToolContext,
   executeTool,
   resolveWorkspacePath,
@@ -528,4 +531,326 @@ test("M3-01 未显式给 permission 时按 read-only 处理", async () => {
     );
     expectSyncCode(() => resolveWorkspacePath(ctx, "x.txt", "write"), ERROR_CODES.E_COMMAND_DENIED);
   });
+});
+
+// ── 9. M3-02 write_file ─────────────────────────────────────────
+
+test("M3-02 write_file 写入与覆盖的 sha256 和 node:crypto 一致，结果与事件都带 sha256", async () => {
+  await withSandbox(async ({ workspace, db, ctx }) => {
+    const content = "第一行\n第二行\nsha256-check";
+    const expected = createHash("sha256").update(content, "utf8").digest("hex");
+
+    const created = await executeTool(
+      "write_file",
+      { path: "nested/dir/created.txt", content },
+      ctx,
+    );
+    assert.equal(created.ok, true, created.output);
+    assert.equal(created.sha256, expected);
+    assert.equal(created.bytes, Buffer.byteLength(content, "utf8"));
+    assert.equal(readFileSync(join(workspace, "nested", "dir", "created.txt"), "utf8"), content);
+
+    const createEvents = listEvents(db, { limit: 100 });
+    const createResult = createEvents.at(-1);
+    assert.equal(createResult?.type, "agent.tool_result");
+    assert.equal(payloadOf(createResult).sha256, expected);
+    assert.equal(payloadOf(createResult).ok, true);
+
+    const replacement = "replacement\ncontent";
+    const replacementSha = createHash("sha256").update(replacement, "utf8").digest("hex");
+    const overwritten = await executeTool(
+      "write_file",
+      { path: "nested/dir/created.txt", content: replacement },
+      ctx,
+    );
+    assert.equal(overwritten.ok, true, overwritten.output);
+    assert.equal(overwritten.sha256, replacementSha);
+    assert.equal(overwritten.sha256 === expected, false);
+    assert.equal(
+      readFileSync(join(workspace, "nested", "dir", "created.txt"), "utf8"),
+      replacement,
+    );
+
+    const overwriteEvents = listEvents(db, { limit: 100 });
+    assert.equal(payloadOf(overwriteEvents.at(-1)).sha256, replacementSha);
+  });
+});
+
+test("M3-02 write_file 拒绝工作区外路径与 read-only，且自动创建父目录", async () => {
+  await withSandbox(async ({ workspace, outside, ctx, makeCtx }) => {
+    await expectCode(
+      executeTool("write_file", { path: "../outside/evil.txt", content: "x" }, ctx),
+      ERROR_CODES.E_WORKSPACE_ESCAPE,
+    );
+    await expectCode(
+      executeTool("write_file", { path: join(outside, "evil2.txt"), content: "x" }, ctx),
+      ERROR_CODES.E_WORKSPACE_ESCAPE,
+    );
+    assert.equal(existsSync(join(outside, "evil.txt")), false);
+    assert.equal(existsSync(join(outside, "evil2.txt")), false);
+
+    const readOnly = makeCtx({ permission: "read-only" });
+    await expectCode(
+      executeTool("write_file", { path: "read-only.txt", content: "x" }, readOnly),
+      ERROR_CODES.E_COMMAND_DENIED,
+    );
+    assert.equal(existsSync(join(workspace, "read-only.txt")), false);
+
+    const deep = await executeTool(
+      "write_file",
+      { path: "a/b/c/d/deep.txt", content: "deep" },
+      ctx,
+    );
+    assert.equal(deep.ok, true, deep.output);
+    assert.equal(readFileSync(join(workspace, "a", "b", "c", "d", "deep.txt"), "utf8"), "deep");
+  });
+});
+
+// ── 10. M3-02 命令白名单 ────────────────────────────────────────
+
+test("M3-02 命令白名单：清单外拒绝、自定义清单放行、清单内命令硬拒绝照旧", async () => {
+  await withSandbox(async ({ ctx, makeCtx }) => {
+    for (const command of ["ftp", "curl", "wget"]) {
+      await expectCode(
+        executeTool("run_command", { argv: [command] }, ctx),
+        ERROR_CODES.E_COMMAND_DENIED,
+      );
+    }
+
+    // 默认清单内的 node 仍然可执行。
+    const nodeRun = await executeTool(
+      "run_command",
+      { argv: [process.execPath, "-e", "console.log('allowlisted')"] },
+      ctx,
+    );
+    assert.equal(nodeRun.ok, true, nodeRun.output);
+    assert.equal(nodeRun.output, "allowlisted\n");
+
+    const customCommand = process.platform === "win32" ? "findstr" : "echo";
+    const customArgv =
+      process.platform === "win32" ? [customCommand, "/?"] : [customCommand, "custom-allowed"];
+    await expectCode(
+      executeTool("run_command", { argv: customArgv }, ctx),
+      ERROR_CODES.E_COMMAND_DENIED,
+    );
+    const customCtx = makeCtx({ allowedCommands: [customCommand] });
+    const customRun = await executeTool("run_command", { argv: customArgv }, customCtx);
+    assert.equal(customRun.ok, true, customRun.output);
+
+    // cmd 在白名单内，但内层硬拒绝仍然生效。
+    await expectCode(
+      executeTool("run_command", { argv: ["cmd", "/c", "format", "C:"] }, ctx),
+      ERROR_CODES.E_COMMAND_DENIED,
+    );
+    await expectCode(
+      executeTool(
+        "run_command",
+        { argv: ["cmd", "/c", "powershell", "-EncodedCommand", "AAAA"] },
+        ctx,
+      ),
+      ERROR_CODES.E_COMMAND_DENIED,
+    );
+  });
+});
+
+// ── 11. M3-02 glob ──────────────────────────────────────────────
+
+test("M3-02 glob 支持 **/* ?、结果排序、上限与符号链接跳过", async () => {
+  await withSandbox(async ({ workspace, outside, ctx }) => {
+    mkdirSync(join(workspace, "src", "nested", "deep"), { recursive: true });
+    writeFileSync(join(workspace, "root.ts"), "root");
+    writeFileSync(join(workspace, "x.txt"), "x");
+    writeFileSync(join(workspace, "src", "a.ts"), "a");
+    writeFileSync(join(workspace, "src", "b.txt"), "b");
+    writeFileSync(join(workspace, "src", "nested", "c.ts"), "c");
+    writeFileSync(join(workspace, "src", "nested", "deep", "d.ts"), "d");
+
+    const tsFiles = await executeTool("glob", { pattern: "**/*.ts" }, ctx);
+    assert.equal(tsFiles.ok, true, tsFiles.output);
+    assert.deepEqual(tsFiles.output.split("\n"), [
+      "root.ts",
+      "src/a.ts",
+      "src/nested/c.ts",
+      "src/nested/deep/d.ts",
+    ]);
+
+    const srcFiles = await executeTool("glob", { pattern: "src/*" }, ctx);
+    assert.equal(srcFiles.ok, true, srcFiles.output);
+    assert.deepEqual(srcFiles.output.split("\n"), ["src/a.ts", "src/b.txt"]);
+
+    const singleChar = await executeTool("glob", { pattern: "?.txt" }, ctx);
+    assert.equal(singleChar.ok, true, singleChar.output);
+    assert.deepEqual(singleChar.output.split("\n"), ["x.txt"]);
+
+    // 上限：205 个匹配只返回前 200 个并标注截断。
+    mkdirSync(join(workspace, "bulk"));
+    for (let i = 0; i < 205; i += 1) {
+      writeFileSync(join(workspace, "bulk", `g${String(i).padStart(3, "0")}.txt`), "");
+    }
+    const limited = await executeTool("glob", { pattern: "bulk/*.txt" }, ctx);
+    assert.equal(limited.ok, true, limited.output);
+    assert.equal(limited.truncated, true);
+    const limitedLines = limited.output.split("\n");
+    assert.equal(limitedLines.filter((line) => line.startsWith("bulk/")).length, 200);
+    assert.ok(limitedLines.at(-1)?.includes("truncated"));
+    assert.ok(limitedLines.at(-1)?.includes("of 205"));
+
+    // 符号链接（目录 junction）跳过：不能把工作区外文件带进结果。
+    let linkCreated = false;
+    try {
+      symlinkSync(
+        outside,
+        join(workspace, "outside-link"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      linkCreated = true;
+    } catch {
+      linkCreated = false;
+    }
+    if (linkCreated) {
+      const allTxt = await executeTool("glob", { pattern: "**/*.txt" }, ctx);
+      assert.equal(allTxt.ok, true, allTxt.output);
+      assert.equal(
+        allTxt.output.split("\n").some((line) => line.includes("outside-link")),
+        false,
+      );
+    }
+  });
+});
+
+// ── 12. M3-02 grep ──────────────────────────────────────────────
+
+test("M3-02 grep 多文件多行命中、非法正则、大文件跳过与命中上限", async () => {
+  await withSandbox(async ({ workspace, ctx }) => {
+    mkdirSync(join(workspace, "src", "sub"), { recursive: true });
+    writeFileSync(join(workspace, "src", "a.ts"), "alpha\nneedle one\nbeta\n");
+    writeFileSync(join(workspace, "src", "sub", "b.ts"), "needle two\n");
+
+    const hits = await executeTool("grep", { pattern: "needle", path: "src" }, ctx);
+    assert.equal(hits.ok, true, hits.output);
+    assert.deepEqual(hits.output.split("\n"), [
+      "src/a.ts:2: needle one",
+      "src/sub/b.ts:1: needle two",
+    ]);
+
+    const bad = await executeTool("grep", { pattern: "([", path: "src" }, ctx);
+    assert.equal(bad.ok, false);
+    assert.equal(bad.code, ERROR_CODES.E_INVALID_ARGUMENT);
+
+    writeFileSync(join(workspace, "large.txt"), `LARGEONLY\n${"x".repeat(2 * 1024 * 1024)}`);
+    const largeSkipped = await executeTool("grep", { pattern: "LARGEONLY" }, ctx);
+    assert.equal(largeSkipped.ok, true, largeSkipped.output);
+    assert.equal(largeSkipped.output.includes("LARGEONLY"), false);
+    assert.ok(largeSkipped.output.includes("skipped 1 file(s) larger than 2MB"));
+
+    const manyLines = Array.from({ length: 205 }, (_, index) => `hit-${index}`).join("\n");
+    writeFileSync(join(workspace, "many-lines.txt"), manyLines);
+    const limited = await executeTool("grep", { pattern: "hit-", path: "many-lines.txt" }, ctx);
+    assert.equal(limited.ok, true, limited.output);
+    assert.equal(limited.truncated, true);
+    const hitLines = limited.output
+      .split("\n")
+      .filter((line) => line.startsWith("many-lines.txt:"));
+    assert.equal(hitLines.length, 200);
+    assert.ok(limited.output.includes("truncated"));
+    assert.ok(limited.output.includes("first 200"));
+  });
+});
+
+// ── 13. M3-02 list_dir ─────────────────────────────────────────
+
+test("M3-02 list_dir 返回名称/是否目录/大小，默认上限 500 并标注截断", async () => {
+  await withSandbox(async ({ workspace, ctx }) => {
+    mkdirSync(join(workspace, "dir1"));
+    writeFileSync(join(workspace, "dir1", "inside.txt"), "abc");
+
+    const listed = await executeTool("list_dir", { path: "." }, ctx);
+    assert.equal(listed.ok, true, listed.output);
+    const payload = JSON.parse(listed.output) as {
+      entries: Array<{ name: string; isDirectory: boolean; size: number }>;
+      total: number;
+      returned: number;
+      truncated: boolean;
+    };
+    const dirEntry = payload.entries.find((entry) => entry.name === "dir1");
+    const fileEntry = payload.entries.find((entry) => entry.name === "hello.txt");
+    assert.equal(dirEntry?.isDirectory, true);
+    assert.equal(fileEntry?.isDirectory, false);
+    assert.equal(fileEntry?.size, Buffer.byteLength("hello\nworld\n"));
+    assert.equal(payload.truncated, false);
+
+    mkdirSync(join(workspace, "many"));
+    for (let i = 0; i < 505; i += 1) {
+      writeFileSync(join(workspace, "many", `f${String(i).padStart(3, "0")}.txt`), "");
+    }
+    const limited = await executeTool("list_dir", { path: "many" }, ctx);
+    assert.equal(limited.ok, true, limited.output);
+    const limitedPayload = JSON.parse(limited.output) as {
+      entries: unknown[];
+      total: number;
+      returned: number;
+      truncated: boolean;
+    };
+    assert.equal(limitedPayload.entries.length, 500);
+    assert.equal(limitedPayload.returned, 500);
+    assert.equal(limitedPayload.total, 505);
+    assert.equal(limitedPayload.truncated, true);
+    assert.equal(limited.truncated, true);
+  });
+});
+
+// ── 14. M3-02 六件套 TOOL_SPECS ─────────────────────────────────
+
+function specRecord(value: unknown): Record<string, unknown> {
+  assert.ok(value !== null && typeof value === "object" && !Array.isArray(value));
+  return value as Record<string, unknown>;
+}
+
+test("M3-02 TOOL_SPECS 覆盖六件套，JSON Schema 的 required/properties/types 完整", () => {
+  const expectedRequired: Record<string, string[]> = {
+    read_file: ["path"],
+    list_dir: ["path"],
+    glob: ["pattern"],
+    grep: ["pattern"],
+    write_file: ["path", "content"],
+    run_command: ["argv"],
+  };
+  assert.deepEqual(
+    TOOL_SPECS.map((spec) => spec.name).sort(),
+    Object.keys(expectedRequired).sort(),
+  );
+
+  for (const spec of TOOL_SPECS) {
+    assert.equal(typeof spec.description, "string");
+    const parameters = specRecord(spec.parameters);
+    assert.equal(parameters.type, "object", `${spec.name}.parameters.type`);
+    assert.equal(parameters.additionalProperties, false, `${spec.name}.additionalProperties`);
+
+    const properties = specRecord(parameters.properties);
+    const required = parameters.required;
+    assert.ok(Array.isArray(required), `${spec.name}.required`);
+    assert.deepEqual(required, expectedRequired[spec.name]);
+
+    for (const key of required as string[]) {
+      assert.ok(Object.prototype.hasOwnProperty.call(properties, key), `${spec.name}.${key}`);
+    }
+    for (const [key, value] of Object.entries(properties)) {
+      const property = specRecord(value);
+      assert.equal(typeof property.type, "string", `${spec.name}.${key}.type`);
+      if (property.type === "array") {
+        const items = specRecord(property.items);
+        assert.equal(items.type, "string", `${spec.name}.${key}.items.type`);
+      }
+    }
+  }
+
+  const writeSpec = TOOL_SPECS.find((spec) => spec.name === "write_file");
+  assert.ok(writeSpec !== undefined);
+  const writeProperties = specRecord(specRecord(writeSpec.parameters).properties);
+  assert.equal(specRecord(writeProperties.content).type, "string");
+
+  const runSpec = TOOL_SPECS.find((spec) => spec.name === "run_command");
+  assert.ok(runSpec !== undefined);
+  const runProperties = specRecord(specRecord(runSpec.parameters).properties);
+  assert.equal(specRecord(runProperties.argv).type, "array");
 });

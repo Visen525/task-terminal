@@ -2,6 +2,16 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M3-02 文件与命令工具（2026-10-24）
+
+- **read_file / run_command 的实现在 executeTool.ts 原地保留，fs.ts / shell.ts re-export 并注册**：这两个工具已有 M3-01 的路径校验、超时杀树、截断、事件成对等验收，搬移只会扩大回归面；`fs.ts` 负责 list_dir / glob / grep / write_file，`shell.ts` 负责白名单常量与 run_command 注册，六件套仍全部经 `executeTool` 分发。
+- **注册表采用“首次调用时懒登记”**：`executeTool.ts` 持有 `Map<name, {spec, handler}>`，fs/shell 通过 `registerTool` 登记；`executeTool` 与两个工具模块存在 ESM 循环引用，若在模块顶层立即登记，会在直接 import `tools/fs.ts` 时读到尚未初始化的常量（TDZ）。懒登记保证模块图求值完成后再读取 spec/handler，同时保留“同名先登记者优先”，便于测试或后续配置替换。
+- **命令白名单叠加在既有硬拒绝之前**：argv[0] 经 `commandStem` 归一化后必须命中 `DEFAULT_ALLOWED_COMMANDS`（node/npm/npx/pnpm/yarn/git/python/python3/py/pip/cmd/powershell/pwsh/where/tar/robocopy）；注入 `allowedCommands` 可替换清单，空数组即全部拒绝。`cmd`/`powershell`/`pwsh` 放进默认清单的理由是内层硬拒绝（format/diskpart/reg delete/EncodedCommand 等）、shell 串分词与管道拒绝、删除族路径校验仍然执行，白名单只是第一道闸，不是 OS 沙箱。
+- **绝对路径命令不存在时仍交给 spawn 报 ENOENT/E_NOT_FOUND**：M3-01 已有“缺失命令返回 E_NOT_FOUND”的断言，而白名单只约束可执行命令；不存在的绝对路径不可能产生副作用，因此放行到 spawn 以保持既有错误语义，裸命令名不在清单内仍直接 E_COMMAND_DENIED。
+- **glob 只返回文件、list_dir 返回目录项**：目录已由 list_dir 负责，glob 面向“可读取的文件路径”，避免 `src/*` 把子目录混进文件列表；`*`/`?` 不跨 `/`，`**/` 可匹配零层目录，结果按相对路径排序、默认上限 200。遍历用 `fs.readdir` 递归并跳过符号链接，所有条目仍逐个经 `resolveWorkspacePath` 校验。
+- **grep 只读 2MB 以内的文件并按行匹配**：超过 2MB 的文件跳过并计数，在输出末尾注明 `skipped N file(s) larger than 2MB`；命中默认上限 200，超出时截断并追加标记。正则非法时返回结构化 `E_INVALID_ARGUMENT`（与 read_file 非法 offset 的处理一致），不抛出未捕获异常；非法正则原文不回显。
+- **write_file 写前算 sha256，结果与 `agent.tool_result` 事件都带 `sha256`/`bytes`**：创建父目录后直接 `writeFileSync`，因此覆盖是“截断后重写”而非原子替换；返回值给模型的是相对路径 + 字节数 + sha256，事件 payload 同步记录，便于后续产物校验。路径仍只走 `resolveWorkspacePath(..., 'write')`，read-only 与工作区逃逸分别返回 E_COMMAND_DENIED / E_WORKSPACE_ESCAPE。
+
 ## M3-01 executeTool 单一出口与路径校验（2026-10-24）
 
 - **路径判定顺序固定为：权限 → UNC/设备路径预检 → resolve → 最深存在祖先 realpath → 拼回不存在尾段 → 大小写归一化前缀比较**。先 realpath 再比较，才能让 symlink、`\\?\` 扩展前缀和 8.3 短名都落在真实目标上；不存在的新文件（未来 `write_file`）用“最深存在祖先 + 剩余相对段”解析，不会因 realpath 抛 ENOENT 而误判。Windows 比较前统一转小写并归一化分隔符；工作区根由 `createToolContext` 启动时 realpath 一次并缓存。percent 解码最多三层，原文和每一层解码形态都校验，避免 `%2e%2e%2f` 类编码变体绕过。
