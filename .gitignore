@@ -28,7 +28,8 @@ Thumbs.db
 *.docx
 .dsh-office-*
 
-# ── 本地 AI 交接 / ZCode 任务通道（含个人路径与对话，绝不入库）──
+# ── 本地 AI 交接 / 任务通道（含个人路径与对话，绝不入库）──
 .ai/
 AI-GUIDE.md
 .dsh-zcode-bridge/
+.zcode-dsh-bridge/
