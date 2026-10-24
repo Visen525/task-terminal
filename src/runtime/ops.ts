@@ -85,8 +85,12 @@ export function createTask(
   actor: TaskCreationActor = 'user',
 ): Task {
   const now = input.now ?? Date.now();
+  // M11-02：未显式给预算时取 settings.subagent.budgetTokens（默认 0=不限）；
+  // 插入时始终显式传值，避免仓库层的 DDL 默认 120000 覆盖“不限”语义。
+  const budgetTokens = input.budgetTokens ?? getSettings(db).subagent.budgetTokens;
   const task = insertTask(db, {
     ...input,
+    budgetTokens,
     permission: clampPermission(db, input.permission),
     now,
   });

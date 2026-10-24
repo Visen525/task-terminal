@@ -119,7 +119,8 @@ function providerParamsFor(role: RoleModelSettings): LoopProviderParams {
 
 /**
  * 每 tick 用当前 subagent 设置组装 limits；显式注入的 limits 仍可覆盖
- * providerParams 中的单项（只覆盖出现的字段，不把设置里的其余项丢掉）。
+ * providerParams 中的单项与步数/墙钟（只覆盖出现的字段，不把设置里的其余项丢掉）。
+ * maxTokens 不在此组装：任务预算由 watchdog 按 task.budgetTokens 接线（0=不限）。
  */
 function buildSubagentLimits(
   settings: AppSettings,
@@ -128,6 +129,8 @@ function buildSubagentLimits(
   const fromSettings: SchedulerLimits = {
     model: settings.subagent.model,
     providerParams: providerParamsFor(settings.subagent),
+    maxSteps: settings.subagent.maxSteps,
+    wallMs: settings.subagent.wallMinutes * 60_000,
   };
   if (explicit === undefined) return fromSettings;
   return {
@@ -296,7 +299,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     const task = listTasks(db, { status: 'queued', limit: 1 })[0];
     if (task === undefined) return { started: false, reason: 'empty' };
 
-    // 每 tick 读一次设置：模型、采样/思考参数与日预算都取当前值。
+    // 每 tick 读一次设置：模型、采样/思考参数、步数/墙钟与日预算都取当前值。
     // options.dailyBudgetTokens 是显式注入的测试/装配覆盖；未给时跟随设置。
     const settings = getSettings(db);
     const dailyBudgetTokens = options.dailyBudgetTokens ?? settings.dailyBudgetTokens;

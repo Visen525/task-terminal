@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
-import { AGENT_TOOL_SPECS } from "../../src/agent/loop.ts";
+import { AGENT_TOOL_SPECS, DEFAULT_LOOP_LIMITS, runLoop } from "../../src/agent/loop.ts";
 import {
   TOOL_SPECS,
   createToolContext,
@@ -44,8 +44,12 @@ import {
 } from "../../src/providers/web-tools.ts";
 import { createTask } from "../../src/runtime/ops.ts";
 import { createScheduler } from "../../src/runtime/scheduler.ts";
+import { getLocalDayRange } from "../../src/runtime/watchdog.ts";
 import { listEvents } from "../../src/store/events.ts";
+import { insertLlmCall } from "../../src/store/llm-calls.ts";
 import { openDatabase } from "../../src/store/migrate.ts";
+import { listTasks } from "../../src/store/repo.ts";
+import { getSettings, saveSettings } from "../../src/store/settings.ts";
 
 const root = join(import.meta.dirname, "..", "..");
 const TEST_KEY = "m11-test-key-not-a-real-secret";
@@ -650,5 +654,354 @@ test("M11-01 装配链路：scheduler 的 ctx.webTools 透传，loop 收到并�
     db.close();
     rmSync(base, { recursive: true, force: true });
     await mock.close();
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// M11-02 子代理预算放开与上限可调
+// ════════════════════════════════════════════════════════════════
+
+interface RuntimeFixture {
+  db: DatabaseSync;
+  workspace: string;
+}
+
+async function withRuntimeFixture(
+  fn: (fixture: RuntimeFixture) => Promise<void>,
+): Promise<void> {
+  const base = mkdtempSync(join(tmpdir(), "task-terminal-m11-02-"));
+  const workspace = join(base, "workspace");
+  mkdirSync(workspace);
+  const db = openDatabase(join(base, "test.db"));
+  try {
+    await fn({ db, workspace });
+  } finally {
+    db.close();
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+test("M11-02 默认上限：120 步 / 60 分钟，maxTokens 默认不设", () => {
+  assert.equal(DEFAULT_LOOP_LIMITS.maxSteps, 120);
+  assert.equal(DEFAULT_LOOP_LIMITS.maxTokens, undefined);
+  assert.equal(DEFAULT_LOOP_LIMITS.wallMs, 60 * 60 * 1000);
+});
+
+test("M11-02 budgetTokens=0：大 usage 不触发 max_tokens，跑到 submit_result 自然完成", async () => {
+  await withRuntimeFixture(async ({ db, workspace }) => {
+    const task = createTask(
+      db,
+      { title: "大用量调研", goal: "不要被 120k 截断", workspace, now: 1_000 },
+      "user",
+    );
+    assert.equal(task.budgetTokens, 0, "settings 默认 0=不限 应透传到任务");
+
+    const provider = new FakeProvider([
+      {
+        content: "大用量第一步",
+        usage: {
+          inputTokens: 500_000,
+          cachedTokens: 0,
+          outputTokens: 20_000,
+          estimated: false,
+        },
+      },
+      {
+        toolCalls: [submitCall("大用量完成")],
+        usage: {
+          inputTokens: 400_000,
+          cachedTokens: 0,
+          outputTokens: 5_000,
+          estimated: false,
+        },
+      },
+    ]);
+    const scheduler = createScheduler({
+      db,
+      provider,
+      reapOnStart: false,
+      now: () => 2_000,
+    });
+
+    const result = await scheduler.tick();
+    assert.equal(result.started, true);
+    if (!result.started) return;
+    assert.ok(
+      result.outcome.status === "completed",
+      `期望 completed，实际 ${result.outcome.status}`,
+    );
+    if (result.outcome.status !== "completed") return;
+    assert.equal(result.outcome.steps, 2);
+    assert.ok(
+      result.outcome.usage.totalTokens > 120_000,
+      `usage 应超过旧 120k 预算，实际 ${result.outcome.usage.totalTokens}`,
+    );
+    assert.equal(provider.calls.length, 2, "不应因 token 预算提前停止");
+
+    const events = listEvents(db, { taskId: task.id });
+    assert.equal(
+      events.filter((event) => event.type === "task.failed").length,
+      0,
+      "无限预算路径不得出现 task.failed",
+    );
+    assert.equal(events.at(-1)?.type, "task.completed");
+    assert.equal(listTasks(db, { status: "completed" }).length, 1);
+  });
+});
+
+test("M11-02 maxTokens=0 与 undefined 同义：显式 0 也跳过 token 检查", async () => {
+  await withRuntimeFixture(async ({ db, workspace }) => {
+    const task = createTask(
+      db,
+      { title: "显式 0", goal: "token 不限", workspace, now: 1_000 },
+      "user",
+    );
+    const provider = new FakeProvider([
+      {
+        content: "第一步就超 120k",
+        usage: {
+          inputTokens: 900_000,
+          cachedTokens: 0,
+          outputTokens: 1_000,
+          estimated: false,
+        },
+      },
+      { content: "第二步" },
+    ]);
+
+    const outcome = await runLoop({
+      db,
+      provider,
+      task,
+      runId: null,
+      limits: { maxSteps: 2, maxTokens: 0, wallMs: 10_000 },
+    });
+
+    assert.ok(outcome.status === "failed", `期望 failed，实际 ${outcome.status}`);
+    if (outcome.status !== "failed") return;
+    assert.equal(outcome.reason, "max_steps", "0 预算不应触发 max_tokens");
+    assert.equal(outcome.steps, 2);
+    assert.equal(provider.calls.length, 2);
+  });
+});
+
+test("M11-02 显式预算仍生效：budgetTokens=500 → 接线 max_tokens", async () => {
+  await withRuntimeFixture(async ({ db, workspace }) => {
+    const task = createTask(
+      db,
+      {
+        title: "小预算",
+        goal: "验证预算仍可显式设置",
+        workspace,
+        budgetTokens: 500,
+        now: 1_000,
+      },
+      "user",
+    );
+    assert.equal(task.budgetTokens, 500);
+
+    const provider = new FakeProvider([
+      {
+        content: "一次就超",
+        usage: {
+          inputTokens: 400,
+          cachedTokens: 0,
+          outputTokens: 200,
+          estimated: false,
+        },
+      },
+      { toolCalls: [submitCall("不应到达")] },
+    ]);
+    const scheduler = createScheduler({
+      db,
+      provider,
+      reapOnStart: false,
+      now: () => 2_000,
+    });
+
+    const result = await scheduler.tick();
+    assert.equal(result.started, true);
+    if (!result.started) return;
+    assert.ok(result.outcome.status === "failed", `期望 failed，实际 ${result.outcome.status}`);
+    if (result.outcome.status !== "failed") return;
+    assert.equal(result.outcome.reason, "max_tokens");
+    assert.equal(result.outcome.usage.totalTokens, 600);
+    assert.equal(provider.calls.length, 1, "超过显式预算后不得再调用 provider");
+
+    const failed = listEvents(db, { taskId: task.id }).find(
+      (event) => event.type === "task.failed",
+    );
+    assert.equal(payloadOf(failed).reason, "max_tokens");
+  });
+});
+
+test("M11-02 settings 三字段：默认/范围校验/createTask 预算来源/maxSteps=2 两步即停", async () => {
+  await withRuntimeFixture(async ({ db, workspace }) => {
+    const defaults = getSettings(db);
+    assert.equal(defaults.subagent.budgetTokens, 0, "任务 token 预算默认 0=不限");
+    assert.equal(defaults.subagent.maxSteps, 120);
+    assert.equal(defaults.subagent.wallMinutes, 60);
+
+    const saved = saveSettings(
+      db,
+      {
+        subagent: {
+          budgetTokens: 2_000_000,
+          maxSteps: 500,
+          wallMinutes: 240,
+        },
+      },
+      1_000,
+    );
+    assert.equal(saved.subagent.budgetTokens, 2_000_000);
+    assert.equal(saved.subagent.maxSteps, 500);
+    assert.equal(saved.subagent.wallMinutes, 240);
+
+    const rejected = (patch: unknown, field: string, code: string): void => {
+      assert.throws(
+        () => saveSettings(db, patch, 1_500),
+        (error: unknown) =>
+          error instanceof ContractError &&
+          error.code === code &&
+          error.message.includes(field),
+        `预期 ${field} 非法被拒绝`,
+      );
+    };
+    for (const [patch, field] of [
+      [{ subagent: { budgetTokens: -1 } }, "subagent.budgetTokens"],
+      [{ subagent: { budgetTokens: 2_000_001 } }, "subagent.budgetTokens"],
+      [{ subagent: { budgetTokens: 1.5 } }, "subagent.budgetTokens"],
+      [{ subagent: { maxSteps: 0 } }, "subagent.maxSteps"],
+      [{ subagent: { maxSteps: 501 } }, "subagent.maxSteps"],
+      [{ subagent: { wallMinutes: 0 } }, "subagent.wallMinutes"],
+      [{ subagent: { wallMinutes: 241 } }, "subagent.wallMinutes"],
+      [{ main: { budgetTokens: 1 } }, "main.budgetTokens"],
+    ] as const) {
+      rejected(patch, field, ERROR_CODES.E_INVALID_ARGUMENT);
+    }
+
+    // ops.createTask：未显式给预算时取 settings（0=不限），显式给值时优先。
+    saveSettings(
+      db,
+      { subagent: { budgetTokens: 0, maxSteps: 2, wallMinutes: 60 } },
+      2_000,
+    );
+    const fromSettings = createTask(
+      db,
+      { title: "按设置", goal: "两步即停", workspace, now: 3_000 },
+      "user",
+    );
+    assert.equal(fromSettings.budgetTokens, 0);
+    const explicit = createTask(
+      db,
+      {
+        title: "显式预算",
+        goal: "覆盖设置",
+        workspace,
+        budgetTokens: 500,
+        now: 3_001,
+      },
+      "user",
+    );
+    assert.equal(explicit.budgetTokens, 500);
+
+    const provider = new FakeProvider(
+      Array.from({ length: 5 }, (_, index) => ({ content: `第 ${index + 1} 步` })),
+    );
+    const scheduler = createScheduler({
+      db,
+      provider,
+      reapOnStart: false,
+      now: () => 4_000,
+    });
+    const result = await scheduler.tick();
+    assert.equal(result.started, true);
+    if (!result.started) return;
+    assert.ok(result.outcome.status === "failed", `期望 failed，实际 ${result.outcome.status}`);
+    if (result.outcome.status !== "failed") return;
+    assert.equal(result.outcome.reason, "max_steps");
+    assert.equal(result.outcome.steps, 2, "settings.subagent.maxSteps=2 应立即生效");
+    assert.equal(provider.calls.length, 2);
+
+    const schedulerSource = readFileSync(join(root, "src/runtime/scheduler.ts"), "utf8");
+    assert.ok(schedulerSource.includes("maxSteps: settings.subagent.maxSteps"));
+    assert.ok(
+      schedulerSource.includes("wallMs: settings.subagent.wallMinutes * 60_000"),
+    );
+  });
+});
+
+test("M11-02 日预算 gate 回归：日预算超限时 queued 任务不启动", async () => {
+  await withRuntimeFixture(async ({ db, workspace }) => {
+    const now = new Date(2026, 9, 24, 12, 0, 0, 0).getTime();
+    const { startMs } = getLocalDayRange(now);
+    insertLlmCall(db, {
+      purpose: "agent",
+      model: "deepseek-chat",
+      inputTokens: 80,
+      outputTokens: 40,
+      ts: startMs + 1_000,
+    });
+
+    const task = createTask(
+      db,
+      { title: "不应启动", goal: "日预算 gate", workspace, now },
+      "user",
+    );
+    const provider = new FakeProvider([{ toolCalls: [submitCall("不应到达")] }]);
+    const scheduler = createScheduler({
+      db,
+      provider,
+      reapOnStart: false,
+      now: () => now,
+      dailyBudgetTokens: 100,
+    });
+
+    const result = await scheduler.tick();
+    assert.equal(result.started, false);
+    if (result.started) return;
+    assert.equal(result.reason, "budget");
+    assert.equal(result.gate?.allowed, false);
+    assert.equal(result.gate?.spent, 120);
+    assert.equal(provider.calls.length, 0, "gate 拒绝后不得调用 provider");
+    assert.deepEqual(
+      listEvents(db, { taskId: task.id }).map((event) => event.type),
+      ["task.created", "task.queued"],
+    );
+    assert.equal(listTasks(db, { status: "queued" }).length, 1);
+  });
+});
+
+test("M11-02 设置页源码：三字段、0=不限提示与 deepseek-v4-pro 预设", () => {
+  const settings = readFileSync(join(root, "src/web/src/pages/Settings.tsx"), "utf8");
+  for (const marker of [
+    '"deepseek-v4-pro"',
+    "旗舰（账号实测可用）",
+    "任务 token 预算",
+    "0=不限；日预算仍全局生效。",
+    "最大步数",
+    "墙钟（分钟）",
+    "budgetTokens",
+    "maxSteps",
+    "wallMinutes",
+  ]) {
+    assert.ok(settings.includes(marker), `Settings.tsx 缺少 ${marker}`);
+  }
+  const chatIndex = settings.indexOf('value: "deepseek-chat"');
+  const flashIndex = settings.indexOf('value: "deepseek-flash"');
+  const reasonerIndex = settings.indexOf('value: "deepseek-reasoner"');
+  const proIndex = settings.indexOf('value: "deepseek-v4-pro"');
+  const customIndex = settings.indexOf('value: CUSTOM_MODEL');
+  assert.ok(
+    chatIndex < flashIndex &&
+      flashIndex < reasonerIndex &&
+      reasonerIndex < proIndex &&
+      proIndex < customIndex,
+    "模型预设顺序应为 chat → flash → reasoner → v4-pro → 自定义",
+  );
+
+  const settingsApi = readFileSync(join(root, "src/web/src/settingsApi.ts"), "utf8");
+  for (const marker of ["budgetTokens", "maxSteps", "wallMinutes", "SubagentSettings"]) {
+    assert.ok(settingsApi.includes(marker), `settingsApi.ts 缺少 ${marker}`);
   }
 });

@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M11-02 子代理预算放开与上限可调（2026-10-24）
+
+- **任务级 token 预算默认 0=不限，但钱包护栏不动**：`LoopLimits.maxTokens` 改为可选，undefined/0 时 loop 跳过 `max_tokens` 检查；`runGuardedLoop` 只在 `task.budgetTokens > 0` 时接线 `limits.maxTokens`。全局日预算 gate（`canStartTask`）与 M11-01 的每 run 30 次联网上限原样保留，二者仍会在钱包/调用次数上兜底。
+- **默认上限只调“跑得完”的两项**：`DEFAULT_LOOP_LIMITS` 的 `maxSteps` 120、`wallMs` 60 分钟，maxTokens 不设。研究型任务死因是 120k token 截断，而不是步数/墙钟；把 token 放开后仍保留步数与墙钟，避免无限循环或卡死。
+- **0=不限的语义链只经过一个显式传值点**：`settings.subagent.budgetTokens`（默认 0）→ `ops.createTask` 在 insert 时显式传 `budgetTokens`（不使用 DDL 默认 120000）→ `scheduler.toGuardedTask` → `watchdog` 按 >0 条件接线 → `loop` 跳过检查。`repo.ts` 的 DDL 与列默认值冻结不动，旧库直插任务仍保留 120000。
+- **步数/墙钟每 tick 从 settings 读取**：`scheduler.buildSubagentLimits` 增加 `maxSteps` 与 `wallMinutes * 60_000`，显式注入的 limits 仍可覆盖；设置页在子代理卡片新增三项，token 预算为 0 时显示「不限」占位，模型预设追加 `deepseek-v4-pro`（旗舰，账号实测可用）。
+- **测试仍全部走 FakeProvider + 临时库**：新增无限预算大 usage 剧本、显式 500 预算、settings 三字段默认/边界/两步即停、日预算 gate 回归与前端源码断言；不读 `.env`、不打真 API，依赖零新增。另发现既有 m3/m10 有 7 处断言直接锁旧默认（30 步 / 120k / 20min、createTask 120000、progress.maxSteps=30），与新默认不可调和；为满足“pnpm verify 全绿”，只把这些期望值更新为新语义，测试逻辑未改，验收时需确认这一偏离。
+
 ## M10-05 系统提示词编辑与 deepseek-flash 预设（2026-10-24）
 
 - **`mainSystemPrompt` 用 `null` 表达「内置默认」，空串仍是非法值**：读取/保存与既有设置共用一个 `app_settings` 单行 JSON，深合并保证改其他字段不会丢提示词；后端校验非空且 ≤8000 字符，前端在保存时把用户清空的 textarea 归一成 `null`，因此「清空并保存即恢复默认」由 UI 完成，API 契约保持「给值必须非空」。

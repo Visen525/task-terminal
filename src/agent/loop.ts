@@ -8,7 +8,7 @@
  *   2. 所有失败路径（上限、异常、结果非法）都写 task.failed{reason} 后返回，不抛出；
  *      任务已终态时只返回失败结局，不再补事件（见下方终态守卫）。
  *   3. 一切副作用只经 executeTool(name, args, ctx) 执行；本文件不 import 任何 IO 模块。
- *   4. 步数 / token / 墙钟三重上限，任一触发即终止。
+ *   4. 步数 / token / 墙钟三重上限，任一触发即终止；token 上限可缺省（不限）。
  *   5. 只有通过 result schema 校验的 submit_result 才算 completed。
  *
  * tool_call 只在 done 事件之后才被解析和执行；done 之前的 tool_call_delta 一律忽略。
@@ -59,13 +59,20 @@ import {
 
 // ── 公共类型 ─────────────────────────────────────────────────────
 
-/** 三重上限默认值（SPEC §4.8）；M3-04 的 watchdog 会复用同一组语义。 */
-export const DEFAULT_LOOP_LIMITS = {
-  maxSteps: 30,
-  maxTokens: 120_000,
-  wallMs: 20 * 60 * 1000,
+/**
+ * 上限默认值（SPEC §4.8 / §10 M11-02）；M3-04 的 watchdog 会复用同一组语义。
+ * maxTokens 默认不设（undefined = 无任务级 token 上限），需要时由调用方显式给值。
+ */
+export const DEFAULT_LOOP_LIMITS: {
+  readonly maxSteps: number;
+  readonly maxTokens?: number;
+  readonly wallMs: number;
+  readonly model: string;
+} = {
+  maxSteps: 120,
+  wallMs: 60 * 60 * 1000,
   model: 'deepseek-chat',
-} as const;
+};
 
 /** provider 采样/思考参数（M10-01）；与 ChatParams 同名同义。 */
 export interface LoopProviderParams {
@@ -77,7 +84,8 @@ export interface LoopProviderParams {
 
 export interface LoopLimits {
   maxSteps: number;
-  maxTokens: number;
+  /** undefined 或 0 = 不设任务级 token 上限；正数时沿用 max_tokens 终态。 */
+  maxTokens?: number;
   wallMs: number;
   model: string;
   /** 透传给每次 provider 调用的采样/思考参数；缺省不发送。 */
@@ -210,12 +218,11 @@ function normalizeLimits(partial: Partial<LoopLimits> | undefined): LoopLimits {
       maxStepsInput >= 0
         ? Math.floor(maxStepsInput)
         : DEFAULT_LOOP_LIMITS.maxSteps,
-    maxTokens:
-      typeof maxTokensInput === 'number' &&
-      Number.isFinite(maxTokensInput) &&
-      maxTokensInput >= 0
-        ? Math.floor(maxTokensInput)
-        : DEFAULT_LOOP_LIMITS.maxTokens,
+    ...(typeof maxTokensInput === 'number' &&
+    Number.isFinite(maxTokensInput) &&
+    maxTokensInput >= 0
+      ? { maxTokens: Math.floor(maxTokensInput) }
+      : {}),
     wallMs:
       typeof wallMsInput === 'number' && Number.isFinite(wallMsInput) && wallMsInput > 0
         ? Math.floor(wallMsInput)
@@ -486,7 +493,11 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopOutcome> {
       if (steps >= limits.maxSteps) {
         return fail('max_steps');
       }
-      if (usage.inputTokens + usage.outputTokens >= limits.maxTokens) {
+      if (
+        limits.maxTokens !== undefined &&
+        limits.maxTokens > 0 &&
+        usage.inputTokens + usage.outputTokens >= limits.maxTokens
+      ) {
         return fail('max_tokens');
       }
 
@@ -537,7 +548,11 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopOutcome> {
       if (wallExpired || Date.now() - startedAt >= limits.wallMs) {
         return fail('wall_clock');
       }
-      if (usage.inputTokens + usage.outputTokens >= limits.maxTokens) {
+      if (
+        limits.maxTokens !== undefined &&
+        limits.maxTokens > 0 &&
+        usage.inputTokens + usage.outputTokens >= limits.maxTokens
+      ) {
         return fail('max_tokens');
       }
       if (externallyAborted()) {

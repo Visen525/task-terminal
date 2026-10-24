@@ -46,6 +46,7 @@ import {
   putSettings,
   type AppSettings,
   type RoleModelSettings,
+  type SubagentSettings,
   type ThinkingLevel,
 } from "../settingsApi";
 
@@ -104,9 +105,14 @@ const MODEL_OPTIONS = [
     label: "deepseek-reasoner",
     title: "深度思考更耗 token",
   },
+  {
+    value: "deepseek-v4-pro",
+    label: "deepseek-v4-pro",
+    title: "旗舰（账号实测可用）",
+  },
   { value: CUSTOM_MODEL, label: "自定义…", title: "手动输入模型名" },
 ];
-const KNOWN_MODELS = new Set(["deepseek-chat", "deepseek-flash", "deepseek-reasoner"]);
+const KNOWN_MODELS = new Set(["deepseek-chat", "deepseek-flash", "deepseek-reasoner", "deepseek-v4-pro"]);
 
 /**
  * 与后端 src/agent/main-loop.ts 的 MAIN_SYSTEM_PROMPT 保持逐字一致（M10-05）。
@@ -264,6 +270,11 @@ function LoadingPanel({ text }: { text: string }) {
   );
 }
 
+type SubagentLimitValues = Pick<
+  SubagentSettings,
+  "budgetTokens" | "maxSteps" | "wallMinutes"
+>;
+
 interface RoleCardProps {
   role: "main" | "subagent";
   title: string;
@@ -271,10 +282,15 @@ interface RoleCardProps {
   value: RoleModelSettings;
   errors: Record<string, string>;
   onChange: (patch: Partial<RoleModelSettings>) => void;
+  /** 仅子代理卡片提供：任务级预算与步数/墙钟上限（M11-02）。 */
+  limits?: {
+    value: SubagentLimitValues;
+    onChange: (patch: Partial<SubagentLimitValues>) => void;
+  };
 }
 
 /** 主 AI / 子智能体各一张并列卡片；字段错误以 `main.xxx` / `subagent.xxx` 定位。 */
-function RoleCard({ role, title, badge, value, errors, onChange }: RoleCardProps) {
+function RoleCard({ role, title, badge, value, errors, onChange, limits }: RoleCardProps) {
   const [customModel, setCustomModel] = useState(() => !KNOWN_MODELS.has(value.model));
 
   useEffect(() => {
@@ -287,6 +303,9 @@ function RoleCard({ role, title, badge, value, errors, onChange }: RoleCardProps
   const temperatureError = errorFor("temperature");
   const topPError = errorFor("topP");
   const maxTokensError = errorFor("maxTokens");
+  const budgetTokensError = errorFor("budgetTokens");
+  const maxStepsError = errorFor("maxSteps");
+  const wallMinutesError = errorFor("wallMinutes");
   const reasoner = value.model.includes("reasoner");
 
   return (
@@ -422,7 +441,7 @@ function RoleCard({ role, title, badge, value, errors, onChange }: RoleCardProps
         {topPError === undefined ? null : <span className="settings-field-error">{topPError}</span>}
       </div>
 
-      <div className="settings-field" style={{ marginBottom: 0 }}>
+      <div className="settings-field" style={{ marginBottom: limits === undefined ? 0 : undefined }}>
         <div className="settings-field-head">
           <span className="settings-field-label">单轮输出上限</span>
         </div>
@@ -444,6 +463,80 @@ function RoleCard({ role, title, badge, value, errors, onChange }: RoleCardProps
           <span className="settings-field-error">{maxTokensError}</span>
         )}
       </div>
+
+      {role === "subagent" && limits !== undefined ? (
+        <>
+          <div className="settings-field">
+            <div className="settings-field-head">
+              <span className="settings-field-label">任务 token 预算</span>
+            </div>
+            <InputNumber
+              min={0}
+              max={2_000_000}
+              step={10_000}
+              precision={0}
+              value={limits.value.budgetTokens === 0 ? null : limits.value.budgetTokens}
+              placeholder="不限"
+              addonAfter="tokens"
+              aria-label={`${title}任务 token 预算`}
+              style={{ width: 220 }}
+              onChange={(next) => {
+                limits.onChange({ budgetTokens: typeof next === "number" ? next : 0 });
+              }}
+            />
+            <span className="settings-field-help">0=不限；日预算仍全局生效。</span>
+            {budgetTokensError === undefined ? null : (
+              <span className="settings-field-error">{budgetTokensError}</span>
+            )}
+          </div>
+
+          <div className="settings-field">
+            <div className="settings-field-head">
+              <span className="settings-field-label">最大步数</span>
+            </div>
+            <InputNumber
+              min={1}
+              max={500}
+              step={10}
+              precision={0}
+              value={limits.value.maxSteps}
+              addonAfter="步"
+              aria-label={`${title}最大步数`}
+              style={{ width: 200 }}
+              onChange={(next) => {
+                if (typeof next === "number") limits.onChange({ maxSteps: next });
+              }}
+            />
+            <span className="settings-field-help">1–500；默认 120 步。</span>
+            {maxStepsError === undefined ? null : (
+              <span className="settings-field-error">{maxStepsError}</span>
+            )}
+          </div>
+
+          <div className="settings-field" style={{ marginBottom: 0 }}>
+            <div className="settings-field-head">
+              <span className="settings-field-label">墙钟（分钟）</span>
+            </div>
+            <InputNumber
+              min={1}
+              max={240}
+              step={5}
+              precision={0}
+              value={limits.value.wallMinutes}
+              addonAfter="分钟"
+              aria-label={`${title}墙钟上限`}
+              style={{ width: 200 }}
+              onChange={(next) => {
+                if (typeof next === "number") limits.onChange({ wallMinutes: next });
+              }}
+            />
+            <span className="settings-field-help">1–240；默认 60，到点中止任务。</span>
+            {wallMinutesError === undefined ? null : (
+              <span className="settings-field-error">{wallMinutesError}</span>
+            )}
+          </div>
+        </>
+      ) : null}
     </Card>
   );
 }
@@ -711,6 +804,14 @@ export default function Settings({ onOpenTask }: SettingsProps) {
     });
   };
 
+  const updateSubagent = (patch: Partial<SubagentLimitValues>): void => {
+    setDraft((current) =>
+      current === null
+        ? current
+        : { ...current, subagent: { ...current.subagent, ...patch } },
+    );
+  };
+
   const usage = overview?.todayUsage;
   const dailyPercent =
     usage === undefined || overview === undefined || overview.dailyBudgetTokens <= 0
@@ -838,6 +939,10 @@ export default function Settings({ onOpenTask }: SettingsProps) {
                 errors={fieldErrors}
                 onChange={(patch) => {
                   updateRole("subagent", patch);
+                }}
+                limits={{
+                  value: draft.subagent,
+                  onChange: updateSubagent,
                 }}
               />
             </div>

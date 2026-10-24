@@ -1367,10 +1367,10 @@ test("M3-03 不变量 d-1：只聊不提交，maxSteps 触发 failed{max_steps}"
     assert.equal(payloadOf(failedEvent).reason, "max_steps");
     assert.equal(foldEvents(events).status, "failed");
 
-    // 默认上限是 SPEC §4.8 的 30 / 120k / 20min。
-    assert.equal(DEFAULT_LOOP_LIMITS.maxSteps, 30);
-    assert.equal(DEFAULT_LOOP_LIMITS.maxTokens, 120_000);
-    assert.equal(DEFAULT_LOOP_LIMITS.wallMs, 20 * 60 * 1000);
+    // 默认上限是 SPEC §4.8 / §10 M11-02 的 120 步 / 无任务级 token 上限 / 60 分钟。
+    assert.equal(DEFAULT_LOOP_LIMITS.maxSteps, 120);
+    assert.equal(DEFAULT_LOOP_LIMITS.maxTokens, undefined);
+    assert.equal(DEFAULT_LOOP_LIMITS.wallMs, 60 * 60 * 1000);
   });
 });
 

@@ -2,8 +2,9 @@
  * 看门狗与预算（SPEC §4.8 / §7 M3-04）。
  *
  * 边界：
- * - 单次运行的三重上限仍由 agent/loop.ts 执行；本文件只把任务预算接到
+ * - 单次运行的步数 / 墙钟上限仍由 agent/loop.ts 执行；本文件把任务预算接到
  *   limits.maxTokens，并在 loop 结束后记账，不改 loop/executeTool。
+ *   task.budgetTokens 语义 0=不限（M11-02）：只在 >0 时设置 maxTokens。
  * - 日预算是“派新任务”的 gate（canStartTask），不打断已在跑的 loop。
  * - 纯日志/告警不改变任务状态；budget.warning 不挂 task_id，避免任务已
  *   completed/failed 后再给该任务追加活动事件导致 foldEvents 非法。
@@ -27,7 +28,7 @@ export const DEFAULT_DAILY_BUDGET_TOKENS = 2_000_000;
 /** SPEC §4.8：当日用量到 80% 发一次告警。 */
 export const DAILY_WARNING_RATIO = 0.8;
 
-/** loop 需要 token 上限，任务行提供 budget_tokens。 */
+/** loop 需要 token 上限，任务行提供 budget_tokens；0 = 不限（M11-02）。 */
 export interface GuardedLoopTask extends LoopTask {
   budgetTokens: number;
 }
@@ -35,8 +36,8 @@ export interface GuardedLoopTask extends LoopTask {
 export interface RunGuardedLoopOptions extends Omit<RunLoopOptions, 'task' | 'limits'> {
   task: GuardedLoopTask;
   /**
-   * 除 maxTokens 外的 loop 上限；maxTokens 一律由 task.budgetTokens 接线，
-   * 调用方不能覆盖，避免任务预算被悄悄放宽。
+   * 除 maxTokens 外的 loop 上限；maxTokens 由 task.budgetTokens 接线，
+   * 调用方不能覆盖。task.budgetTokens=0 表示不限，不设置 maxTokens。
    */
   limits?: Partial<Omit<LoopLimits, 'maxTokens'>>;
   /** 全局日预算；默认 DEFAULT_DAILY_BUDGET_TOKENS。 */
@@ -103,7 +104,8 @@ function hasDailyBudgetWarning(db: DatabaseSync, startMs: number, endMs: number)
 
 /**
  * 包装 runLoop：
- * 1. task.budgetTokens → limits.maxTokens（既有 max_tokens 终态不变）；
+ * 1. task.budgetTokens > 0 时 → limits.maxTokens（既有 max_tokens 终态不变）；
+ *    0 表示不限，不设置 maxTokens，token 检查跳过；
  * 2. 结束后写一条本次运行的汇总 llm_calls（purpose=agent）；
  * 3. 查当日用量，首次跨过 80% 时追加全局 budget.warning（当日去重）。
  *
@@ -119,7 +121,10 @@ export async function runGuardedLoop(options: RunGuardedLoopOptions): Promise<Lo
     // 只透传钩子；workspace / artifactsDir / 时钟参数由装配层在回调里绑定。
     ...(onBeforeComplete === undefined ? {} : { onBeforeComplete }),
     task,
-    limits: { ...limits, maxTokens: task.budgetTokens },
+    limits: {
+      ...limits,
+      ...(task.budgetTokens > 0 ? { maxTokens: task.budgetTokens } : {}),
+    },
   });
 
   const nowMs = clock();

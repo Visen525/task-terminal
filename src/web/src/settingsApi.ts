@@ -17,12 +17,19 @@ export interface RoleModelSettings {
   maxTokens: number;
 }
 
+/** 子代理执行上限（M11-02）：budgetTokens=0 表示任务级 token 不限。 */
+export interface SubagentSettings extends RoleModelSettings {
+  budgetTokens: number;
+  maxSteps: number;
+  wallMinutes: number;
+}
+
 export interface AppSettings {
   workspaceDir: string | null;
   /** null = 使用后端内置主线提示词；非 null 为用户自定义全文。 */
   mainSystemPrompt: string | null;
   main: RoleModelSettings;
-  subagent: RoleModelSettings;
+  subagent: SubagentSettings;
   mainTaskDefaultPermission: PermissionMode;
   subagentPermissionCap: PermissionMode;
   dailyBudgetTokens: number;
@@ -32,7 +39,7 @@ export interface SettingsPatch {
   workspaceDir?: string | null;
   mainSystemPrompt?: string | null;
   main?: Partial<RoleModelSettings>;
-  subagent?: Partial<RoleModelSettings>;
+  subagent?: Partial<SubagentSettings>;
   mainTaskDefaultPermission?: PermissionMode;
   subagentPermissionCap?: PermissionMode;
   dailyBudgetTokens?: number;
@@ -92,13 +99,32 @@ function isRoleModelSettings(value: unknown): value is RoleModelSettings {
   );
 }
 
+function isSubagentSettings(value: unknown): value is SubagentSettings {
+  if (!isRoleModelSettings(value)) return false;
+  const limits = value as RoleModelSettings & Record<string, unknown>;
+  return (
+    isFiniteNumber(limits.budgetTokens) &&
+    Number.isInteger(limits.budgetTokens) &&
+    limits.budgetTokens >= 0 &&
+    limits.budgetTokens <= 2_000_000 &&
+    isFiniteNumber(limits.maxSteps) &&
+    Number.isInteger(limits.maxSteps) &&
+    limits.maxSteps >= 1 &&
+    limits.maxSteps <= 500 &&
+    isFiniteNumber(limits.wallMinutes) &&
+    Number.isInteger(limits.wallMinutes) &&
+    limits.wallMinutes >= 1 &&
+    limits.wallMinutes <= 240
+  );
+}
+
 function isAppSettings(value: unknown): value is AppSettings {
   return (
     isRecord(value) &&
     (value.workspaceDir === null || typeof value.workspaceDir === "string") &&
     (value.mainSystemPrompt === null || typeof value.mainSystemPrompt === "string") &&
     isRoleModelSettings(value.main) &&
-    isRoleModelSettings(value.subagent) &&
+    isSubagentSettings(value.subagent) &&
     isPermissionMode(value.mainTaskDefaultPermission) &&
     isPermissionMode(value.subagentPermissionCap) &&
     isFiniteNumber(value.dailyBudgetTokens)
@@ -191,7 +217,7 @@ export async function browseDirectory(path?: string): Promise<BrowseResult> {
  * 只识别设置页真实存在的字段，避免把任意路径/文本误当字段。
  */
 const SETTINGS_FIELD_PATTERN =
-  /^(main\.(?:model|thinkingLevel|temperature|topP|maxTokens)|subagent\.(?:model|thinkingLevel|temperature|topP|maxTokens)|workspaceDir|mainSystemPrompt|mainTaskDefaultPermission|subagentPermissionCap|dailyBudgetTokens)\b/u;
+  /^(main\.(?:model|thinkingLevel|temperature|topP|maxTokens)|subagent\.(?:model|thinkingLevel|temperature|topP|maxTokens|budgetTokens|maxSteps|wallMinutes)|workspaceDir|mainSystemPrompt|mainTaskDefaultPermission|subagentPermissionCap|dailyBudgetTokens)\b/u;
 
 export interface ParsedSettingsError {
   fieldErrors: Record<string, string>;

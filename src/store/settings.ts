@@ -27,6 +27,16 @@ export interface RoleModelSettings {
   maxTokens: number;
 }
 
+/** 子代理在模型参数之外可调的执行上限（SPEC §10 M11-02）。 */
+export interface SubagentSettings extends RoleModelSettings {
+  /** 任务级 token 预算；0 = 不限（默认）。日预算仍是全局护栏。 */
+  budgetTokens: number;
+  /** 单次任务的模型步数上限。 */
+  maxSteps: number;
+  /** 单次任务的墙钟上限（分钟）。 */
+  wallMinutes: number;
+}
+
 export interface AppSettings {
   workspaceDir: string | null;
   /**
@@ -35,7 +45,7 @@ export interface AppSettings {
    */
   mainSystemPrompt: string | null;
   main: RoleModelSettings;
-  subagent: RoleModelSettings;
+  subagent: SubagentSettings;
   mainTaskDefaultPermission: PermissionMode;
   subagentPermissionCap: PermissionMode;
   dailyBudgetTokens: number;
@@ -46,7 +56,7 @@ export interface SettingsPatch {
   workspaceDir?: string | null;
   mainSystemPrompt?: string | null;
   main?: Partial<RoleModelSettings>;
-  subagent?: Partial<RoleModelSettings>;
+  subagent?: Partial<SubagentSettings>;
   mainTaskDefaultPermission?: PermissionMode;
   subagentPermissionCap?: PermissionMode;
   dailyBudgetTokens?: number;
@@ -71,6 +81,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
     temperature: 1.0,
     topP: 1.0,
     maxTokens: 4096,
+    budgetTokens: 0,
+    maxSteps: 120,
+    wallMinutes: 60,
   },
   mainTaskDefaultPermission: 'workspace-write',
   subagentPermissionCap: 'workspace-write',
@@ -95,12 +108,24 @@ const ROLE_FIELDS = new Set([
   'topP',
   'maxTokens',
 ]);
+const SUBAGENT_FIELDS = new Set([
+  ...ROLE_FIELDS,
+  'budgetTokens',
+  'maxSteps',
+  'wallMinutes',
+]);
 
 const MODEL_MAX_CHARS = 60;
 const MAIN_SYSTEM_PROMPT_MAX_CHARS = 8000;
 const MAX_TOKENS_MIN = 256;
 const MAX_TOKENS_MAX = 8192;
 const DAILY_BUDGET_MIN = 50_000;
+const SUBAGENT_BUDGET_MIN = 0;
+const SUBAGENT_BUDGET_MAX = 2_000_000;
+const SUBAGENT_MAX_STEPS_MIN = 1;
+const SUBAGENT_MAX_STEPS_MAX = 500;
+const SUBAGENT_WALL_MINUTES_MIN = 1;
+const SUBAGENT_WALL_MINUTES_MAX = 240;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -185,9 +210,10 @@ function parseSettingsPatch(raw: unknown, errors: string[]): SettingsPatch {
       continue;
     }
 
-    const rolePatch: Partial<RoleModelSettings> = {};
+    const rolePatch: Partial<SubagentSettings> = {};
+    const allowedFields = role === 'main' ? ROLE_FIELDS : SUBAGENT_FIELDS;
     for (const field of Object.keys(value)) {
-      if (!ROLE_FIELDS.has(field)) {
+      if (!allowedFields.has(field)) {
         errors.push(`${role}.${field} 不是可配置字段`);
       }
     }
@@ -240,6 +266,44 @@ function parseSettingsPatch(raw: unknown, errors: string[]): SettingsPatch {
         errors,
       );
       if (maxTokens !== undefined) rolePatch.maxTokens = maxTokens;
+    }
+
+    if (role === 'subagent') {
+      if ('budgetTokens' in value) {
+        const budgetTokens = parseBoundedNumber(
+          value.budgetTokens,
+          'subagent.budgetTokens',
+          SUBAGENT_BUDGET_MIN,
+          SUBAGENT_BUDGET_MAX,
+          true,
+          errors,
+        );
+        if (budgetTokens !== undefined) rolePatch.budgetTokens = budgetTokens;
+      }
+
+      if ('maxSteps' in value) {
+        const maxSteps = parseBoundedNumber(
+          value.maxSteps,
+          'subagent.maxSteps',
+          SUBAGENT_MAX_STEPS_MIN,
+          SUBAGENT_MAX_STEPS_MAX,
+          true,
+          errors,
+        );
+        if (maxSteps !== undefined) rolePatch.maxSteps = maxSteps;
+      }
+
+      if ('wallMinutes' in value) {
+        const wallMinutes = parseBoundedNumber(
+          value.wallMinutes,
+          'subagent.wallMinutes',
+          SUBAGENT_WALL_MINUTES_MIN,
+          SUBAGENT_WALL_MINUTES_MAX,
+          true,
+          errors,
+        );
+        if (wallMinutes !== undefined) rolePatch.wallMinutes = wallMinutes;
+      }
     }
 
     if (role === 'main') patch.main = rolePatch;

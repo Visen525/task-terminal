@@ -1189,7 +1189,8 @@ test("M10-04 buildTaskProgress：事件序列推导步数/未收尾工具/token�
       }, "预期未收尾工具按 args_preview 截断后返回");
       assert.equal(running.elapsedMs, 3_900, "预期 running 用 now - startedAt");
       assert.equal(running.spentTokens, 180, "预期 llm.call 的 in+out 累计，cached 不重复计");
-      assert.equal(running.budgetTokens, 120_000);
+      // M11-02：settings.subagent.budgetTokens 默认 0=不限，ops.createTask 显式落库。
+      assert.equal(running.budgetTokens, 0);
       assert.equal(running.recentEvents.length, 5, "预期只保留最近 5 条事件");
       assert.equal(running.recentEvents.at(-1)?.type, "agent.tool_call");
       assert.match(running.recentEvents.at(-1)?.summary ?? "", /run_command/u);
@@ -1240,7 +1241,8 @@ test("M10-04 buildTaskProgress：刚创建、无 run/过程事件的任务返回
       assert.equal(progress.currentTool, null);
       assert.equal(progress.elapsedMs, 0);
       assert.equal(progress.spentTokens, 0);
-      assert.equal(progress.budgetTokens, 120_000);
+      // M11-02：默认 0=不限（日预算仍是全局护栏）。
+      assert.equal(progress.budgetTokens, 0);
       assert.deepEqual(
         progress.recentEvents.map((event) => event.type),
         ["task.created", "task.queued"],
@@ -1356,14 +1358,15 @@ test("M10-04 主线 get_task：假 provider 询问进度 → 工具被调且回�
       assert.equal(progress.status, "running");
       assert.equal(progress.attempt, 1);
       assert.equal(progress.step, 1);
-      assert.equal(progress.maxSteps, 30);
+      assert.equal(progress.maxSteps, DEFAULT_LOOP_LIMITS.maxSteps);
       assert.deepEqual(progress.currentTool, {
         tool: "run_command",
         args_preview: '{"argv":["node","-e","setTimeout(()=>{},5000)"]}',
       });
       assert.equal(progress.elapsedMs, 8_000);
       assert.equal(progress.spentTokens, 40);
-      assert.equal(progress.budgetTokens, 120_000);
+      // M11-02：默认 0=不限。
+      assert.equal(progress.budgetTokens, 0);
       assert.equal(asArray(progress.recentEvents, "progress.recentEvents").length, 5);
 
       const toolMessage = provider.calls[1]?.messages.at(-1);
