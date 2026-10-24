@@ -23,10 +23,12 @@ import {
   retryTask,
   type TaskCanceller,
 } from '../runtime/ops.ts';
-import { getArtifact, searchArtifacts, type Artifact } from '../store/artifacts.ts';
+import { getArtifact, type Artifact } from '../store/artifacts.ts';
 import { appendEvent, listEvents, type ListEventsOptions } from '../store/events.ts';
 import { recallFacts, upsertFact, type Fact } from '../store/facts.ts';
 import { getTask, listTasks } from '../store/repo.ts';
+import { searchArtifactsRanked } from '../store/search.ts';
+import { readArtifactNoteContent } from './artifacts.ts';
 
 /** read_artifact 默认分页大小；M7-01 落正文前返回空串。 */
 export const DEFAULT_ARTIFACT_PAGE_CHARS = 2000;
@@ -189,6 +191,11 @@ export interface MainToolOptions {
   scheduler?: TaskCanceller | null;
   /** 可注入时钟；默认 Date.now。 */
   now?: () => number;
+  /**
+   * note 产物正文的实际根目录（默认 <cwd>/data/artifacts）。
+   * 与 persistArtifacts 的 artifactsDir 对应，测试/装配层注入。
+   */
+  artifactsDir?: string;
 }
 
 export interface MainToolError {
@@ -408,15 +415,17 @@ function wakeScheduler(options: MainToolOptions, task: Task): void {
 }
 
 /**
- * M7-01 之前 artifacts 表没有正文列：已有产物返回空正文，分页元数据照常返回。
- * 这里刻意不做任何文件读取，主线只能通过产物仓储拿数据。
+ * note 的正文在 data/artifacts/ 受信目录里，用 fs 直读并按字符分页；
+ * file/dataset/patch 的正文仍是工作区文件，模型需要用 read_file 任务去看，
+ * 这里只返回 sha256/bytes/path 等元数据（见 docs/decisions.md）。
  */
-function artifactBody(_artifact: Artifact): string {
-  return '';
+function artifactBody(artifact: Artifact, artifactsDir: string | undefined): string {
+  if (artifact.kind !== 'note' || artifact.path === null) return '';
+  return readArtifactNoteContent(artifact.path, artifactsDir);
 }
 
 function readArtifact(
-  db: DatabaseSync,
+  options: MainToolOptions,
   tool: string,
   record: Record<string, unknown>,
 ): MainToolResult {
@@ -426,30 +435,32 @@ function readArtifact(
     optionalInteger(tool, record, 'limit', 1) ?? DEFAULT_ARTIFACT_PAGE_CHARS;
   const limit = Math.min(requestedLimit, MAX_ARTIFACT_PAGE_CHARS);
 
-  const artifact = getArtifact(db, artifactId);
+  const artifact = getArtifact(options.db, artifactId);
   if (artifact === null) {
     return failure(tool, ERROR_CODES.E_NOT_FOUND, `产物不存在: ${artifactId}`);
   }
 
-  const content = artifactBody(artifact);
+  const content = artifactBody(artifact, options.artifactsDir);
   const startedAt = Math.min(offset, content.length);
   const end = Math.min(content.length, startedAt + limit);
   const page = content.slice(startedAt, end);
   const nextOffset = end < content.length ? end : null;
-  return success(
-    tool,
-    {
-      artifact_id: artifact.id,
-      task_id: artifact.taskId,
-      title: artifact.title,
-      offset: startedAt,
-      limit,
-      total_chars: content.length,
-      next_offset: nextOffset,
-      content: page,
-    },
-    page,
-  );
+  const data = {
+    artifact_id: artifact.id,
+    task_id: artifact.taskId,
+    kind: artifact.kind,
+    title: artifact.title,
+    offset: startedAt,
+    limit,
+    total_chars: content.length,
+    next_offset: nextOffset,
+    ...(artifact.path === null ? {} : { path: artifact.path }),
+    ...(artifact.sha256 === null ? {} : { sha256: artifact.sha256 }),
+    ...(artifact.bytes === null ? {} : { bytes: artifact.bytes }),
+    content: page,
+  };
+  // note 直接回正文；其它类型回元数据 JSON，让模型知道要去工作区 read_file。
+  return artifact.kind === 'note' ? success(tool, data, page) : success(tool, data);
 }
 
 function remember(
@@ -569,7 +580,11 @@ export async function executeMainTool(
         const query = requiredString(tool, record, 'query');
         const limit =
           optionalInteger(tool, record, 'limit', 1) ?? DEFAULT_ARTIFACT_SEARCH_LIMIT;
-        const hits = searchArtifacts(options.db, { query, limit });
+        const hits = searchArtifactsRanked(options.db, {
+          query,
+          limit,
+          now: options.now?.() ?? Date.now(),
+        });
         return success(tool, {
           count: hits.length,
           artifacts: hits.map((hit) => ({
@@ -588,7 +603,7 @@ export async function executeMainTool(
       }
 
       case 'read_artifact':
-        return readArtifact(options.db, tool, record);
+        return readArtifact(options, tool, record);
 
       case 'remember':
         return remember(options, tool, record);

@@ -100,6 +100,11 @@ export interface RunLoopOptions {
   runId?: string | null;
   /** 写入 task.failed 事件的 attempt；默认 1。 */
   attempt?: number;
+  /**
+   * submit_result 校验通过后、写 task.completed 之前同步调用。
+   * 用于产物落盘等系统动作；抛错时按既有的 result_invalid 路径失败。
+   */
+  onBeforeComplete?: (result: SubmitResult) => void;
 }
 
 export interface LoopUsage {
@@ -575,6 +580,18 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopOutcome> {
           if (validation.ok) {
             appendControlToolCall('submit_result', parsed.value);
             appendControlToolResult(true, 'submit_result 校验通过，任务完成');
+            if (options.onBeforeComplete !== undefined) {
+              try {
+                // 同步钩子：产物事件必须写在 task.completed 之前（活动事件只在 running 合法）。
+                options.onBeforeComplete(validation.value);
+              } catch (error) {
+                const loopError = toLoopError(error);
+                return fail('result_invalid', {
+                  code: loopError.code,
+                  message: `${loopError.code}: ${loopError.message}`,
+                });
+              }
+            }
             return complete(validation.value);
           }
 

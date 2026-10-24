@@ -16,6 +16,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 
 import type { LoopLimits, LoopOutcome, LoopToolContextOptions } from '../agent/loop.ts';
+import { persistArtifacts } from '../agent/artifacts.ts';
 import type { Task } from '../core/types.ts';
 import type { LlmProvider } from '../providers/types.ts';
 import { appendEvent } from '../store/events.ts';
@@ -191,6 +192,15 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
         attempt,
         now: clock,
         dailyBudgetTokens,
+        // submit_result 校验通过后、task.completed 事件前落盘产物（M7-01）。
+        onBeforeComplete: (result) => {
+          persistArtifacts(db, {
+            taskId: task.id,
+            runId: run.id,
+            workspace: task.workspace,
+            result,
+          });
+        },
       });
     } finally {
       if (leaseTimer !== undefined) clearInterval(leaseTimer);

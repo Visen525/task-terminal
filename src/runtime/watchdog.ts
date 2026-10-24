@@ -110,12 +110,14 @@ function hasDailyBudgetWarning(db: DatabaseSync, startMs: number, endMs: number)
  * 记账与告警都在 loop 返回后同步完成，中间不 await，单进程内不会重复告警。
  */
 export async function runGuardedLoop(options: RunGuardedLoopOptions): Promise<LoopOutcome> {
-  const { task, limits, dailyBudgetTokens, now, ...loopOptions } = options;
+  const { task, limits, dailyBudgetTokens, now, onBeforeComplete, ...loopOptions } = options;
   const clock = now ?? Date.now;
   const budget = dailyBudgetTokens ?? DEFAULT_DAILY_BUDGET_TOKENS;
 
   const outcome = await runLoop({
     ...loopOptions,
+    // 只透传钩子；workspace / artifactsDir / 时钟参数由装配层在回调里绑定。
+    ...(onBeforeComplete === undefined ? {} : { onBeforeComplete }),
     task,
     limits: { ...limits, maxTokens: task.budgetTokens },
   });

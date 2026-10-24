@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M7-01 产物落盘与检索（2026-10-28）
+
+- **落盘只挂一个 loop 钩子，且必须排在 task.completed 之前**：`RunLoopOptions.onBeforeComplete` 在 submit_result 校验通过、`agent.tool_result` 写完之后同步调用；`persistArtifacts` 先写全部 `artifact.created`，最后写一条 `summary.generated`，loop 随后才写 `task.completed`。这样 foldEvents 看到的 `artifact.created` / `summary.generated` 都在 running 态，不会触发非法转移；钩子抛错复用既有 `fail('result_invalid')`，事件 payload 与返回值都带 `error_code`，不新增失败原因。
+- **假完成防御采用“先全量校验、后统一落盘”的两阶段**：file/dataset/patch 先用 `createToolContext + resolveWorkspacePath`（与 executeTool 同款路径语义，但不经 executeTool）校验并读取，任何路径缺失/读失败都在写 note、插表、发事件之前抛 `E_NOT_FOUND`，避免“第一个产物成功、第二个失败”留下半落盘。模型声称产出不存在的文件按 SPEC 反假完成原则直接失败；非 note 缺 path 则是 `E_INVALID_ARGUMENT`（schema 描述“path 仅 note 可省”）。
+- **note 写 `data/artifacts/<taskId>/<ulid>.md`，data/ 视为系统受信目录**：目录创建/写文件直接用 fs，不走 executeTool 的模型动作沙箱；`artifacts.path` 始终存逻辑相对路径 `data/artifacts/...`，实际根目录由 `artifactsDir` 注入（默认 `<cwd>/data/artifacts`），测试用临时目录而不在仓库留下 note 文件。Markdown 含 artifact.summary 与 result.findings，两者随 insertArtifact 进 FTS（只索引摘要/标签/findings，不索引正文）。
+- **看门狗只透传钩子，装配参数留给装配层**：`runGuardedLoop` 把 `onBeforeComplete` 原样交给 `runLoop`，不在 runtime 里 import agent 落盘模块；workspace 从 task 绑定、runId/now/artifactsDir 由调用方组装。M7-01 期间 `scheduler.ts` 属冻结文件，生产调度接线留到后续装配卡；本卡用 `runGuardedLoop` 的显式钩子完成端到端验收，既有 M3-04 调用因未传钩子行为完全不变。
+- **检索排序在仓储层之外做复合打分**：`searchArtifactsRanked` 先用既有 `searchArtifacts` 取 50 个候选（短词自动走 instr 退化路径），再按 bm25/字段分 min-max 归一 + `exp(-ageDays/30)*0.3` + tag 命中比例 `*0.2` 重排取 8；正文与 path 不参与索引。`read_artifact` 的 note 正文读取放在 `agent/artifacts.ts` 的受信目录 helper 里，main-tools 只调用它，既满足“note fs 直读”，也不破坏 M5 既有“main-tools 不 import node:fs”的源码断言；file/dataset/patch 只回 sha256/bytes/path，正文仍要模型用工作区 read_file 查看。
+
 ## M6-03 产物库与对话（2026-10-27）
 
 - **POST /chat 的流式错误放在 HTTP 200 的流内**：路由先 `reply.hijack()` 写 `text/event-stream` 头，成功发 `event: delta`（`{text}`）与一条 `event: done`（`{reply, usage}`）；运行期错误发 `event: error`（`{code, message}`）后结束，不再改成 500 JSON。这样前端只需处理一种响应形态，已收到的 delta 不会因状态码切换而丢失；参数错误仍发生在建流之前，由全局错误处理器返回 400 JSON。建流后立即写一行 `: connected` 注释，既冲刷响应头让 fetch 在首 token 前拿到流，也让代理/客户端确认连接已建立。
@@ -162,3 +170,7 @@
 ## 契约 · §5.6 白名单补 Vite（2026-10-24，随 M6-01 前置修订）
 
 - M6-01 任务卡指定 "Vite + React + AntD"，但 §5.6 白名单表漏列 Vite——属 SPEC 内部不一致，按契约流程修订补入（vite、@vitejs/plugin-react、@types/react、@types/react-dom），并注明仅限 src/web/ 前端构建；后端仍零打包器。
+
+## M7-01 补记（Manager 接线，2026-10-24）
+
+- DSH 交付本卡时 scheduler.ts 属禁改文件，onBeforeComplete 钩子只在测试直连路径生效；Manager 在验收时补上调度器接线（executeTask 的 runGuardedLoop 增加 onBeforeComplete → persistArtifacts，生产路径用默认 data/artifacts 目录），并追加回归测试「调度路径真实落盘 2 件产物 + 事件顺序」锁定。
