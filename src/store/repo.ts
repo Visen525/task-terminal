@@ -12,13 +12,9 @@ import {
   isTerminalTaskStatus,
 } from '../core/state.ts';
 import type {
-  EventActor,
-  EventType,
-  JsonValue,
   PermissionMode,
   RunStatus,
   Task,
-  TaskEvent,
   TaskRun,
   TaskStatus,
 } from '../core/types.ts';
@@ -55,16 +51,6 @@ interface RunRow {
   ended_at: number | null;
 }
 
-interface EventRow {
-  seq: number;
-  task_id: string | null;
-  run_id: string | null;
-  ts: number;
-  type: string;
-  actor: string;
-  payload: string;
-}
-
 function mapTask(row: TaskRow): Task {
   return {
     id: row.id,
@@ -95,18 +81,6 @@ function mapRun(row: RunRow): TaskRun {
     error: row.error,
     startedAt: row.started_at,
     endedAt: row.ended_at,
-  };
-}
-
-function mapEvent(row: EventRow): TaskEvent {
-  return {
-    seq: row.seq,
-    taskId: row.task_id,
-    runId: row.run_id,
-    ts: row.ts,
-    type: row.type as EventType,
-    actor: row.actor as EventActor,
-    payload: JSON.parse(row.payload) as JsonValue,
   };
 }
 
@@ -323,58 +297,7 @@ export function finishRun(
   return updated;
 }
 
-// ── events ───────────────────────────────────────────────────────
+// ── events（实现已迁至 events.ts；re-export 保持 repo API 兼容）────
 
-export interface NewEventInput {
-  taskId?: string | null;
-  runId?: string | null;
-  type: EventType;
-  actor: EventActor;
-  payload: JsonValue;
-  ts?: number;
-}
-
-/** 追加事件，返回全局单调 seq。 */
-export function appendEvent(db: DatabaseSync, input: NewEventInput): number {
-  const result = db
-    .prepare('INSERT INTO events (task_id, run_id, ts, type, actor, payload) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(
-      input.taskId ?? null,
-      input.runId ?? null,
-      input.ts ?? Date.now(),
-      input.type,
-      input.actor,
-      JSON.stringify(input.payload),
-    );
-  return Number(result.lastInsertRowid);
-}
-
-export interface ListEventsOptions {
-  taskId?: string;
-  runId?: string;
-  afterSeq?: number;
-  limit?: number;
-}
-
-export function listEvents(db: DatabaseSync, options: ListEventsOptions = {}): TaskEvent[] {
-  const where: string[] = [];
-  const params: Array<string | number> = [];
-  if (options.taskId !== undefined) {
-    where.push('task_id = ?');
-    params.push(options.taskId);
-  }
-  if (options.runId !== undefined) {
-    where.push('run_id = ?');
-    params.push(options.runId);
-  }
-  if (options.afterSeq !== undefined) {
-    where.push('seq > ?');
-    params.push(options.afterSeq);
-  }
-  const limit = options.limit ?? 100;
-  const sql = `SELECT * FROM events
-    ${where.length > 0 ? 'WHERE ' + where.join(' AND ') : ''}
-    ORDER BY seq ASC LIMIT ?`;
-  const rows = db.prepare(sql).all(...params, limit) as unknown as EventRow[];
-  return rows.map(mapEvent);
-}
+export { appendEvent, listEvents } from './events.ts';
+export type { ListEventsOptions, NewEventInput } from './events.ts';
