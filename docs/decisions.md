@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M4-01 调度器与恢复（2026-10-24）
+
+- **并发 1 用“busy 标志 + 当前执行 promise”而不是锁**：`tick()` 在第一次 `await` 之前同步置 busy，并发调用只会拿到 `{started:false, reason:'busy'}`；`shutdown()` 等待同一个 promise，单进程模型下无需队列锁/工作线程。
+- **派任务严格“insertRun → task.started 事件 → 表 queued→running”**：事件是唯一真相源，表是投影；loop 仍只负责写 `task.completed` / `task.failed` / `ask_user` 等事件，调度器只按 `LoopOutcome` 推进表并收 run，避免两处写同一终态事件。`run.attempt` 取该任务既有 runs 数 + 1，重试永远是新 run。
+- **waiting_input 的 run 收 `interrupted`**：一次执行在 ask_user 处已经结束，run 不能保持 running 等用户；任务表进 waiting_input 保留待回复语义。用户回复后的恢复由 `waiting_input→running` + 新 run 表达（后续卡），不在 waiting_input 状态续租。
+- **shutdown(abort) 与外部 signal 都走 loop 的 interrupted 失败路径**：loop 先补 `task.failed{reason:'interrupted'}`，调度器再把 run 收 `interrupted`、任务表 running→failed；调度器不会替 loop 重写终态事件。正常结束的租约定时器在 `finally` 里 `clearInterval`，续约回调发现 run 已收尾也会自清。
+- **reaper 对过期 run 先收 run，再按任务状态分流**：任务仍 running 时补 `task.failed{reason:'interrupted', attempt}`；`attempt < 3` 追加 `task.queued` 并走 `running→failed→queued`（foldEvents 由此把 attempt 递增），用尽则只到 failed。任务已 completed/cancelled 的孤儿 run 只把 run 收 interrupted，不发任务事件、不改任务表；启动恢复默认在 `createScheduler` 内先跑一次 reaper，但恢复动作本身始终可通过 `reapExpiredRuns` 单独调用与验收。
+
 ## M3-04 看门狗与预算（2026-10-24）
 
 - **`llm_calls` 按“一次 run 一条汇总行”记账，而不是逐次 LLM 调用**：M3-03 的 loop 已经在事件流里逐步写了 `llm.call`（含每次调用的 in/cached/out/ms），表里再逐调用写一份会形成两份容易漂移的账；而 `LoopOutcome` 只返回本次运行的累计 usage，逐调用记账必须改 `loop.ts`（本卡禁止）。汇总行以 `purpose='agent'`、`latency_ms=elapsedMs` 落库，日预算按 `input+output` 聚合；`insertLlmCall` 仍保留 `estimated` 入参并原样落 0/1，供后续主线（M5-01）逐调用记账使用。局限：loop 的聚合 usage 不暴露 `estimated`，所以汇总行固定记 0。
