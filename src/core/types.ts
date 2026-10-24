@@ -159,6 +159,8 @@ export interface LlmResponse {
   toolCalls: LlmToolCall[];
   usage?: TokenUsage;
   finishReason: string;
+  /** 思考链全文（M13-02）：reasoning 模型返回；仅用于展示/落库，禁止回喂给 API。 */
+  reasoningContent?: string;
 }
 
 /** 工具声明（注册表用；parameters 为 JSON Schema，契约层不解析）。 */

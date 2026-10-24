@@ -49,6 +49,15 @@ export interface TextDeltaEvent {
 }
 
 /**
+ * 思考链增量（M13-02）：reasoning 模型先于正文产出。
+ * 与 text_delta 同构；只用于展示转发，调用方不得把累计结果回喂给 API。
+ */
+export interface ReasoningDeltaEvent {
+  type: "reasoning_delta";
+  text: string;
+}
+
+/**
  * tool_call 增量。argumentsDelta 是原始 JSON 字符串的一段，
  * 只有最终 `done.response.toolCalls[i].function.arguments` 才是完整参数。
  */
@@ -66,7 +75,11 @@ export interface DoneEvent {
   response: LlmResponse;
 }
 
-export type LlmStreamEvent = TextDeltaEvent | ToolCallDeltaEvent | DoneEvent;
+export type LlmStreamEvent =
+  | TextDeltaEvent
+  | ReasoningDeltaEvent
+  | ToolCallDeltaEvent
+  | DoneEvent;
 
 /** 余额条目（DeepSeek `/user/balance` 字段的 camelCase 映射）。 */
 export interface BalanceEntry {
