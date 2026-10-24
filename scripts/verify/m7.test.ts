@@ -18,7 +18,12 @@ import { executeMainTool, type MainToolOptions } from "../../src/agent/main-tool
 import type { SubmitResult } from "../../src/agent/result-validator.ts";
 import { ContractError, ERROR_CODES } from "../../src/core/errors.ts";
 import { foldEvents } from "../../src/core/fold.ts";
-import type { LlmToolCall, Task, TaskEvent } from "../../src/core/types.ts";
+import {
+  llmContentText,
+  type LlmToolCall,
+  type Task,
+  type TaskEvent,
+} from "../../src/core/types.ts";
 import { FakeProvider, type FakeStep } from "../../src/providers/fake.ts";
 import { runGuardedLoop, type GuardedLoopTask } from "../../src/runtime/watchdog.ts";
 import { insertArtifact, type Artifact } from "../../src/store/artifacts.ts";
@@ -846,15 +851,15 @@ test("M7-02 剧本 A：主线程 remember 后新会话 recall 命中且事实注
     // recall 工具结果回喂给模型（第 2 次 provider 调用的最后一条消息）。
     const recallToolMessage = secondProvider.calls[1]?.messages.at(-1);
     assert.equal(recallToolMessage?.role, "tool");
-    assert.match(recallToolMessage?.content ?? "", /用户偏好/u);
-    assert.match(recallToolMessage?.content ?? "", /喜欢中文简洁回答/u);
+    assert.match(llmContentText(recallToolMessage?.content ?? ""), /用户偏好/u);
+    assert.match(llmContentText(recallToolMessage?.content ?? ""), /喜欢中文简洁回答/u);
 
     // 新会话首次 provider 调用的 system prompt 已注入长期事实块。
     const system = secondProvider.calls[0]?.messages[0];
     assert.equal(system?.role, "system");
-    assert.match(system?.content ?? "", /## 长期事实/u);
-    assert.match(system?.content ?? "", /用户偏好/u);
-    assert.match(system?.content ?? "", /喜欢中文简洁回答/u);
+    assert.match(llmContentText(system?.content ?? ""), /## 长期事实/u);
+    assert.match(llmContentText(system?.content ?? ""), /用户偏好/u);
+    assert.match(llmContentText(system?.content ?? ""), /喜欢中文简洁回答/u);
   });
 });
 
@@ -949,8 +954,8 @@ test("M7-02 剧本 B：回访检索命中并读原文，read_artifact 带 source
     // 检索结果把来源任务回喂给模型（第 2 次 provider 调用）。
     const searchToolMessage = revisit.calls[1]?.messages.at(-1);
     assert.equal(searchToolMessage?.role, "tool");
-    assert.match(searchToolMessage?.content ?? "", /季度分析结论/u);
-    assert.match(searchToolMessage?.content ?? "", new RegExp(task.id, "u"));
+    assert.match(llmContentText(searchToolMessage?.content ?? ""), /季度分析结论/u);
+    assert.match(llmContentText(searchToolMessage?.content ?? ""), new RegExp(task.id, "u"));
 
     // 读正文：note 分页输出仍是正文页（第 3 次 provider 调用）。
     const readToolMessage = revisit.calls[2]?.messages.at(-1);

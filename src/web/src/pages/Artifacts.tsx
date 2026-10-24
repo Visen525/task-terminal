@@ -17,7 +17,10 @@ import {
   Tag,
   Typography,
 } from "antd";
+import { FolderOpenOutlined, SearchOutlined } from "@ant-design/icons";
 
+import EmptyState from "../components/EmptyState";
+import PageHeader from "../components/PageHeader";
 import {
   getArtifact,
   searchArtifacts,
@@ -125,19 +128,18 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
   };
 
   return (
-    <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <div>
-        <Typography.Title level={3} style={{ margin: 0 }}>
-          产物库
-        </Typography.Title>
-        <Typography.Text type="secondary">
-          按关键词检索产物摘要、标签与发现；点卡片查看详情。
-        </Typography.Text>
-      </div>
+    <>
+      <PageHeader
+        eyebrow="Artifacts"
+        title="产物库"
+        subtitle="按关键词检索产物摘要、标签与发现；点卡片查看详情。"
+      />
 
-      <Space.Compact style={{ width: "100%", maxWidth: 680 }}>
+      <div className="artifact-search">
         <Input
+          size="large"
           allowClear
+          prefix={<SearchOutlined />}
           value={query}
           placeholder="输入关键词，例如：月度分析、环比、CSV"
           onChange={(event) => {
@@ -148,7 +150,10 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
           }}
         />
         <Button
+          className="search-button"
+          size="large"
           type="primary"
+          icon={<SearchOutlined />}
           loading={loading}
           onClick={() => {
             void runSearch(query);
@@ -156,153 +161,149 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
         >
           搜索
         </Button>
-      </Space.Compact>
+      </div>
 
-      {error === null ? null : (
-        <Alert
-          type="error"
-          showIcon
-          message="产物检索失败"
-          description={error}
-          action={
-            <Button
-              size="small"
-              onClick={() => {
-                void runSearch(query);
-              }}
-            >
-              重试
-            </Button>
-          }
-        />
-      )}
-
-      {loading ? (
-        <Space size={10} style={{ padding: 24 }}>
-          <Spin />
-          <span>检索中…</span>
-        </Space>
-      ) : error !== null ? null : !searched ? (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description="输入关键词后回车或点「搜索」，开始检索产物。"
-          style={{ marginTop: 56 }}
-        />
-      ) : results.length === 0 ? (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description={`没有命中「${query.trim()}」的产物。`}
-          style={{ marginTop: 56 }}
-        />
-      ) : (
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
-            gap: 16,
-          }}
-        >
-          {results.map((artifact) => (
-            <Card
-              key={artifact.id}
-              hoverable
-              onClick={() => {
-                void openDetail(artifact);
-              }}
-              extra={<TrustTag trust={artifact.trust} />}
-              title={
-                <Typography.Text strong ellipsis={{ tooltip: artifact.title }}>
-                  {artifact.title}
-                </Typography.Text>
-              }
-              styles={{ body: { display: "flex", flexDirection: "column", gap: 8 } }}
-            >
-              <Typography.Paragraph
-                type="secondary"
-                ellipsis={{ rows: 3 }}
-                style={{ marginBottom: 0, minHeight: 66 }}
-              >
-                {artifact.summary}
-              </Typography.Paragraph>
-
-              {artifact.tags.length > 0 ? (
-                <Space size={[0, 4]} wrap>
-                  {artifact.tags.map((tag) => (
-                    <Tag key={tag} color="blue">
-                      {tag}
-                    </Tag>
-                  ))}
-                </Space>
-              ) : (
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  无标签
-                </Typography.Text>
-              )}
-
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: 8,
-                  flexWrap: "wrap",
+      <div style={{ marginTop: 20 }}>
+        {error === null ? null : (
+          <Alert
+            type="error"
+            showIcon
+            message="产物检索失败"
+            description={error}
+            action={
+              <Button
+                size="small"
+                onClick={() => {
+                  void runSearch(query);
                 }}
               >
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  来源任务{" "}
-                  <Typography.Text code title={artifact.taskId}>
-                    {shortId(artifact.taskId)}
+                重试
+              </Button>
+            }
+            style={{ marginBottom: 16 }}
+          />
+        )}
+
+        {loading ? (
+          <div style={{ display: "flex", justifyContent: "center", padding: "72px 0" }}>
+            <Space size={10} style={{ color: "var(--tt-text-secondary)" }}>
+              <Spin />
+              <span>检索中…</span>
+            </Space>
+          </div>
+        ) : error !== null ? null : !searched ? (
+          <EmptyState
+            icon={<FolderOpenOutlined />}
+            title="开始检索产物"
+            description="输入关键词后回车或点「搜索」，从摘要、标签与发现中查找产物。"
+          />
+        ) : results.length === 0 ? (
+          <EmptyState
+            icon={<SearchOutlined />}
+            title="没有匹配的产物"
+            description={`没有命中「${query.trim()}」的产物，换个关键词试试。`}
+          />
+        ) : (
+          <div className="artifact-grid">
+            {results.map((artifact) => (
+              <Card
+                key={artifact.id}
+                className="artifact-card"
+                hoverable
+                onClick={() => {
+                  void openDetail(artifact);
+                }}
+                extra={<TrustTag trust={artifact.trust} />}
+                title={
+                  <Typography.Text strong ellipsis={{ tooltip: artifact.title }}>
+                    {artifact.title}
                   </Typography.Text>
-                </Typography.Text>
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {formatTime(artifact.createdAt)}
-                </Typography.Text>
-              </div>
-            </Card>
-          ))}
-        </div>
-      )}
+                }
+                styles={{ body: { display: "flex", flexDirection: "column", gap: 10 } }}
+              >
+                <Typography.Paragraph
+                  type="secondary"
+                  ellipsis={{ rows: 3 }}
+                  className="artifact-summary"
+                >
+                  {artifact.summary}
+                </Typography.Paragraph>
+
+                {artifact.tags.length > 0 ? (
+                  <Space size={[0, 6]} wrap>
+                    {artifact.tags.map((tag) => (
+                      <Tag key={tag} className="soft-tag">
+                        {tag}
+                      </Tag>
+                    ))}
+                  </Space>
+                ) : (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    无标签
+                  </Typography.Text>
+                )}
+
+                <div className="artifact-footer">
+                  <span>
+                    来源任务{" "}
+                    <Typography.Text code title={artifact.taskId}>
+                      {shortId(artifact.taskId)}
+                    </Typography.Text>
+                  </span>
+                  <span>{formatTime(artifact.createdAt)}</span>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )}
+      </div>
 
       <Drawer
         title={selected === null ? "产物详情" : selected.title}
         open={drawerOpen}
         onClose={closeDrawer}
         width={560}
+        styles={{ body: { paddingTop: 20 } }}
       >
         {detailLoading ? (
-          <Space size={10} style={{ padding: 24 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "center",
+              alignItems: "center",
+              gap: 10,
+              padding: "48px 0",
+              color: "var(--tt-text-secondary)",
+            }}
+          >
             <Spin />
             <span>加载产物详情…</span>
-          </Space>
+          </div>
         ) : detailError !== null ? (
           <Alert type="error" showIcon message="产物详情加载失败" description={detailError} />
         ) : selected === null ? (
           <Empty description="请选择一条产物" />
         ) : (
-          <Space direction="vertical" size={20} style={{ width: "100%" }}>
-            <Space size={8} wrap>
+          <div className="drawer-stack">
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <TrustTag trust={selected.trust} />
-              <Tag>{selected.kind}</Tag>
-              <Typography.Text type="secondary">{formatTime(selected.createdAt)}</Typography.Text>
-            </Space>
+              <Tag className="soft-tag">{selected.kind}</Tag>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {formatTime(selected.createdAt)}
+              </Typography.Text>
+            </div>
 
             <section>
-              <Typography.Title level={5} style={{ marginTop: 0 }}>
-                摘要
-              </Typography.Title>
-              <Typography.Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>
-                {selected.summary}
-              </Typography.Paragraph>
+              <h3 className="drawer-section-title">摘要</h3>
+              <p className="drawer-summary">{selected.summary}</p>
             </section>
 
             <section>
-              <Typography.Title level={5} style={{ marginTop: 0 }}>
-                发现（findings）
-              </Typography.Title>
+              <h3 className="drawer-section-title">发现（findings）</h3>
               {selected.findings.length === 0 ? (
                 <Typography.Text type="secondary">暂无</Typography.Text>
               ) : (
-                <ul style={{ margin: 0, paddingInlineStart: 20 }}>
+                <ul className="drawer-list">
                   {selected.findings.map((finding, index) => (
                     <li key={`${String(index)}-${finding}`}>{finding}</li>
                   ))}
@@ -311,15 +312,13 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
             </section>
 
             <section>
-              <Typography.Title level={5} style={{ marginTop: 0 }}>
-                标签
-              </Typography.Title>
+              <h3 className="drawer-section-title">标签</h3>
               {selected.tags.length === 0 ? (
                 <Typography.Text type="secondary">无</Typography.Text>
               ) : (
-                <Space size={[0, 4]} wrap>
+                <Space size={[0, 6]} wrap>
                   {selected.tags.map((tag) => (
-                    <Tag key={tag} color="blue">
+                    <Tag key={tag} className="soft-tag">
                       {tag}
                     </Tag>
                   ))}
@@ -328,9 +327,7 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
             </section>
 
             <section>
-              <Typography.Title level={5} style={{ marginTop: 0 }}>
-                来源任务
-              </Typography.Title>
+              <h3 className="drawer-section-title">来源任务</h3>
               <Button
                 type="link"
                 style={{ paddingInline: 0 }}
@@ -343,9 +340,9 @@ export default function Artifacts({ onOpenTask }: ArtifactsProps) {
                 查看任务 {selected.taskId}
               </Button>
             </section>
-          </Space>
+          </div>
         )}
       </Drawer>
-    </Space>
+    </>
   );
 }

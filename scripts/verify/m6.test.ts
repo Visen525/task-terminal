@@ -84,6 +84,7 @@ test("M6-01 依赖：dependencies/devDependencies 逐项限定在白名单内", 
   const pkg = readJson("package.json");
 
   const allowedDependencies = new Set([
+    "@ant-design/icons",
     "fastify",
     "react",
     "react-dom",
@@ -478,6 +479,7 @@ test("M6-03 依赖：package.json 零新增（与 M6-02 的依赖集合完全一
   assert.deepEqual(
     Object.keys(dependencies).sort(),
     [
+      "@ant-design/icons",
       "@tanstack/react-query",
       "@tanstack/react-virtual",
       "antd",

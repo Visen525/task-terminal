@@ -5,10 +5,13 @@
  * （EventSource 不支持 POST）。delta 先进入字符串缓冲，24ms 合批后才 setState，
  * 避免每个 token 触发一次渲染；请求中禁用发送，首段 delta 未到前显示「思考中…」。
  */
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
-import { Alert, App as AntdApp, Button, Empty, Input, Space, Spin, Typography } from "antd";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Alert, App as AntdApp, Button, Input, Spin, Tooltip } from "antd";
+import { MessageOutlined, PaperClipOutlined, SendOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 
+import EmptyState from "../components/EmptyState";
+import PageHeader from "../components/PageHeader";
 import { listMessages, streamChat, type ChatMessage } from "../chatApi";
 
 /** 16–32ms 合批窗口，取中间值。 */
@@ -19,13 +22,17 @@ function localId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const bubbleBase: CSSProperties = {
-  maxWidth: "78%",
-  padding: "10px 14px",
-  borderRadius: 12,
-  lineHeight: 1.7,
-  wordBreak: "break-word",
-};
+function ThinkingDots() {
+  return (
+    <span className="thinking" role="status" aria-label="思考中">
+      <span className="thinking-dots" aria-hidden>
+        <span />
+        <span />
+        <span />
+      </span>
+    </span>
+  );
+}
 
 function MessageBubble({
   message,
@@ -35,40 +42,27 @@ function MessageBubble({
   thinking: boolean;
 }) {
   const isUser = message.role === "user";
-  const bubbleStyle: CSSProperties = isUser
-    ? {
-        ...bubbleBase,
-        marginLeft: "auto",
-        background: "#1677ff",
-        color: "#fff",
-        whiteSpace: "pre-wrap",
-      }
-    : {
-        ...bubbleBase,
-        marginRight: "auto",
-        background: "#fff",
-        border: "1px solid #f0f0f0",
-        boxShadow: "0 1px 2px rgba(0,0,0,0.03)",
-      };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}>
-      <Typography.Text type="secondary" style={{ fontSize: 12, marginBottom: 4 }}>
-        {isUser ? "我" : "主 AI"}
-      </Typography.Text>
-      <div style={bubbleStyle}>
-        {isUser ? (
-          message.content
-        ) : message.content.length === 0 && thinking ? (
-          <Space size={8}>
-            <Spin size="small" />
-            <Typography.Text type="secondary">思考中…</Typography.Text>
-          </Space>
-        ) : (
-          <div className="chat-markdown">
-            <ReactMarkdown>{message.content}</ReactMarkdown>
-          </div>
-        )}
+    <div className={isUser ? "chat-row chat-row-user" : "chat-row chat-row-assistant"}>
+      <div
+        className={isUser ? "chat-avatar chat-avatar-user" : "chat-avatar chat-avatar-ai"}
+        aria-hidden
+      >
+        {isUser ? "我" : "AI"}
+      </div>
+      <div className="chat-bubble-col">
+        <div className={isUser ? "chat-bubble chat-bubble-user" : "chat-bubble chat-bubble-ai"}>
+          {isUser ? (
+            message.content
+          ) : message.content.length === 0 && thinking ? (
+            <ThinkingDots />
+          ) : (
+            <div className="chat-markdown">
+              <ReactMarkdown>{message.content}</ReactMarkdown>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -231,22 +225,12 @@ export default function Chat() {
   }, [flushDeltas, input, loadingHistory, sending, toast]);
 
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        height: "calc(100vh - 160px)",
-        minHeight: 480,
-      }}
-    >
-      <div style={{ marginBottom: 12 }}>
-        <Typography.Title level={3} style={{ margin: 0 }}>
-          对话
-        </Typography.Title>
-        <Typography.Text type="secondary">
-          主 AI 常驻会话；需要动手时会派任务给子智能体。
-        </Typography.Text>
-      </div>
+    <div className="chat-page">
+      <PageHeader
+        eyebrow="Chat"
+        title="对话"
+        subtitle="主 AI 常驻会话；需要动手时会派任务给子智能体。"
+      />
 
       {error === null ? null : (
         <Alert
@@ -262,30 +246,39 @@ export default function Chat() {
         />
       )}
 
-      <div
-        ref={listRef}
-        style={{
-          flex: 1,
-          overflowY: "auto",
-          padding: 16,
-          background: "#fafafa",
-          border: "1px solid #f0f0f0",
-          borderRadius: 8,
-        }}
-      >
+      <div ref={listRef} className="chat-panel">
         {loadingHistory ? (
-          <Space size={10} style={{ padding: 24 }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 10,
+              height: "100%",
+              color: "var(--tt-text-secondary)",
+            }}
+          >
             <Spin />
             <span>加载历史对话…</span>
-          </Space>
+          </div>
         ) : messages.length === 0 ? (
-          <Empty
-            image={Empty.PRESENTED_IMAGE_SIMPLE}
-            description="还没有对话。试试问「帮我看下现在有哪些任务」。"
-            style={{ marginTop: 72 }}
-          />
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              height: "100%",
+            }}
+          >
+            <EmptyState
+              compact
+              icon={<MessageOutlined />}
+              title="还没有对话"
+              description="试试问「帮我看下现在有哪些任务」。"
+            />
+          </div>
         ) : (
-          <Space direction="vertical" size={16} style={{ width: "100%" }}>
+          <div className="chat-message-list">
             {messages.map((item) => (
               <MessageBubble
                 key={item.id}
@@ -293,12 +286,13 @@ export default function Chat() {
                 thinking={sending && item.role === "assistant" && item.content.length === 0}
               />
             ))}
-          </Space>
+          </div>
         )}
       </div>
 
-      <div style={{ marginTop: 12 }}>
+      <div className="chat-composer">
         <Input.TextArea
+          variant="borderless"
           value={input}
           onChange={(event) => {
             setInput(event.target.value);
@@ -314,9 +308,23 @@ export default function Chat() {
           disabled={sending || loadingHistory}
           maxLength={8000}
         />
-        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+        <div className="chat-composer-footer">
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <Tooltip title="附件功能将在 M9-03 开放" placement="top">
+              <Button
+                type="text"
+                size="small"
+                icon={<PaperClipOutlined />}
+                disabled
+                aria-label="添加附件（M9-03 开放）"
+              />
+            </Tooltip>
+            <span className="chat-composer-hint">Enter 发送 · Shift+Enter 换行</span>
+          </div>
           <Button
+            className="send-button"
             type="primary"
+            icon={<SendOutlined />}
             loading={sending}
             disabled={sending || loadingHistory || input.trim().length === 0}
             onClick={() => {

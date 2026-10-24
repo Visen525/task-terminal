@@ -1,34 +1,46 @@
 import { useState, type ReactNode } from "react";
-import { Empty, Layout, Menu, Space, Typography } from "antd";
+import { Button, Layout, Menu, Tooltip } from "antd";
+import {
+  AppstoreOutlined,
+  FolderOpenOutlined,
+  MessageOutlined,
+  ProfileOutlined,
+  SettingOutlined,
+  ThunderboltFilled,
+} from "@ant-design/icons";
 
+import EmptyState from "./components/EmptyState";
+import PageHeader from "./components/PageHeader";
 import Artifacts from "./pages/Artifacts";
 import Chat from "./pages/Chat";
 import TaskBoard from "./pages/TaskBoard";
 import TaskDetail from "./pages/TaskDetail";
 
-const { Content, Header, Sider } = Layout;
+const { Content, Sider } = Layout;
 
 type ViewKey = "board" | "detail" | "artifacts" | "chat";
 
 const MENU_ITEMS = [
-  { key: "board", label: "任务看板" },
-  { key: "detail", label: "任务详情" },
-  { key: "artifacts", label: "产物库" },
-  { key: "chat", label: "对话" },
+  { key: "board", icon: <AppstoreOutlined />, label: "任务看板" },
+  { key: "detail", icon: <ProfileOutlined />, label: "任务详情" },
+  { key: "artifacts", icon: <FolderOpenOutlined />, label: "产物库" },
+  { key: "chat", icon: <MessageOutlined />, label: "对话" },
 ];
 
-function Placeholder({ title, description }: { title: string; description: string }) {
+function DetailPlaceholder() {
   return (
-    <Empty
-      image={Empty.PRESENTED_IMAGE_SIMPLE}
-      style={{ marginTop: 120 }}
-      description={
-        <Space direction="vertical" size={4}>
-          <Typography.Text strong>{title}</Typography.Text>
-          <Typography.Text type="secondary">{description}</Typography.Text>
-        </Space>
-      }
-    />
+    <>
+      <PageHeader
+        eyebrow="Task detail"
+        title="任务详情"
+        subtitle="从看板或产物库选择一条任务，查看目标、预算与执行时间线。"
+      />
+      <EmptyState
+        icon={<ProfileOutlined />}
+        title="还没有选择任务"
+        description="请先在「任务看板」点击一条任务。"
+      />
+    </>
   );
 }
 
@@ -48,7 +60,7 @@ export default function App() {
   } else if (activeKey === "detail") {
     content =
       selectedTaskId === null ? (
-        <Placeholder title="任务详情" description="请先在「任务看板」点击一条任务。" />
+        <DetailPlaceholder />
       ) : (
         <TaskDetail
           taskId={selectedTaskId}
@@ -64,9 +76,17 @@ export default function App() {
   }
 
   return (
-    <Layout style={{ minHeight: "100vh" }}>
-      <Sider theme="light" width={210} style={{ borderRight: "1px solid #f0f0f0" }}>
-        <div style={{ padding: "20px 24px", fontSize: 18, fontWeight: 600 }}>任务终端</div>
+    <Layout className="app-shell">
+      <Sider theme="light" width={208} className="app-sider">
+        <div className="app-brand">
+          <div className="app-brand-mark">
+            <ThunderboltFilled />
+          </div>
+          <div>
+            <div className="app-brand-title">任务终端</div>
+            <div className="app-brand-sub">本地 AI 任务台</div>
+          </div>
+        </div>
         <Menu
           mode="inline"
           selectedKeys={[activeKey]}
@@ -74,29 +94,20 @@ export default function App() {
           onClick={({ key }) => {
             setActiveKey(key as ViewKey);
           }}
-          style={{ borderInlineEnd: "none" }}
+          className="app-nav"
         />
+        <div className="app-sider-footer">
+          <span>v1.1.0</span>
+          <Tooltip title="设置（M9-02 开放）" placement="top">
+            <Button type="text" size="small" icon={<SettingOutlined />} aria-label="设置" />
+          </Tooltip>
+        </div>
       </Sider>
-      <Layout>
-        <Header
-          style={{
-            background: "#fff",
-            padding: "0 24px",
-            borderBottom: "1px solid #f0f0f0",
-            display: "flex",
-            alignItems: "center",
-          }}
-        >
-          <Typography.Text type="secondary">本地优先的个人 AI 任务台</Typography.Text>
-        </Header>
-        <Content style={{ padding: 24, background: "#f5f5f5" }}>
+      <Layout className="app-main">
+        <Content className="app-content">
           <div
-            style={{
-              background: "#fff",
-              borderRadius: 8,
-              padding: 24,
-              minHeight: "calc(100vh - 112px)",
-            }}
+            className="app-page"
+            style={{ maxWidth: activeKey === "chat" ? 860 : 1080 }}
           >
             {content}
           </div>

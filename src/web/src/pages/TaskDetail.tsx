@@ -6,8 +6,10 @@
  */
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Alert, App as AntdApp, Button, Empty, Space, Spin } from "antd";
+import { Alert, App as AntdApp, Button, Spin } from "antd";
+import { ProfileOutlined } from "@ant-design/icons";
 
+import EmptyState from "../components/EmptyState";
 import EventTimeline from "../components/EventTimeline";
 import TaskHeader from "../components/TaskHeader";
 import { useTaskEvents } from "../hooks/useTaskEvents";
@@ -54,7 +56,7 @@ export default function TaskDetail({ taskId, onBack }: TaskDetailProps) {
   const actionPending = cancelMutation.isPending || retryMutation.isPending;
 
   return (
-    <Space direction="vertical" size={16} style={{ width: "100%" }}>
+    <div style={{ width: "100%" }}>
       {error === null ? null : (
         <Alert
           type="error"
@@ -71,17 +73,32 @@ export default function TaskDetail({ taskId, onBack }: TaskDetailProps) {
               重试
             </Button>
           }
+          style={{ marginBottom: 16 }}
         />
       )}
 
       {task === undefined ? (
         isLoading ? (
-          <Space size={10} style={{ padding: 32 }}>
-            <Spin />
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "center",
+              alignItems: "center",
+              gap: 12,
+              padding: "72px 0",
+              color: "var(--tt-text-secondary)",
+            }}
+          >
+            <Spin size="large" />
             <span>加载任务与历史事件…</span>
-          </Space>
+          </div>
         ) : error === null ? (
-          <Empty description="任务不存在或尚未加载完成" style={{ marginTop: 80 }} />
+          <EmptyState
+            icon={<ProfileOutlined />}
+            title="任务不存在或尚未加载完成"
+            description="请返回看板重新选择一条任务。"
+            action={<Button onClick={onBack}>返回任务看板</Button>}
+          />
         ) : null
       ) : (
         <>
@@ -107,6 +124,6 @@ export default function TaskDetail({ taskId, onBack }: TaskDetailProps) {
           />
         </>
       )}
-    </Space>
+    </div>
   );
 }

@@ -5,8 +5,10 @@ import { App as AntdApp, ConfigProvider } from "antd";
 import zhCN from "antd/locale/zh_CN";
 
 import "antd/dist/reset.css";
+import "./styles.css";
 
 import App from "./App";
+import { themeConfig } from "./theme";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -24,7 +26,7 @@ if (container === null) {
 
 createRoot(container).render(
   <React.StrictMode>
-    <ConfigProvider locale={zhCN}>
+    <ConfigProvider locale={zhCN} theme={themeConfig}>
       <AntdApp>
         <QueryClientProvider client={queryClient}>
           <App />

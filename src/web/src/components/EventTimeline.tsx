@@ -14,38 +14,28 @@ import {
   type UIEvent,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Empty, Space, Tag, Typography } from "antd";
+import { Space, Tag, Typography } from "antd";
+import { HistoryOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 
 import type { TaskEvent } from "../api";
+import EmptyState from "./EmptyState";
 
 const { Text } = Typography;
 
 const PREVIEW_STYLE: CSSProperties = {
   margin: "6px 0 0",
   padding: "8px 10px",
-  background: "#fafafa",
-  border: "1px solid #f0f0f0",
-  borderRadius: 6,
+  background: "#F8FAFC",
+  border: "1px solid #EEF0F3",
+  borderRadius: 8,
+  fontFamily: "var(--tt-mono)",
   fontSize: 12,
-  lineHeight: 1.55,
+  lineHeight: 1.6,
   maxHeight: 220,
   overflow: "auto",
   whiteSpace: "pre-wrap",
   overflowWrap: "anywhere",
-};
-
-const ROW_STYLE: CSSProperties = {
-  position: "relative",
-  padding: "10px 12px 10px 26px",
-  border: "1px solid #f0f0f0",
-  borderRadius: 8,
-  background: "#fff",
-};
-
-const TASK_ROW_STYLE: CSSProperties = {
-  ...ROW_STYLE,
-  background: "#fafafa",
 };
 
 const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
@@ -57,22 +47,33 @@ const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
   hour12: false,
 });
 
-const EVENT_COLORS: Record<string, string> = {
-  "task.created": "blue",
-  "task.queued": "default",
-  "task.started": "processing",
-  "task.completed": "success",
-  "task.failed": "error",
-  "task.cancelled": "default",
-  "agent.step": "geekblue",
-  "agent.message": "cyan",
-  "agent.tool_call": "orange",
-  "agent.tool_result": "green",
-  "llm.call": "purple",
-  "artifact.created": "gold",
-  "summary.generated": "gold",
-  "budget.warning": "warning",
-  "memory.fact_upserted": "magenta",
+interface EventTone {
+  color: string;
+  background: string;
+}
+
+const NEUTRAL_TONE: EventTone = { color: "#6B7280", background: "#F3F4F6" };
+const PRIMARY_TONE: EventTone = { color: "#4F46E5", background: "#EEF2FF" };
+const SUCCESS_TONE: EventTone = { color: "#15803D", background: "#F0FDF4" };
+const DANGER_TONE: EventTone = { color: "#B91C1C", background: "#FEF2F2" };
+const WARNING_TONE: EventTone = { color: "#B45309", background: "#FFFBEB" };
+
+const EVENT_TONES: Record<string, EventTone> = {
+  "task.created": PRIMARY_TONE,
+  "task.queued": NEUTRAL_TONE,
+  "task.started": PRIMARY_TONE,
+  "task.completed": SUCCESS_TONE,
+  "task.failed": DANGER_TONE,
+  "task.cancelled": NEUTRAL_TONE,
+  "agent.step": PRIMARY_TONE,
+  "agent.message": PRIMARY_TONE,
+  "agent.tool_call": WARNING_TONE,
+  "agent.tool_result": SUCCESS_TONE,
+  "llm.call": PRIMARY_TONE,
+  "artifact.created": WARNING_TONE,
+  "summary.generated": WARNING_TONE,
+  "budget.warning": WARNING_TONE,
+  "memory.fact_upserted": PRIMARY_TONE,
 };
 
 const ACTOR_LABELS: Record<string, string> = {
@@ -290,64 +291,46 @@ function EventBody({ event }: { event: TaskEvent }): ReactNode {
 }
 
 function EventRow({ event }: { event: TaskEvent }) {
-  const isTaskEvent = event.type.startsWith("task.");
-  const color = EVENT_COLORS[event.type] ?? "default";
-  const dotColor =
-    event.type === "task.failed"
-      ? "#cf1322"
-      : event.type === "task.completed"
-        ? "#389e0d"
-        : isTaskEvent
-          ? "#1677ff"
-          : "#d9d9d9";
+  const tone = EVENT_TONES[event.type] ?? NEUTRAL_TONE;
 
   return (
-    <div style={isTaskEvent ? TASK_ROW_STYLE : ROW_STYLE}>
+    <div className="timeline-row">
       <span
         aria-hidden
+        className="timeline-dot"
         style={{
-          position: "absolute",
-          left: 8,
-          top: 18,
-          width: isTaskEvent ? 9 : 7,
-          height: isTaskEvent ? 9 : 7,
-          borderRadius: "50%",
-          background: dotColor,
-          boxShadow: isTaskEvent ? `0 0 0 3px ${dotColor}22` : undefined,
+          background: tone.color,
+          boxShadow: `0 0 0 3px ${tone.background}`,
         }}
       />
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "flex-start",
-          gap: 12,
-        }}
-      >
-        <Space size={6} wrap>
-          <Text type="secondary" style={{ fontFamily: "monospace", fontSize: 12 }}>
-            #{event.seq}
-          </Text>
-          <Tag color={color} style={{ marginInlineEnd: 0 }}>
+      <div className="timeline-content">
+        <div className="timeline-head">
+          <span className="timeline-seq">#{event.seq}</span>
+          <Tag
+            className="timeline-type-tag"
+            style={{
+              border: "none",
+              background: tone.background,
+              color: tone.color,
+            }}
+          >
             {event.type}
           </Tag>
-          <Tag style={{ marginInlineEnd: 0 }}>{ACTOR_LABELS[event.actor] ?? event.actor}</Tag>
-        </Space>
-        <Text type="secondary" style={{ fontSize: 12, whiteSpace: "nowrap" }}>
-          {formatTime(event.ts)}
-        </Text>
-      </div>
+          <span className="timeline-actor">
+            {ACTOR_LABELS[event.actor] ?? event.actor}
+          </span>
+          <span className="timeline-time">{formatTime(event.ts)}</span>
+        </div>
 
-      <div style={{ marginTop: 6 }}>
-        <EventBody event={event} />
-      </div>
+        <div className="timeline-body">
+          <EventBody event={event} />
+        </div>
 
-      <details style={{ marginTop: 6 }}>
-        <summary style={{ cursor: "pointer", color: "#8c8c8c", fontSize: 12 }}>
-          payload JSON
-        </summary>
-        <pre style={PREVIEW_STYLE}>{formatJson(event.payload)}</pre>
-      </details>
+        <details className="timeline-payload">
+          <summary>payload JSON</summary>
+          <pre style={PREVIEW_STYLE}>{formatJson(event.payload)}</pre>
+        </details>
+      </div>
     </div>
   );
 }
@@ -399,81 +382,69 @@ export default function EventTimeline({ events, autoFollow, running }: EventTime
   };
 
   return (
-    <Space direction="vertical" size={8} style={{ width: "100%" }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          gap: 12,
-        }}
-      >
-        <Text strong>执行时间线</Text>
-        <Space size={8}>
+    <section className="timeline-section">
+      <div className="section-heading">
+        <h2 className="section-title">执行时间线</h2>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           {running ? (
-            <Tag color="processing" style={{ marginInlineEnd: 0 }}>
+            <Tag
+              style={{
+                marginInlineEnd: 0,
+                border: "none",
+                background: "#EEF2FF",
+                color: "#4F46E5",
+              }}
+            >
               实时接收中
             </Tag>
           ) : null}
-          <Text type="secondary" style={{ fontSize: 12 }}>
+          <span className="section-hint">
             共 {events.length} 条 · 虚拟滚动仅渲染可视行
-          </Text>
-        </Space>
+          </span>
+        </div>
       </div>
 
-      <div
-        ref={scrollParentRef}
-        onScroll={handleScroll}
-        style={{
-          height: "calc(100vh - 500px)",
-          minHeight: 300,
-          overflowY: "auto",
-          overflowX: "hidden",
-          border: "1px solid #f0f0f0",
-          borderRadius: 8,
-          background: "#fcfcfc",
-          padding: "12px 14px",
-          contain: "strict",
-        }}
-      >
-        {events.length === 0 ? (
-          <Empty
-            image={Empty.PRESENTED_IMAGE_SIMPLE}
-            description="还没有事件；任务启动后会在这里实时出现。"
-            style={{ marginTop: 80 }}
-          />
-        ) : (
-          <div
-            style={{
-              height: virtualizer.getTotalSize(),
-              width: "100%",
-              position: "relative",
-            }}
-          >
-            {virtualizer.getVirtualItems().map((virtualItem) => {
-              const event = events[virtualItem.index];
-              if (event === undefined) return null;
-              return (
-                <div
-                  key={virtualItem.key}
-                  data-index={virtualItem.index}
-                  ref={virtualizer.measureElement}
-                  style={{
-                    position: "absolute",
-                    top: 0,
-                    left: 0,
-                    width: "100%",
-                    transform: `translateY(${virtualItem.start}px)`,
-                    paddingBottom: 8,
-                  }}
-                >
-                  <EventRow event={event} />
-                </div>
-              );
-            })}
-          </div>
-        )}
+      <div className="timeline-shell">
+        <div ref={scrollParentRef} onScroll={handleScroll} className="timeline-scroll">
+          {events.length === 0 ? (
+            <EmptyState
+              compact
+              icon={<HistoryOutlined />}
+              title="还没有事件"
+              description="任务启动后会在这里实时出现。"
+            />
+          ) : (
+            <div
+              style={{
+                height: virtualizer.getTotalSize(),
+                width: "100%",
+                position: "relative",
+              }}
+            >
+              {virtualizer.getVirtualItems().map((virtualItem) => {
+                const event = events[virtualItem.index];
+                if (event === undefined) return null;
+                return (
+                  <div
+                    key={virtualItem.key}
+                    data-index={virtualItem.index}
+                    ref={virtualizer.measureElement}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      transform: `translateY(${virtualItem.start}px)`,
+                    }}
+                  >
+                    <EventRow event={event} />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
-    </Space>
+    </section>
   );
 }

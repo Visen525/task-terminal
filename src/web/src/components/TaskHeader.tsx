@@ -1,34 +1,37 @@
 /**
  * 任务详情头部（M6-02）：状态、目标、耗时、token 累计、预算进度与操作按钮。
+ *
+ * M9-01 仅做视觉分组：目标 / token 与预算 / 时间线三张小卡。
  */
-import { useEffect, useState, type ReactNode } from "react";
-import { Button, Progress, Space, Spin, Switch, Tag, Tooltip, Typography } from "antd";
+import { useEffect, useState } from "react";
+import { Button, Progress, Spin, Switch, Tag, Tooltip, Typography } from "antd";
+import { ArrowLeftOutlined } from "@ant-design/icons";
 
 import type { Task, TaskEvent, TaskStatus } from "../api";
 import type { SseStatus } from "../hooks/useTaskEvents";
 
-const { Text, Paragraph, Title } = Typography;
+const { Text } = Typography;
 
 interface StatusMeta {
   label: string;
   color: string;
-  spinning: boolean;
+  background: string;
 }
 
 const STATUS_META: Record<TaskStatus, StatusMeta> = {
-  queued: { label: "排队中", color: "default", spinning: false },
-  running: { label: "执行中", color: "processing", spinning: true },
-  completed: { label: "已完成", color: "success", spinning: false },
-  failed: { label: "失败", color: "error", spinning: false },
-  waiting_input: { label: "等待输入", color: "warning", spinning: false },
-  cancelled: { label: "已取消", color: "default", spinning: false },
+  queued: { label: "排队中", color: "#6B7280", background: "#F3F4F6" },
+  running: { label: "执行中", color: "#4F46E5", background: "#EEF2FF" },
+  completed: { label: "已完成", color: "#15803D", background: "#F0FDF4" },
+  failed: { label: "失败", color: "#B91C1C", background: "#FEF2F2" },
+  waiting_input: { label: "等待输入", color: "#B45309", background: "#FFFBEB" },
+  cancelled: { label: "已取消", color: "#6B7280", background: "#F3F4F6" },
 };
 
-const SSE_META: Record<SseStatus, { label: string; color: string }> = {
-  connecting: { label: "连接中", color: "default" },
-  open: { label: "实时已连接", color: "success" },
-  reconnecting: { label: "断线重连中", color: "warning" },
-  closed: { label: "连接已关闭", color: "default" },
+const SSE_META: Record<SseStatus, StatusMeta> = {
+  connecting: { label: "连接中", color: "#6B7280", background: "#F3F4F6" },
+  open: { label: "实时已连接", color: "#15803D", background: "#F0FDF4" },
+  reconnecting: { label: "断线重连中", color: "#B45309", background: "#FFFBEB" },
+  closed: { label: "连接已关闭", color: "#6B7280", background: "#F3F4F6" },
 };
 
 const NUMBER_FORMATTER = new Intl.NumberFormat("zh-CN");
@@ -89,28 +92,22 @@ function StatusTag({ status }: { status: TaskStatus }) {
   const meta = STATUS_META[status];
   return (
     <Tag
-      color={meta.color}
-      icon={meta.spinning ? <Spin size="small" /> : undefined}
-      style={{ marginInlineEnd: 0 }}
+      style={{
+        marginInlineEnd: 0,
+        border: "none",
+        background: meta.background,
+        color: meta.color,
+        fontWeight: 500,
+      }}
     >
+      <span
+        className={
+          status === "running" ? "task-status-dot is-running" : "task-status-dot"
+        }
+        style={{ background: meta.color, marginInlineEnd: 6, verticalAlign: "middle" }}
+      />
       {meta.label}
     </Tag>
-  );
-}
-
-interface MetaItemProps {
-  label: string;
-  children: ReactNode;
-}
-
-function MetaItem({ label, children }: MetaItemProps) {
-  return (
-    <Space direction="vertical" size={0}>
-      <Text type="secondary" style={{ fontSize: 12 }}>
-        {label}
-      </Text>
-      <div>{children}</div>
-    </Space>
   );
 }
 
@@ -153,7 +150,7 @@ export default function TaskHeader({
   const spent = Math.max(task.spentTokens, tokensFromEvents);
   const percent =
     task.budgetTokens > 0 ? Math.min(100, Math.round((spent / task.budgetTokens) * 1000) / 10) : 0;
-  const progressColor = percent >= 90 ? "#cf1322" : percent >= 80 ? "#faad14" : "#52c41a";
+  const progressColor = percent >= 90 ? "#DC2626" : percent >= 80 ? "#D97706" : "#4F46E5";
   const elapsed =
     task.startedAt === null
       ? null
@@ -161,45 +158,17 @@ export default function TaskHeader({
   const sse = SSE_META[sseStatus];
 
   return (
-    <div
-      style={{
-        border: "1px solid #f0f0f0",
-        borderRadius: 10,
-        padding: 16,
-        background: "#fff",
-      }}
-    >
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "flex-start",
-          gap: 16,
-          flexWrap: "wrap",
-        }}
-      >
-        <div style={{ minWidth: 0, flex: 1 }}>
-          <Space size={10} wrap align="center">
-            <Title level={3} style={{ margin: 0 }}>
-              {task.title}
-            </Title>
-            <StatusTag status={task.status} />
-            <Tag color={sse.color} style={{ marginInlineEnd: 0 }}>
-              {sse.label}
-            </Tag>
-            <Text type="secondary" copyable={{ text: task.id }} style={{ fontFamily: "monospace" }}>
-              {task.id}
-            </Text>
-          </Space>
-          <Paragraph
-            type="secondary"
-            style={{ margin: "10px 0 0", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-          >
-            {task.goal}
-          </Paragraph>
-        </div>
-
-        <Space wrap>
+    <div>
+      <div className="detail-topbar">
+        <Button
+          type="text"
+          className="detail-back"
+          icon={<ArrowLeftOutlined />}
+          onClick={onBack}
+        >
+          任务看板
+        </Button>
+        <div className="detail-top-actions">
           {task.status === "failed" ? (
             <Button type="primary" loading={actionPending} onClick={onRetry}>
               重试任务
@@ -212,75 +181,123 @@ export default function TaskHeader({
               </Button>
             </Tooltip>
           ) : null}
-          <Button onClick={onBack}>返回任务看板</Button>
-        </Space>
+        </div>
       </div>
 
-      <div
-        style={{
-          display: "flex",
-          gap: 28,
-          flexWrap: "wrap",
-          marginTop: 16,
-          paddingTop: 14,
-          borderTop: "1px solid #f5f5f5",
-        }}
-      >
-        <MetaItem label="耗时">
-          <Text>{elapsed === null ? "尚未开始" : formatDuration(elapsed)}</Text>
-        </MetaItem>
-        <MetaItem label={`LLM 调用 / token（${totals.calls} 次）`}>
-          <Space size={10} wrap>
-            <Text>输入 {NUMBER_FORMATTER.format(totals.input)}</Text>
+      <div className="detail-headline">
+        <div className="detail-title-block">
+          <h1 className="detail-title">{task.title}</h1>
+          <div className="detail-subline">
+            <StatusTag status={task.status} />
+            <Tag
+              style={{
+                marginInlineEnd: 0,
+                border: "none",
+                background: sse.background,
+                color: sse.color,
+                fontWeight: 500,
+              }}
+            >
+              {sse.label}
+            </Tag>
+            <Text
+              className="detail-id"
+              copyable={{ text: task.id, tooltips: ["复制任务 ID", "已复制"] }}
+            >
+              {task.id}
+            </Text>
+          </div>
+        </div>
+      </div>
+
+      <div className="detail-grid">
+        <div className="info-panel info-panel-wide">
+          <span className="info-label">状态与目标</span>
+          <p className="detail-goal" style={{ margin: 0 }}>
+            {task.goal}
+          </p>
+        </div>
+
+        <div className="info-panel">
+          <span className="info-label">Token 与预算</span>
+          <div className="token-row">
+            <span>
+              输入 <strong>{NUMBER_FORMATTER.format(totals.input)}</strong>
+            </span>
             {totals.cached > 0 ? (
               <Tag color="green" style={{ marginInlineEnd: 0 }}>
                 缓存命中 {NUMBER_FORMATTER.format(totals.cached)}
               </Tag>
-            ) : null}
-            <Text>输出 {NUMBER_FORMATTER.format(totals.output)}</Text>
-            <Text type="secondary">合计 {NUMBER_FORMATTER.format(tokensFromEvents)}</Text>
-          </Space>
-        </MetaItem>
-        <MetaItem label="创建 / 开始 / 结束">
-          <Text type="secondary">
-            {formatTime(task.createdAt)} / {formatTime(task.startedAt)} / {formatTime(task.endedAt)}
-          </Text>
-        </MetaItem>
-        <div style={{ flex: "1 1 260px", minWidth: 220 }}>
-          <Space size={8} style={{ width: "100%" }}>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              预算
-            </Text>
-            <Text style={{ fontSize: 12 }}>
-              {NUMBER_FORMATTER.format(spent)} / {NUMBER_FORMATTER.format(task.budgetTokens)}
-            </Text>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              {percent}%
-            </Text>
-          </Space>
-          <Progress
-            percent={percent}
-            showInfo={false}
-            strokeColor={progressColor}
-            size="small"
-            style={{ margin: 0 }}
-          />
+            ) : (
+              <span className="token-muted">缓存 0</span>
+            )}
+            <span>
+              输出 <strong>{NUMBER_FORMATTER.format(totals.output)}</strong>
+            </span>
+            <span className="token-muted">
+              合计 {NUMBER_FORMATTER.format(tokensFromEvents)} · {totals.calls} 次调用
+            </span>
+          </div>
+
+          <div className="budget-line">
+            <div className="budget-top">
+              <span>
+                预算 {NUMBER_FORMATTER.format(spent)} / {NUMBER_FORMATTER.format(task.budgetTokens)}
+              </span>
+              <span>{percent}%</span>
+            </div>
+            <Progress
+              percent={percent}
+              showInfo={false}
+              strokeColor={progressColor}
+              size="small"
+              style={{ margin: 0 }}
+            />
+          </div>
+
         </div>
-        {running ? (
-          <MetaItem label="时间线跟随">
-            <Space size={8}>
-              <Spin size="small" />
-              <Text style={{ fontSize: 12 }}>执行中</Text>
-              <Switch
-                size="small"
-                checked={autoFollow}
-                onChange={onAutoFollowChange}
-                checkedChildren="自动"
-                unCheckedChildren="手动"
-              />
-            </Space>
-          </MetaItem>
-        ) : null}
+
+        <div className="info-panel">
+          <span className="info-label">时间线</span>
+          <div className="timeline-meta-list">
+            <div className="timeline-meta-row">
+              <span className="meta-key">耗时</span>
+              <span className="meta-value">
+                {elapsed === null ? "尚未开始" : formatDuration(elapsed)}
+              </span>
+            </div>
+            <div className="timeline-meta-row">
+              <span className="meta-key">创建</span>
+              <span className="meta-value">{formatTime(task.createdAt)}</span>
+            </div>
+            <div className="timeline-meta-row">
+              <span className="meta-key">开始</span>
+              <span className="meta-value">{formatTime(task.startedAt)}</span>
+            </div>
+            <div className="timeline-meta-row">
+              <span className="meta-key">结束</span>
+              <span className="meta-value">{formatTime(task.endedAt)}</span>
+            </div>
+          </div>
+          {running ? (
+            <div style={{ marginTop: 14 }}>
+              <span className="info-label" style={{ marginBottom: 6 }}>
+                时间线跟随
+              </span>
+              <div className="follow-switch">
+                <Spin size="small" />
+                <span>执行中</span>
+                <Switch
+                  size="small"
+                  checked={autoFollow}
+                  onChange={onAutoFollowChange}
+                  checkedChildren="自动"
+                  unCheckedChildren="手动"
+                />
+              </div>
+            </div>
+          ) : null}
+        </div>
       </div>
     </div>
   );

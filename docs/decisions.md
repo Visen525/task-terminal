@@ -2,6 +2,15 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M9-01 前端视觉重构（2026-10-24）
+
+- **主题 token 集中在 `src/web/src/theme.ts`，页面局部样式集中在 `styles.css`**：主色 `#4F46E5`、`borderRadius: 10`、`fontSize: 14`、冷灰中性色与系统字体栈只走 ConfigProvider；页面用 `--tt-*` CSS 变量复用同一套色阶，避免每个组件各写一份十六进制。重阴影全部换成 1px `#E5E7EB` 边框 + 极浅底色。
+- **侧边栏 208px 浅色 + 图标菜单，内容区自带标题**：去掉全局 Header，页面标题由 `PageHeader` 组件提供；App 只负责 1080px（对话 860px）居中容器与响应式内边距。设置齿轮仅摆图标，事件留给 M9-02。
+- **看板由 Table 改单列卡片；详情拆三张信息小卡；时间线改左侧竖线节点**：卡片保留 2s 轮询、新建 Modal、分页（12 条/页）与点击打开详情的原有行为；详情保留 SSE、取消/重试、自动跟随开关；时间线仍是虚拟滚动，只替换行结构与字号/间距。
+- **对话与产物库只动表现层**：气泡、头像、三点动画、卡片化输入区、附件占位和产物卡片 hover 都不改 `chatApi.ts` / `artifactApi.ts` 的请求逻辑；发送仍走 24ms 合批与 disabled 逻辑。
+- **构建 chunk 用 `manualChunks` 按职责拆 antd**：`antd-form`（196kB）、`antd-display`（167kB）、`antd-core`（433kB，含 React 公共运行时）、`icons`（14kB）、`markdown`（118kB）、`tanstack`（68kB）；Rolldown 会把 React 合并进 core，但已无 >500kB 单 chunk 告警。
+- **验收备注（未改测试）**：`pnpm verify` 的类型检查在 v1.1 契约提交（a7f5dc34）后已有 30 处 `LlmMessage.content` 联合类型错误，全部位于未改动的 `scripts/verify/m3|m5|m7.test.ts`；运行时 156 条中 154 条通过，剩余 2 条是 M6 的依赖白名单断言尚未包含本卡要求新增的 `@ant-design/icons`。本卡遵守“既有测试不改”的边界，`src/web` 自身类型检查与构建均通过，待 Manager 授权后单独更新测试白名单/断言。
+
 ## M8-01 开源收尾（2026-10-30）
 
 - **README 的快速开始以实际装配为准，而不是照抄 SPEC 的占位值**：端口取 `src/index.ts` 的 `DEFAULT_PORT = 4310` 与 `src/web/vite.config.ts` 的 `5173`；命令名逐条核对 `package.json` 的 `dev` / `verify` / `build`。`pnpm verify` 目前是 156 条测试，全部走假 provider，不要求真实 Key。

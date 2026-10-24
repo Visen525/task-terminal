@@ -17,7 +17,12 @@ import {
   MAIN_TOOL_SPECS,
   type MainToolOptions,
 } from "../../src/agent/main-tools.ts";
-import type { LlmToolCall, Task, TaskEvent } from "../../src/core/types.ts";
+import {
+  llmContentText,
+  type LlmToolCall,
+  type Task,
+  type TaskEvent,
+} from "../../src/core/types.ts";
 import { FakeProvider, type FakeStep } from "../../src/providers/fake.ts";
 import type { ChatParams, LlmProvider } from "../../src/providers/types.ts";
 import { createApp } from "../../src/server/index.ts";
@@ -97,7 +102,7 @@ function contextPrompt(
     ...gathered,
     systemPrompt: MAIN_SYSTEM_PROMPT,
   });
-  return messages.map((message) => message.content).join("\n");
+  return messages.map((message) => llmContentText(message.content)).join("\n");
 }
 
 function factKeys(prompt: string): string[] {
@@ -298,7 +303,7 @@ test("M5-01 remember→recall：同 key 新值取代旧值，recall 只命中当
     // 第二次 provider 调用的最后一条 tool 消息就是 recall 的返回值。
     const firstRecallMessage = first.calls[2]?.messages.at(-1);
     assert.equal(firstRecallMessage?.role, "tool");
-    assert.match(firstRecallMessage?.content ?? "", /Asia\/Shanghai/u);
+    assert.match(llmContentText(firstRecallMessage?.content ?? ""), /Asia\/Shanghai/u);
 
     const current = recallFacts(fixture.db, { query: "timezone" });
     assert.equal(current.length, 1);
@@ -322,8 +327,8 @@ test("M5-01 remember→recall：同 key 新值取代旧值，recall 只命中当
 
     const secondRecallMessage = second.calls[2]?.messages.at(-1);
     assert.equal(secondRecallMessage?.role, "tool");
-    assert.match(secondRecallMessage?.content ?? "", /UTC/u);
-    assert.doesNotMatch(secondRecallMessage?.content ?? "", /Asia\/Shanghai/u);
+    assert.match(llmContentText(secondRecallMessage?.content ?? ""), /UTC/u);
+    assert.doesNotMatch(llmContentText(secondRecallMessage?.content ?? ""), /Asia\/Shanghai/u);
 
     const rows = fixture.db
       .prepare("SELECT * FROM memory_facts ORDER BY rowid ASC")
@@ -436,12 +441,12 @@ test("M5-01 多轮工具循环：create_task → get_task → 失败回喂 → �
 
     // get_task 的返回值包含最近事件摘要。
     const getTaskToolMessage = calls[2]?.messages.at(-1);
-    assert.match(getTaskToolMessage?.content ?? "", /recent_events/u);
+    assert.match(llmContentText(getTaskToolMessage?.content ?? ""), /recent_events/u);
 
     // 失败的 cancel_task 已回喂给模型，下一轮仍继续而不是抛错。
     const beforeFinal = calls[3]?.messages.at(-1);
     assert.equal(beforeFinal?.role, "tool");
-    assert.match(beforeFinal?.content ?? "", /任务不存在/u);
+    assert.match(llmContentText(beforeFinal?.content ?? ""), /任务不存在/u);
     assert.equal(listTasks(fixture.db).length, 1);
   });
 });
@@ -747,13 +752,13 @@ test("M5-02 事实注入：upsertFact 后下一轮 runMainTurn 的 prompt 含 ke
 
     const call = provider.calls[0];
     assert.ok(call !== undefined, "provider 必须被调用");
-    const prompt = call.messages.map((message) => message.content).join("\n");
+    const prompt = call.messages.map((message) => llmContentText(message.content)).join("\n");
     assert.match(prompt, /## 长期事实/u);
     assert.ok(prompt.includes("user.editor"), "prompt 缺少事实 key");
     assert.ok(prompt.includes("Neovim"), "prompt 缺少事实 value");
 
     // 系统消息仍以附录 B 骨架开头，上下文块只是追加。
-    assert.ok(call.messages[0]?.content.startsWith(MAIN_SYSTEM_PROMPT));
+    assert.ok(llmContentText(call.messages[0]?.content ?? "").startsWith(MAIN_SYSTEM_PROMPT));
   });
 });
 
@@ -894,7 +899,7 @@ test("M5-02 对话窗口：15 轮只带最近 12 轮，更早折成一行省略�
       ...gathered,
       systemPrompt: MAIN_SYSTEM_PROMPT,
     });
-    const prompt = messages.map((message) => message.content).join("\n");
+    const prompt = messages.map((message) => llmContentText(message.content)).join("\n");
     const markers = prompt
       .split("\n")
       .filter((line) => line.includes("[已省略"));
@@ -936,7 +941,7 @@ test("M5-02 子智能体上下文：goal+权限卡+父任务≤3条摘要；无 
     assert.deepEqual(upstream, ["父摘要 4", "父摘要 3", "父摘要 2"]);
 
     const childContext = buildAgentContext(child, { upstreamSummaries: upstream });
-    const childPrompt = childContext[0]?.content ?? "";
+    const childPrompt = llmContentText(childContext[0]?.content ?? "");
     assert.match(childPrompt, /整理父任务产物/u, "缺少子任务 goal");
     assert.match(childPrompt, /read-only（只读）/u, "缺少权限卡");
     assert.match(childPrompt, /## 上游任务产物摘要/u);
@@ -952,9 +957,11 @@ test("M5-02 子智能体上下文：goal+权限卡+父任务≤3条摘要；无 
       workspace: fixture.workspace,
     });
     assert.deepEqual(gatherAgentContext(fixture.db, orphan), []);
-    const orphanPrompt = buildAgentContext(orphan, {
-      upstreamSummaries: gatherAgentContext(fixture.db, orphan),
-    })[0]?.content ?? "";
+    const orphanPrompt = llmContentText(
+      buildAgentContext(orphan, {
+        upstreamSummaries: gatherAgentContext(fixture.db, orphan),
+      })[0]?.content ?? "",
+    );
     assert.match(orphanPrompt, /没有父任务/u);
     assert.match(orphanPrompt, /workspace-write（读写）/u);
     assert.doesNotMatch(orphanPrompt, /## 上游任务产物摘要/u);

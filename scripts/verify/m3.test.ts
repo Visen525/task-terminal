@@ -17,7 +17,12 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { ContractError, ERROR_CODES, type ErrorCode } from "../../src/core/errors.ts";
 import { foldEvents } from "../../src/core/fold.ts";
-import type { LlmToolCall, TaskEvent, TokenUsage } from "../../src/core/types.ts";
+import {
+  llmContentText,
+  type LlmToolCall,
+  type TaskEvent,
+  type TokenUsage,
+} from "../../src/core/types.ts";
 import {
   TOOL_SPECS,
   createToolContext,
@@ -1171,8 +1176,8 @@ test("M3-03 三步剧本（文本 → read_file → submit_result）全链路，
       (message) => message.role === "tool" && message.toolCallId === "call_read",
     );
     assert.ok(readToolMessage !== undefined, "第三次调用缺少 read_file 的 tool 结果");
-    assert.ok(readToolMessage.content.includes("月份,金额"));
-    assert.ok(readToolMessage.content.includes("2月,80"));
+    assert.ok(llmContentText(readToolMessage.content).includes("月份,金额"));
+    assert.ok(llmContentText(readToolMessage.content).includes("2月,80"));
 
     // 工具声明包含六件套 + ask_user + submit_result。
     const firstCall = provider.calls[0];
@@ -1483,8 +1488,8 @@ test("M3-03 不变量 e：非法提交回喂重试一次，第二次仍非法返
       (message) => message.role === "tool" && message.toolCallId === "call_bad_1",
     );
     assert.ok(feedback !== undefined, "第一次校验失败未回喂模型");
-    assert.ok(feedback.content.includes("findings"));
-    assert.ok(feedback.content.includes("只允许再重试一次"));
+    assert.ok(llmContentText(feedback.content).includes("findings"));
+    assert.ok(llmContentText(feedback.content).includes("只允许再重试一次"));
 
     const events = taskEvents(fixture, task);
     assert.equal(countType(events, "task.completed"), 0);
@@ -1556,8 +1561,8 @@ test("M3-03 run_command 非零退出（E_TOOL_EXIT）回喂后调整，最终 co
       (message) => message.role === "tool" && message.toolCallId === "call_exit",
     );
     assert.ok(feedback !== undefined, "工具失败结果未回喂模型");
-    assert.ok(feedback.content.includes("E_TOOL_EXIT"));
-    assert.ok(feedback.content.includes("command exited with code 3"));
+    assert.ok(llmContentText(feedback.content).includes("E_TOOL_EXIT"));
+    assert.ok(llmContentText(feedback.content).includes("command exited with code 3"));
 
     assert.equal(countType(events, "task.failed"), 0);
     assert.equal(foldEvents(events).status, "completed");
@@ -1650,7 +1655,7 @@ test("M3-03 executeTool 抛 ContractError 时只作为失败工具结果回喂�
       (message) => message.role === "tool" && message.toolCallId === "call_escape",
     );
     assert.ok(feedback !== undefined, "抛出的 ContractError 未回喂模型");
-    assert.ok(feedback.content.includes(ERROR_CODES.E_WORKSPACE_ESCAPE));
+    assert.ok(llmContentText(feedback.content).includes(ERROR_CODES.E_WORKSPACE_ESCAPE));
 
     assert.equal(countType(events, "task.failed"), 0);
     assert.equal(foldEvents(events).status, "completed");
