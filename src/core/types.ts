@@ -133,11 +133,25 @@ export interface LlmToolCall {
   };
 }
 
+/** 多模态内容分片（v1.1）：文本或图片（data URL 或 https）。 */
+export type LlmContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 export interface LlmMessage {
   role: LlmRole;
-  content: string;
+  /** 纯文本，或多模态分片数组（v1.1 起；历史消息建议仅当前轮携带图片以控成本）。 */
+  content: string | readonly LlmContentPart[];
   toolCallId?: string;
   toolCalls?: LlmToolCall[];
+}
+
+/** 提取 content 的纯文本（多模态分片取 text 部分，图片折为占位）。 */
+export function llmContentText(content: LlmMessage['content']): string {
+  if (typeof content === 'string') return content;
+  return content
+    .map((part) => (part.type === 'text' ? part.text : '[图片]'))
+    .join('');
 }
 
 export interface LlmResponse {

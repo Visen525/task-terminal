@@ -188,3 +188,9 @@
 ## M7-01 补记（Manager 接线，2026-10-24）
 
 - DSH 交付本卡时 scheduler.ts 属禁改文件，onBeforeComplete 钩子只在测试直连路径生效；Manager 在验收时补上调度器接线（executeTask 的 runGuardedLoop 增加 onBeforeComplete → persistArtifacts，生产路径用默认 data/artifacts 目录），并追加回归测试「调度路径真实落盘 2 件产物 + 事件顺序」锁定。
+
+## 契约 · v1.1 多模态与图标包（2026-10-24）
+
+- 实测（api-notes 之外）：DeepSeek `/chat/completions` 接受 OpenAI 多模态 content 数组，64x64 纯红 PNG 被正确识别为"红色"（HTTP 200，in≈199 token）。据此 `LlmMessage.content` 扩展为 `string | readonly LlmContentPart[]`，向后兼容（原字符串路径不变）；新增 `llmContentText()` 提取纯文本。
+- `@ant-design/icons` 补入白名单：antd v5 的官方图标伴侣包（antd 自身依赖它，pnpm 严格模式下显式声明才可 import），MIT 纯 JS。
+- 历史轮图片折占位的成本策略：仅当前轮携带真实图片分片。
