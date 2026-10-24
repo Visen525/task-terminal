@@ -28,6 +28,7 @@ import { appendEvent, listEvents, type ListEventsOptions } from '../store/events
 import { recallFacts, upsertFact, type Fact } from '../store/facts.ts';
 import { getTask, listTasks } from '../store/repo.ts';
 import { searchArtifactsRanked } from '../store/search.ts';
+import { getSettings } from '../store/settings.ts';
 import { readArtifactNoteContent } from './artifacts.ts';
 
 /** read_artifact 默认分页大小；M7-01 落正文前返回空串。 */
@@ -540,6 +541,10 @@ export async function executeMainTool(
         if (options.workspace.trim().length === 0) {
           return failure(tool, ERROR_CODES.E_INVALID_ARGUMENT, '未注入默认工作区');
         }
+        // 未显式指定权限时用设置里的「主线派任务默认权限」；
+        // 最终落库前还会由 ops.createTask 按 subagentPermissionCap 钳制。
+        const effectivePermission: PermissionMode =
+          taskPermission ?? getSettings(options.db).mainTaskDefaultPermission;
         const now = options.now?.() ?? Date.now();
         const task = createTask(
           options.db,
@@ -547,7 +552,7 @@ export async function executeMainTool(
             title,
             goal,
             workspace: options.workspace,
-            ...(taskPermission === undefined ? {} : { permission: taskPermission }),
+            permission: effectivePermission,
             now,
           },
           'main',

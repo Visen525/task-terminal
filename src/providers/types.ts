@@ -32,6 +32,14 @@ export interface ChatParams {
   signal?: AbortSignal;
   /** 默认在提供 tools 时为 `auto`。 */
   toolChoice?: ToolChoice;
+  /** 采样温度，映射为 API `temperature`；缺省不发送。 */
+  temperature?: number;
+  /** 核采样，映射为 API `top_p`；缺省不发送。 */
+  topP?: number;
+  /** 最大输出 token，映射为 API `max_tokens`；缺省不发送。 */
+  maxTokens?: number;
+  /** 思考等级，映射为 API `reasoning_effort`；off/缺省不发送。 */
+  reasoningEffort?: 'low' | 'medium' | 'high';
 }
 
 /** 文本增量。 */

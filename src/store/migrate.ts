@@ -7,9 +7,10 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
-const DDL = `
+/** v1 DDL 保持不变；v2 只在文件末尾追加新表，避免旧库升级时重建/改写既有表。 */
+const V1_DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,
   parent_id     TEXT REFERENCES tasks(id),
@@ -131,6 +132,15 @@ CREATE TABLE IF NOT EXISTS llm_calls (
 );
 `;
 
+/** v2：单行 JSON 应用设置（M10-01）。只追加，不改 v1 任何表。 */
+const V2_DDL = `
+CREATE TABLE IF NOT EXISTS app_settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`;
+
 /** 打开（必要时创建）数据库并完成迁移。 */
 export function openDatabase(file: string): DatabaseSync {
   if (file !== ':memory:') {
@@ -159,11 +169,24 @@ export function migrate(db: DatabaseSync): void {
 
   db.exec('BEGIN IMMEDIATE');
   try {
-    db.exec(DDL);
-    db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)').run(
-      SCHEMA_VERSION,
-      Date.now(),
-    );
+    // 按版本逐段执行：v1 库只跑 v2 增量 DDL；新库从 v1 顺序建到最新。
+    if (current < 1) db.exec(V1_DDL);
+    if (current < 2) db.exec(V2_DDL);
+
+    const appliedAt = Date.now();
+    if (current === 0) {
+      db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)').run(
+        SCHEMA_VERSION,
+        appliedAt,
+      );
+    } else {
+      // 沿用“单行当前版本”的既有形态（m0/m1 断言版本记录恰好 1 条）。
+      db.prepare('UPDATE schema_migrations SET version = ?, applied_at = ? WHERE version = ?').run(
+        SCHEMA_VERSION,
+        appliedAt,
+        current,
+      );
+    }
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');

@@ -15,7 +15,7 @@
  */
 import type { DatabaseSync } from 'node:sqlite';
 
-import type { LoopLimits, LoopOutcome, LoopToolContextOptions } from '../agent/loop.ts';
+import type { LoopLimits, LoopOutcome, LoopProviderParams, LoopToolContextOptions } from '../agent/loop.ts';
 import { persistArtifacts } from '../agent/artifacts.ts';
 import type { Task } from '../core/types.ts';
 import type { LlmProvider } from '../providers/types.ts';
@@ -29,9 +29,13 @@ import {
   renewRunLease,
   updateTaskStatus,
 } from '../store/repo.ts';
+import {
+  getSettings,
+  type AppSettings,
+  type RoleModelSettings,
+} from '../store/settings.ts';
 import { reapExpiredRuns } from './reaper.ts';
 import {
-  DEFAULT_DAILY_BUDGET_TOKENS,
   canStartTask,
   runGuardedLoop,
   type DailyBudgetGate,
@@ -59,7 +63,7 @@ export interface SchedulerOptions {
   leaseMs?: number;
   /** 续约间隔；默认 DEFAULT_RENEW_INTERVAL_MS。 */
   renewIntervalMs?: number;
-  /** 全局日预算；默认 DEFAULT_DAILY_BUDGET_TOKENS。 */
+  /** 显式日预算覆盖；未给时每 tick 取 settings.dailyBudgetTokens。 */
   dailyBudgetTokens?: number;
   /** 创建时先跑一次 reaper（启动恢复）；默认 true。 */
   reapOnStart?: boolean;
@@ -102,6 +106,40 @@ function positiveOr(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+type SchedulerLimits = Partial<Omit<LoopLimits, 'maxTokens'>>;
+
+function providerParamsFor(role: RoleModelSettings): LoopProviderParams {
+  return {
+    temperature: role.temperature,
+    topP: role.topP,
+    maxTokens: role.maxTokens,
+    ...(role.thinkingLevel === 'off' ? {} : { reasoningEffort: role.thinkingLevel }),
+  };
+}
+
+/**
+ * 每 tick 用当前 subagent 设置组装 limits；显式注入的 limits 仍可覆盖
+ * providerParams 中的单项（只覆盖出现的字段，不把设置里的其余项丢掉）。
+ */
+function buildSubagentLimits(
+  settings: AppSettings,
+  explicit: SchedulerLimits | undefined,
+): SchedulerLimits {
+  const fromSettings: SchedulerLimits = {
+    model: settings.subagent.model,
+    providerParams: providerParamsFor(settings.subagent),
+  };
+  if (explicit === undefined) return fromSettings;
+  return {
+    ...fromSettings,
+    ...explicit,
+    providerParams: {
+      ...(fromSettings.providerParams ?? {}),
+      ...(explicit.providerParams ?? {}),
+    },
+  };
+}
+
 function toGuardedTask(task: Task): GuardedLoopTask {
   return {
     id: task.id,
@@ -118,7 +156,6 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
   const clock = options.now ?? Date.now;
   const leaseMs = positiveOr(options.leaseMs, DEFAULT_LEASE_MS);
   const renewIntervalMs = positiveOr(options.renewIntervalMs, DEFAULT_RENEW_INTERVAL_MS);
-  const dailyBudgetTokens = options.dailyBudgetTokens ?? DEFAULT_DAILY_BUDGET_TOKENS;
 
   if (options.reapOnStart ?? true) {
     reapExpiredRuns(db, clock());
@@ -130,7 +167,11 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
   let currentAbort: AbortController | null = null;
   let currentTaskId: string | null = null;
 
-  async function executeTask(task: Task): Promise<{ runId: string; outcome: LoopOutcome }> {
+  async function executeTask(
+    task: Task,
+    taskLimits: SchedulerLimits,
+    dailyBudgetTokens: number,
+  ): Promise<{ runId: string; outcome: LoopOutcome }> {
     const attempt = listRuns(db, task.id).length + 1;
     const startedAt = clock();
 
@@ -185,7 +226,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
         db,
         provider,
         task: toGuardedTask(task),
-        ...(limits === undefined ? {} : { limits }),
+        limits: taskLimits,
         ...(ctx === undefined ? {} : { ctx }),
         signal: controller.signal,
         runId: run.id,
@@ -255,13 +296,19 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     const task = listTasks(db, { status: 'queued', limit: 1 })[0];
     if (task === undefined) return { started: false, reason: 'empty' };
 
+    // 每 tick 读一次设置：模型、采样/思考参数与日预算都取当前值。
+    // options.dailyBudgetTokens 是显式注入的测试/装配覆盖；未给时跟随设置。
+    const settings = getSettings(db);
+    const dailyBudgetTokens = options.dailyBudgetTokens ?? settings.dailyBudgetTokens;
+    const taskLimits = buildSubagentLimits(settings, limits);
+
     // 日预算 gate 只读；拒绝时本 tick 直接放弃，insertRun/事件/表都不动。
     const gate = canStartTask(db, clock(), dailyBudgetTokens);
     if (!gate.allowed) return { started: false, reason: 'budget', gate };
 
     // busy 必须在第一次 await 之前置位，保证并发 tick 不会启动第二个任务。
     busy = true;
-    const execution = executeTask(task);
+    const execution = executeTask(task, taskLimits, dailyBudgetTokens);
     currentRun = execution.then(
       () => undefined,
       () => undefined,

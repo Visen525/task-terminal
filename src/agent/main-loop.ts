@@ -33,6 +33,7 @@ import type { TaskCanceller } from '../runtime/ops.ts';
 import { appendEvent } from '../store/events.ts';
 import { insertLlmCall } from '../store/llm-calls.ts';
 import { appendMessage, type MessageAttachment } from '../store/messages.ts';
+import { getSettings, resolveDefaultWorkspace } from '../store/settings.ts';
 import { buildMainContext, gatherMainContext } from './context.ts';
 import {
   executeMainTool,
@@ -124,14 +125,19 @@ export interface RunMainTurnOptions {
   onTaskCreated?: (task: Task) => void | Promise<void>;
   /** cancel_task 的 abort 能力；可省略。 */
   scheduler?: TaskCanceller | null;
-  /** create_task 的默认工作区；默认 process.cwd()。 */
+  /** create_task 的默认工作区；缺省 resolveDefaultWorkspace(db)（settings > env > <repo>/workspace）。 */
   workspace?: string;
   /** note 产物正文根目录；默认 <cwd>/data/artifacts，测试/装配层可注入。 */
   artifactsDir?: string;
   /** 可注入时钟（毫秒时间戳）；默认 Date.now。 */
   now?: () => number;
-  /** 模型名；默认 MAIN_MODEL。 */
+  /** 模型名；缺省取当前设置 main.model。 */
   model?: string;
+  /** 以下四项缺省取当前设置 main.*；调用方显式传入优先。 */
+  reasoningEffort?: 'low' | 'medium' | 'high';
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
   /**
    * 文本增量转发（M6-03）。提供时本轮 provider 调用走 `stream`，
    * 仅在 `done` 后把完整响应交给循环；缺省时仍走 `chat`，保持 M5 行为不变。
@@ -248,7 +254,15 @@ async function requestProviderResponse(
 export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurnResult> {
   const { db, provider } = options;
   const clock = options.now ?? Date.now;
-  const model = options.model ?? MAIN_MODEL;
+  // 每轮对话读一次设置：运行中修改设置后，下一轮立即生效（无需重启）。
+  const roleSettings = getSettings(db).main;
+  const model = options.model ?? roleSettings.model;
+  const reasoningEffort =
+    options.reasoningEffort ??
+    (roleSettings.thinkingLevel === 'off' ? undefined : roleSettings.thinkingLevel);
+  const temperature = options.temperature ?? roleSettings.temperature;
+  const topP = options.topP ?? roleSettings.topP;
+  const maxTokens = options.maxTokens ?? roleSettings.maxTokens;
   const maxToolRounds = normalizeMaxToolRounds(options.maxToolRounds);
   const historyTurns = normalizeHistoryTurns(options.historyLimit);
 
@@ -269,7 +283,7 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
 
   const toolOptions: MainToolOptions = {
     db,
-    workspace: options.workspace ?? process.cwd(),
+    workspace: options.workspace ?? resolveDefaultWorkspace(db),
     ...(options.onTaskCreated === undefined
       ? {}
       : { onTaskCreated: options.onTaskCreated }),
@@ -372,6 +386,10 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
         messages: [...messages],
         tools: MAIN_TOOL_SPECS,
         model,
+        temperature,
+        topP,
+        maxTokens,
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         toolChoice: 'auto',
       };

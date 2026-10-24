@@ -8,8 +8,15 @@
  * SSE 的实时源是 events 表轮询（默认 150ms）：单用户量级足够，且与
  * “事件是唯一真相源”一致；不引入 ws/额外依赖，断点续传只依赖 seq。
  */
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  accessSync,
+  constants as fsConstants,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
+import { join, parse as parsePath, resolve as resolvePath } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 
 import Fastify, {
@@ -28,10 +35,7 @@ import { runMainTurn } from '../agent/main-loop.ts';
 import type { LlmProvider } from '../providers/types.ts';
 import { cancelTask, createTask, retryTask } from '../runtime/ops.ts';
 import type { Scheduler } from '../runtime/scheduler.ts';
-import {
-  DEFAULT_DAILY_BUDGET_TOKENS,
-  getLocalDayRange,
-} from '../runtime/watchdog.ts';
+import { getLocalDayRange } from '../runtime/watchdog.ts';
 import { getArtifact, searchArtifacts } from '../store/artifacts.ts';
 import { deleteFact, listFacts } from '../store/facts.ts';
 import { listEvents, type ListEventsOptions } from '../store/events.ts';
@@ -41,6 +45,12 @@ import {
   listRecentMessages,
 } from '../store/messages.ts';
 import { getTask, listTasks } from '../store/repo.ts';
+import {
+  getSettings,
+  resolveDefaultWorkspace,
+  saveSettings,
+  validateSettingsInput,
+} from '../store/settings.ts';
 import { isUlid } from '../store/ulid.ts';
 import {
   buildChatUserContent,
@@ -64,8 +74,12 @@ export interface SseOptions {
 export interface CreateAppOptions {
   db: DatabaseSync;
   scheduler: Scheduler;
-  /** POST /tasks 未带 workspace 时的默认工作区（由启动装配注入）。 */
-  defaultWorkspace: string;
+  /**
+   * POST /tasks / POST /chat 未带 workspace 时的默认工作区。
+   * 缺省时每次请求走 resolveDefaultWorkspace(db)（settings > env > <repo>/workspace）；
+   * 测试/装配层显式注入时以注入值为准。
+   */
+  defaultWorkspace?: string;
   /**
    * 主线 AI 依赖（M6-03）；缺省时 POST /chat 返回 500。
    * 只注入 provider，db / scheduler / workspace 仍由本层持有。
@@ -84,8 +98,8 @@ const DEFAULT_SSE_PAGE_SIZE = 500;
 const DEFAULT_MESSAGES_LIMIT = 50;
 const RECENT_EVENT_LIMIT = 20;
 const EVENT_PAGE_SIZE = 500;
-/** 设置概览展示的主线模型；模型名由 provider 默认值固定，不在本卡做成可配置。 */
-const SETTINGS_MODEL = 'deepseek-chat';
+/** /fs/browse 单次最多返回的目录数（M10-01）。 */
+const BROWSE_LIMIT = 500;
 
 interface ErrorBody {
   error: { code: string; message: string };
@@ -221,6 +235,42 @@ function positiveOr(value: number | undefined, fallback: number): number {
     : fallback;
 }
 
+/** 目录是否可进入：只做权限探测，不读文件内容。 */
+function canEnterDirectory(path: string): boolean {
+  try {
+    accessSync(path, fsConstants.R_OK | fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 解析 /fs/browse?path=：缺省取 process.cwd() 所在盘根；传入值必须真实存在
+ * 且是目录。错误信息不回显用户路径。
+ */
+function resolveBrowseTarget(raw: unknown): string {
+  if (raw === undefined) return parsePath(process.cwd()).root;
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    invalid('path 必须是非空字符串');
+  }
+  let resolved: string;
+  try {
+    resolved = realpathSync(resolvePath(raw.trim()));
+  } catch {
+    invalid('path 不存在或不可访问');
+  }
+  try {
+    if (!statSync(resolved).isDirectory()) invalid('path 不是目录');
+    // 目录本身可读/可进入才允许列举，避免后续 readdir 才暴露权限问题。
+    accessSync(resolved, fsConstants.R_OK | fsConstants.X_OK);
+  } catch (error) {
+    if (error instanceof ContractError) throw error;
+    invalid('path 不可访问');
+  }
+  return resolved;
+}
+
 function logInfo(message: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ level: 'info', msg: message, ...fields }));
 }
@@ -281,7 +331,17 @@ interface ActiveChatStream {
 }
 
 export function createApp(options: CreateAppOptions): FastifyInstance {
-  const { db, scheduler, defaultWorkspace } = options;
+  const { db, scheduler } = options;
+  const injectedWorkspace = options.defaultWorkspace;
+  /**
+   * 请求时的默认工作区：settings 永远优先；未设置时保留测试/装配注入值，
+   * 最后由 resolveDefaultWorkspace 走 env WORKSPACE_DIR > <repo>/workspace。
+   */
+  const appWorkspace = (): string => {
+    const stored = getSettings(db).workspaceDir;
+    if (stored !== null) return stored;
+    return injectedWorkspace ?? resolveDefaultWorkspace(db);
+  };
   const clock = options.now ?? Date.now;
   const uploadsDir = options.uploadsDir ?? join(process.cwd(), 'data', 'uploads');
   const sseOptions = options.sse ?? {};
@@ -365,7 +425,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       permission = body.permission as PermissionMode;
     }
 
-    const workspace = optionalString(body.workspace, 'workspace') ?? defaultWorkspace;
+    const workspace = optionalString(body.workspace, 'workspace') ?? appWorkspace();
     const now = clock();
 
     const task = createTask(
@@ -463,6 +523,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   });
 
   app.get('/settings/overview', async () => {
+    const settings = getSettings(db);
     const { startMs, endMs } = getLocalDayRange(clock());
     const usage = db
       .prepare(
@@ -487,8 +548,8 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       .get() as unknown as { count: number | bigint } | undefined;
 
     return {
-      model: SETTINGS_MODEL,
-      dailyBudgetTokens: DEFAULT_DAILY_BUDGET_TOKENS,
+      model: settings.main.model,
+      dailyBudgetTokens: settings.dailyBudgetTokens,
       todayUsage: {
         input: Number(usage?.input ?? 0),
         cached: Number(usage?.cached ?? 0),
@@ -500,6 +561,48 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         artifacts: Number(artifactRow?.count ?? 0),
         facts: Number(factRow?.count ?? 0),
       },
+    };
+  });
+
+  // ── 应用设置与目录浏览（M10-01） ─────────────────────────────
+
+  app.get('/settings', async () => getSettings(db));
+
+  app.put('/settings', async (request) => {
+    const body = readJsonBody(request);
+    // 先校验再写：非法字段不落库；错误信息带字段路径（400）。
+    const patch = validateSettingsInput(body);
+    return saveSettings(db, patch, clock());
+  });
+
+  /**
+   * GET /fs/browse?path=：只列目录名与“是否可进入”，不返回文件/文件内容。
+   * 缺省 path 为 process.cwd() 所在盘根；最多 500 条，超出以 truncated 标注。
+   */
+  app.get('/fs/browse', async (request) => {
+    const query = readQuery(request);
+    const target = resolveBrowseTarget(query.path);
+
+    let directories: Array<{ name: string }>;
+    try {
+      directories = readdirSync(target, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => ({ name: entry.name }))
+        .sort((left, right) => left.name.localeCompare(right.name));
+    } catch {
+      invalid('path 不可访问');
+    }
+
+    const page = directories.slice(0, BROWSE_LIMIT);
+    return {
+      path: target,
+      entries: page.map((entry) => ({
+        name: entry.name,
+        enterable: canEnterDirectory(join(target, entry.name)),
+      })),
+      total: directories.length,
+      limit: BROWSE_LIMIT,
+      truncated: directories.length > BROWSE_LIMIT,
     };
   });
 
@@ -644,7 +747,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
               userText: userContent.text,
               userAttachments: saved.map((item) => item.attachment),
             }),
-        workspace: defaultWorkspace,
+        workspace: appWorkspace(),
         signal: controller.signal,
         onTextDelta: (text) => {
           writeDelta(text);

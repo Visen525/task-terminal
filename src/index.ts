@@ -3,7 +3,7 @@
  *
  * 只做装配与生命周期，不写业务逻辑。所有配置可由环境变量覆盖：
  * - PORT          监听端口，默认 4310
- * - WORKSPACE_DIR 默认工作区，默认 <repo>/workspace
+ * - WORKSPACE_DIR 默认工作区（设置 workspaceDir 优先），默认 <repo>/workspace
  * - DATA_DIR      数据目录，默认 <repo>/data
  * - DB_PATH       数据库文件，默认 <DATA_DIR>/task-terminal.db
  * - DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL
@@ -19,6 +19,7 @@ import { reapExpiredRuns } from './runtime/reaper.ts';
 import { createScheduler } from './runtime/scheduler.ts';
 import { createApp } from './server/index.ts';
 import { openDatabase } from './store/migrate.ts';
+import { resolveDefaultWorkspace } from './store/settings.ts';
 
 /** 端口常量；SPEC 未指定端口号，取 4310 并由 PORT 覆盖。 */
 export const DEFAULT_PORT = 4310;
@@ -31,7 +32,6 @@ interface StartupConfig {
   apiKey: string;
   baseUrl: string | undefined;
   model: string | undefined;
-  workspace: string;
   dataDir: string;
   dbPath: string;
 }
@@ -91,7 +91,6 @@ function readConfig(): StartupConfig {
   }
 
   const dataDir = envText('DATA_DIR') ?? join(REPO_ROOT, 'data');
-  const workspace = envText('WORKSPACE_DIR') ?? join(REPO_ROOT, 'workspace');
   const dbPath = envText('DB_PATH') ?? join(dataDir, 'task-terminal.db');
 
   return {
@@ -99,7 +98,6 @@ function readConfig(): StartupConfig {
     apiKey,
     baseUrl: envText('DEEPSEEK_BASE_URL'),
     model: envText('DEEPSEEK_MODEL'),
-    workspace,
     dataDir,
     dbPath,
   };
@@ -111,10 +109,13 @@ function logInfo(message: string, fields: Record<string, unknown> = {}): void {
 
 async function main(): Promise<void> {
   const config = readConfig();
-  mkdirSync(config.workspace, { recursive: true });
 
   const db = openDatabase(config.dbPath);
   try {
+    // 启动装配与每次请求共用同一解析顺序：settings > env WORKSPACE_DIR > <repo>/workspace。
+    const workspace = resolveDefaultWorkspace(db);
+    mkdirSync(workspace, { recursive: true });
+
     // 显式跑一次启动恢复；调度器内不再重复 reap。
     const reaped = reapExpiredRuns(db);
     if (reaped.length > 0) {
@@ -135,7 +136,6 @@ async function main(): Promise<void> {
     const app = createApp({
       db,
       scheduler,
-      defaultWorkspace: config.workspace,
       mainAi: { provider },
     });
 
@@ -164,7 +164,7 @@ async function main(): Promise<void> {
     logInfo('task-terminal listening', {
       url: `http://${DEFAULT_HOST}:${String(config.port)}`,
       db: config.dbPath,
-      workspace: config.workspace,
+      workspace,
     });
   } catch (error) {
     db.close();

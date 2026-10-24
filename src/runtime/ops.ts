@@ -12,7 +12,7 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { ContractError, ERROR_CODES } from '../core/errors.ts';
 import { canTransition } from '../core/state.ts';
-import type { Task } from '../core/types.ts';
+import type { PermissionMode, Task } from '../core/types.ts';
 import { appendEvent } from '../store/events.ts';
 import {
   getTask,
@@ -21,6 +21,7 @@ import {
   updateTaskStatus,
   type NewTaskInput,
 } from '../store/repo.ts';
+import { getSettings } from '../store/settings.ts';
 
 /** 任务创建者：用户从 REST 创建，或主线 AI 通过 create_task 派活。 */
 export type TaskCreationActor = 'user' | 'main';
@@ -59,6 +60,20 @@ function normalizeCancelReason(raw: unknown): string {
 }
 
 /**
+ * createTask 的权限钳制：read-only < workspace-write，结果取请求与上限的较小者。
+ * 未显式给权限时按既有默认 workspace-write 参与钳制（用户 REST 与主线工具同语义）。
+ */
+function clampPermission(
+  db: DatabaseSync,
+  requested: PermissionMode | undefined,
+): PermissionMode {
+  const base: PermissionMode = requested ?? 'workspace-write';
+  const cap = getSettings(db).subagentPermissionCap;
+  if (cap === 'read-only') return 'read-only';
+  return base;
+}
+
+/**
  * 创建任务并写入 task.created + task.queued。
  *
  * 事件顺序与 M4-02 的 POST /tasks 相同：created（actor 由调用方决定）→ queued
@@ -70,7 +85,11 @@ export function createTask(
   actor: TaskCreationActor = 'user',
 ): Task {
   const now = input.now ?? Date.now();
-  const task = insertTask(db, { ...input, now });
+  const task = insertTask(db, {
+    ...input,
+    permission: clampPermission(db, input.permission),
+    now,
+  });
 
   appendEvent(db, {
     taskId: task.id,

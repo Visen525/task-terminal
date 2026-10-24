@@ -433,6 +433,21 @@ export class DeepSeekProvider implements LlmProvider {
       }));
       payload.tool_choice = params.toolChoice ?? "auto";
     }
+    if (params.temperature !== undefined) {
+      payload.temperature = params.temperature;
+    }
+    if (params.topP !== undefined) {
+      payload.top_p = params.topP;
+    }
+    if (params.maxTokens !== undefined) {
+      payload.max_tokens = params.maxTokens;
+    }
+    // off 由上层映射为“不传 reasoningEffort”；适配器再做一次运行时兜底，
+    // 保证显式传入 off（或未来扩展值）也不会发给 API。
+    const reasoningEffort: string | undefined = params.reasoningEffort;
+    if (reasoningEffort !== undefined && reasoningEffort !== 'off') {
+      payload.reasoning_effort = reasoningEffort;
+    }
     return payload;
   }
 

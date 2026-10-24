@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M10-01 设置系统后端（2026-10-24）
+
+- **迁移 v2 只追加 `app_settings` 一段 DDL，版本记录仍沿用单行当前版本**：v1 的 DDL 原样保留，升级时只执行 `current < 2` 的增量；`schema_migrations` 从 1 更新为 2 而不是插入新行，是为了不破坏 m0/m1 已冻结的“版本记录恰好 1 条”断言。设置整份 JSON 存 key='app' 单行，读时与默认值深合并，新增字段不需要再加列或回填。
+- **设置校验在写入前完成，非法值不落库**：枚举/范围错误一次收集成带字段路径的 `E_INVALID_ARGUMENT`（如 `main.temperature`），`workspaceDir` 必须 `fs.realpath` 成功且是目录，保存时存真实绝对路径；坏 JSON 或坏结构读取时抛 `E_INTERNAL`，不静默回退默认值。错误信息不回显用户给的目录，避免把个人路径带进日志/响应。
+- **生效时机是“每轮 / 每 tick”，不是启动时快照**：`runMainTurn` 每轮开头读 `main` 设置，`createScheduler.tick` 每次派任务前读 `subagent` 设置并组装 `LoopLimits.model + providerParams`，日预算 gate 与 watchdog 告警都用同一个当次读数；调用方显式传入的 model/采样参数仍优先，方便测试和特殊轮次覆盖。
+- **权限钳制放在 `runtime/ops.createTask` 单一出口**：`read-only < workspace-write`，取请求与 `subagentPermissionCap` 的较小者；`main-tools` 只在参数缺省时补 `mainTaskDefaultPermission`，最终仍由 ops 钳制。这样 REST 创建与主线派活共用同一语义，`task.created` 事件里的 permission 也是钳制后的值。
+- **`/fs/browse` 只返回目录名与是否可进入**：缺省浏览 `process.cwd()` 所在盘根，最多 500 条并给 `truncated/total`；文件、不存在路径、不可读目录统一 400，错误文案不含本机路径。文件内容与文件名不进入响应，避免把工作区外的个人文件暴露给前端。
+
 ## M9-03 对话附件与引用（2026-10-24）
 
 - **附件校验/落盘集中在 `src/server/uploads.ts`，且在 `reply.hijack()` 之前完成**：数量 ≤5、单个 ≤8MB、总量 ≤16MB、base64 合法性、文件名净化（取 basename、去 `/` `\` 与 Windows 非法字符、≤120 码点）全部先于建流判定，违规统一走全局错误处理器返回 400 JSON；POST /chat 单独把 bodyLimit 提到 64MiB，否则 5×8MB 的 base64 外壳会先被 Fastify 默认 1MiB 拦成 413。写入与读取都做 `resolve` 后的目录包含校验，GET /uploads 只接受 Crockford Base32 的 ULID 前缀，越界/非法 id/文件不存在一律 404，错误信息不含本机路径。

@@ -67,11 +67,21 @@ export const DEFAULT_LOOP_LIMITS = {
   model: 'deepseek-chat',
 } as const;
 
+/** provider 采样/思考参数（M10-01）；与 ChatParams 同名同义。 */
+export interface LoopProviderParams {
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  reasoningEffort?: 'low' | 'medium' | 'high';
+}
+
 export interface LoopLimits {
   maxSteps: number;
   maxTokens: number;
   wallMs: number;
   model: string;
+  /** 透传给每次 provider 调用的采样/思考参数；缺省不发送。 */
+  providerParams?: LoopProviderParams;
 }
 
 export interface LoopTask {
@@ -214,6 +224,9 @@ function normalizeLimits(partial: Partial<LoopLimits> | undefined): LoopLimits {
       typeof modelInput === 'string' && modelInput.trim().length > 0
         ? modelInput
         : DEFAULT_LOOP_LIMITS.model,
+    ...(partial?.providerParams === undefined
+      ? {}
+      : { providerParams: { ...partial.providerParams } }),
   };
 }
 
@@ -500,6 +513,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopOutcome> {
           messages: [...messages],
           tools,
           model: limits.model,
+          ...(limits.providerParams ?? {}),
           signal: controller.signal,
           toolChoice: 'auto',
         });
