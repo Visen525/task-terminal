@@ -92,11 +92,15 @@ export function parseOptionGroups(text: string): OptionGroup[] {
   const groups: OptionGroup[] = [];
   let current: { kind: OptionKind; items: ParsedLine[] } | null = null;
 
+  // 选项内容常带 markdown 强调标记（**加粗** 等），chip 展示与填入前剥掉。
+  const cleanText = (raw: string): string =>
+    raw.replace(/\*\*|__|`/gu, "").replace(/\s+/gu, " ").trim();
+
   const flush = (): void => {
     if (current !== null && current.items.length >= OPTION_MIN_COUNT) {
       groups.push({
         kind: current.kind,
-        items: current.items.map((item) => ({ marker: item.marker, text: item.text })),
+        items: current.items.map((item) => ({ marker: item.marker, text: cleanText(item.text) })),
       });
     }
     current = null;
