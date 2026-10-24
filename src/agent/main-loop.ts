@@ -30,7 +30,8 @@ import {
 import type { TaskCanceller } from '../runtime/ops.ts';
 import { appendEvent } from '../store/events.ts';
 import { insertLlmCall } from '../store/llm-calls.ts';
-import { appendMessage, listRecentMessages } from '../store/messages.ts';
+import { appendMessage } from '../store/messages.ts';
+import { buildMainContext, gatherMainContext } from './context.ts';
 import {
   executeMainTool,
   MAIN_TOOL_SPECS,
@@ -208,13 +209,14 @@ export async function runMainTurn(options: RunMainTurnOptions): Promise<MainTurn
     ts: clock(),
   });
 
-  const history = listRecentMessages(db, Math.max(1, historyTurns * 2));
-  const messages: LlmMessage[] = [{ role: 'system', content: MAIN_SYSTEM_PROMPT }];
-  for (const message of history) {
-    if (message.role === 'user' || message.role === 'assistant') {
-      messages.push({ role: message.role, content: message.content });
-    }
-  }
+  const gathered = gatherMainContext(db, {
+    userMessage: options.userMessage,
+    historyLimit: historyTurns,
+  });
+  const messages: LlmMessage[] = buildMainContext(db, {
+    ...gathered,
+    systemPrompt: MAIN_SYSTEM_PROMPT,
+  });
 
   const usage: MutableUsage = { inputTokens: 0, cachedTokens: 0, outputTokens: 0 };
   const toolTrace: MainToolTraceEntry[] = [];

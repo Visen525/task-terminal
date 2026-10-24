@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M5-02 上下文组装与记忆注入（2026-10-25）
+
+- **组装与采集分离**：`gatherMainContext` 只读库（facts / board / related / history），`buildMainContext` 纯拼接 provider 入参；`main-loop.ts` 只把原来的「系统提示 + 最近历史」两段替换为这两个调用，循环、工具分发、记账、终态收口一行未改，M5-01 的 m5 用例零改动全绿作为行为不变证明。空上下文时系统提示与 `MAIN_SYSTEM_PROMPT` 逐字相同，避免改变既有提示契约。
+- **滑动窗口不做 LLM 摘要（已定偏差）**：超出 12 轮的旧对话只折成一行 `[已省略 N 轮更早对话]`，不额外调用模型。理由是多一次调用换来的摘要收益不抵成本；将来需要时可在 `gatherHistory` 内替换为摘要，属可逆决策。`N` 按 user+assistant 两条一轮计算（15 轮 → 省略 3 轮）。
+- **看板超过 30 个活动任务改为状态汇总**：活动任务 = 非 completed / cancelled（failed 仍可重试，按活动处理）。≤30 时每任务一行 `[id] title | status | 产物 N`，产物数用一条按 task_id 分组的 COUNT 查询；>30 时只输出一行 `[看板汇总] 活动任务 N 个 | queued x | running y …`，不展开 id/title。阈值取 30 是为了在“看板一眼可读”和“不把任务表塞进上下文”之间折中，后续可配置化。
+- **related 的 query 就是最近一条用户消息的前 50 个字符**（按 Unicode 码点截断后 trim），直接交给既有 `searchArtifacts(..., limit=5)`。命中结果只映射 `title` / `summary` / `tags`：path、sha256、findings 与正文全部在 `gatherRelated` 丢弃，正文只能经显式 `read_artifact` 进入上下文。既有 FTS 对中文按 trigram 匹配，因此 query 与摘要需要共享至少 3 字的连续片段；这是检索层现状，不在本卡扩大范围。
+- **子智能体上下文只导出不强接线**：`buildAgentContext` 复用 `prompt.ts` 的 goal/工作区/权限卡，再追加父任务最近 3 条产物 summary；`gatherAgentContext` 在无 parent 或 parent 不存在时返回空。`loop.ts` 本卡未改，接入留给 M6+。
+
 ## M5-01 主线 AI 循环与工具集（2026-10-25）
 
 - **`runtime/ops.ts` 是纯行为等价抽取，不是重写**：把 POST /tasks、cancel、retry 的「insert/事件/表/abort」顺序原样搬进 `createTask` / `cancelTask` / `retryTask`，server 只保留 HTTP 参数整形与响应；取消 reason 的校验也放在 ops 的任务/状态检查之后，保持 M4-02 的 404→409→400 判定顺序。事件顺序、错误码、409 文案、scheduler.cancel 时机全部照 M4-02；m4.test.ts 一字未改全绿即行为不变证明，另加三条 `app.inject` 冒烟（POST /tasks、cancel、retry）锁住路由。

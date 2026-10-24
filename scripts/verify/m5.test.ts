@@ -7,6 +7,12 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { runMainTurn, MAIN_SYSTEM_PROMPT } from "../../src/agent/main-loop.ts";
 import {
+  buildAgentContext,
+  buildMainContext,
+  gatherAgentContext,
+  gatherMainContext,
+} from "../../src/agent/context.ts";
+import {
   executeMainTool,
   MAIN_TOOL_SPECS,
   type MainToolOptions,
@@ -18,8 +24,8 @@ import { createApp } from "../../src/server/index.ts";
 import type { Scheduler } from "../../src/runtime/scheduler.ts";
 import { insertArtifact, searchArtifacts } from "../../src/store/artifacts.ts";
 import { appendEvent, listEvents } from "../../src/store/events.ts";
-import { recallFacts } from "../../src/store/facts.ts";
-import { listRecentMessages } from "../../src/store/messages.ts";
+import { recallFacts, upsertFact } from "../../src/store/facts.ts";
+import { appendMessage, listRecentMessages } from "../../src/store/messages.ts";
 import { openDatabase } from "../../src/store/migrate.ts";
 import {
   finishRun,
@@ -76,6 +82,32 @@ function taskEvents(fixture: Fixture, taskId: string): TaskEvent[] {
 
 function usageOf(inputTokens: number, cachedTokens: number, outputTokens: number) {
   return { inputTokens, cachedTokens, outputTokens, estimated: false };
+}
+
+function contextPrompt(
+  fixture: Fixture,
+  userMessage: string,
+  historyLimit?: number,
+): string {
+  const gathered = gatherMainContext(fixture.db, {
+    userMessage,
+    ...(historyLimit === undefined ? {} : { historyLimit }),
+  });
+  const messages = buildMainContext(fixture.db, {
+    ...gathered,
+    systemPrompt: MAIN_SYSTEM_PROMPT,
+  });
+  return messages.map((message) => message.content).join("\n");
+}
+
+function factKeys(prompt: string): string[] {
+  const header = "## 长期事实";
+  const start = prompt.indexOf(header);
+  assert.notEqual(start, -1, "prompt 缺少长期事实块");
+  const rest = prompt.slice(start + header.length);
+  const end = rest.indexOf("\n## ");
+  const block = end === -1 ? rest : rest.slice(0, end);
+  return [...block.matchAll(/^- (fact\.\d{2}):/gmu)].map((match) => match[1] ?? "");
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -691,3 +723,241 @@ test("M5-01 read_artifact 分页参数：默认 limit=2000，M7 前正文为空"
     assert.match(searched.output, /月度分析/u);
   });
 });
+
+// ════════════════════════════════════════════════════════════════
+// M5-02 上下文组装与记忆注入
+// ════════════════════════════════════════════════════════════════
+
+test("M5-02 事实注入：upsertFact 后下一轮 runMainTurn 的 prompt 含 key 与 value", async () => {
+  await withFixture(async (fixture) => {
+    upsertFact(fixture.db, {
+      key: "user.editor",
+      value: "Neovim",
+      confidence: 0.92,
+      now: 1_000,
+    });
+
+    const provider = new FakeProvider([{ content: "你常用 Neovim。" }]);
+    await runMainTurn({
+      db: fixture.db,
+      provider,
+      userMessage: "我用什么编辑器？",
+      workspace: fixture.workspace,
+    });
+
+    const call = provider.calls[0];
+    assert.ok(call !== undefined, "provider 必须被调用");
+    const prompt = call.messages.map((message) => message.content).join("\n");
+    assert.match(prompt, /## 长期事实/u);
+    assert.ok(prompt.includes("user.editor"), "prompt 缺少事实 key");
+    assert.ok(prompt.includes("Neovim"), "prompt 缺少事实 value");
+
+    // 系统消息仍以附录 B 骨架开头，上下文块只是追加。
+    assert.ok(call.messages[0]?.content.startsWith(MAIN_SYSTEM_PROMPT));
+  });
+});
+
+test("M5-02 事实裁剪：25 条只注入 20 条，置信度降序、同分新者在前", async () => {
+  await withFixture(async (fixture) => {
+    for (let index = 0; index < 25; index += 1) {
+      const key = `fact.${String(index).padStart(2, "0")}`;
+      const confidence = index >= 23 ? 0.95 : 0.1 + index * 0.03;
+      upsertFact(fixture.db, {
+        key,
+        value: `value-${index}`,
+        confidence,
+        now: 1_000 + index,
+      });
+    }
+
+    const prompt = contextPrompt(fixture, "事实裁剪");
+    const keys = factKeys(prompt);
+    assert.equal(keys.length, 20, "长期事实必须恰好注入 20 条");
+
+    const expected = Array.from({ length: 20 }, (_, offset) =>
+      `fact.${String(24 - offset).padStart(2, "0")}`,
+    );
+    assert.deepEqual(keys, expected, "应按置信度降序；0.95 同分时新记录在前");
+
+    for (const omitted of ["fact.00", "fact.01", "fact.02", "fact.03", "fact.04"]) {
+      assert.ok(!prompt.includes(omitted), `低置信度事实 ${omitted} 不应进入 prompt`);
+    }
+  });
+});
+
+test("M5-02 看板：活动任务每任务一行；超过 30 个改为状态汇总", async () => {
+  await withFixture(async (fixture) => {
+    const alpha = insertTask(fixture.db, {
+      title: "任务甲",
+      goal: "看板甲",
+      workspace: fixture.workspace,
+    });
+    const beta = insertTask(fixture.db, {
+      title: "任务乙",
+      goal: "看板乙",
+      workspace: fixture.workspace,
+    });
+    updateTaskStatus(fixture.db, alpha.id, "running");
+    insertArtifact(fixture.db, {
+      taskId: alpha.id,
+      kind: "note",
+      title: "甲产物一",
+      summary: "甲摘要一",
+    });
+    insertArtifact(fixture.db, {
+      taskId: alpha.id,
+      kind: "note",
+      title: "甲产物二",
+      summary: "甲摘要二",
+    });
+
+    let prompt = contextPrompt(fixture, "看板");
+    assert.match(prompt, /## 任务看板/u);
+    assert.ok(
+      prompt.includes(`[${alpha.id}] 任务甲 | running | 产物 2`),
+      "running 任务应占一行且带产物数",
+    );
+    assert.ok(
+      prompt.includes(`[${beta.id}] 任务乙 | queued | 产物 0`),
+      "queued 任务应占一行且带产物数",
+    );
+
+    // 追加 29 个活动任务，总数到 31：不再逐任务展开。
+    for (let index = 0; index < 29; index += 1) {
+      insertTask(fixture.db, {
+        title: `批量任务 ${index}`,
+        goal: "批量看板",
+        workspace: fixture.workspace,
+      });
+    }
+
+    prompt = contextPrompt(fixture, "看板");
+    assert.match(prompt, /\[看板汇总\] 活动任务 31 个/u);
+    assert.match(prompt, /queued 30/u);
+    assert.match(prompt, /running 1/u);
+    assert.ok(!prompt.includes(`[${alpha.id}]`), "汇总模式不得再展开任务 id");
+    assert.ok(!prompt.includes("批量任务 0"), "汇总模式不得再展开任务标题");
+  });
+});
+
+test("M5-02 相关产物：只注入 title+summary+tags，不泄露 path/正文/findings", async () => {
+  await withFixture(async (fixture) => {
+    const task = insertTask(fixture.db, {
+      title: "销售任务",
+      goal: "相关产物检索",
+      workspace: fixture.workspace,
+    });
+    insertArtifact(fixture.db, {
+      taskId: task.id,
+      kind: "file",
+      title: "季度销售复盘",
+      summary: "华东区环比增长 12%",
+      tags: ["销售", "季度"],
+      path: "workspace/report/secret.csv",
+      sha256: "deadbeefdeadbeef",
+      findings: ["正文里的隐藏结论"],
+    });
+
+    const prompt = contextPrompt(fixture, "环比增长");
+    assert.match(prompt, /## 相关产物摘要/u);
+    assert.ok(prompt.includes("季度销售复盘"), "缺少产物 title");
+    assert.ok(prompt.includes("华东区环比增长 12%"), "缺少产物 summary");
+    assert.ok(prompt.includes("销售") && prompt.includes("季度"), "缺少产物 tags");
+
+    assert.ok(!prompt.includes("workspace/report/secret.csv"), "path 不得进入上下文");
+    assert.ok(!prompt.includes("deadbeefdeadbeef"), "sha256 不得进入上下文");
+    assert.ok(!prompt.includes("正文里的隐藏结论"), "findings/正文不得进入上下文");
+  });
+});
+
+test("M5-02 对话窗口：15 轮只带最近 12 轮，更早折成一行省略标记", async () => {
+  await withFixture(async (fixture) => {
+    for (let turn = 1; turn <= 15; turn += 1) {
+      appendMessage(fixture.db, {
+        role: "user",
+        content: `历史问题 ${turn}`,
+        ts: turn * 2,
+      });
+      appendMessage(fixture.db, {
+        role: "assistant",
+        content: `历史回答 ${turn}`,
+        ts: turn * 2 + 1,
+      });
+    }
+
+    const gathered = gatherMainContext(fixture.db, { userMessage: "现在的问题" });
+    assert.equal(gathered.omittedHistoryTurns, 3);
+    assert.equal(gathered.history.length, 24, "窗口应恰好保留 12 轮 = 24 条消息");
+    assert.equal(gathered.history[0]?.content, "历史问题 4");
+
+    const messages = buildMainContext(fixture.db, {
+      ...gathered,
+      systemPrompt: MAIN_SYSTEM_PROMPT,
+    });
+    const prompt = messages.map((message) => message.content).join("\n");
+    const markers = prompt
+      .split("\n")
+      .filter((line) => line.includes("[已省略"));
+    assert.deepEqual(markers, ["[已省略 3 轮更早对话]"]);
+
+    assert.ok(prompt.includes("历史问题 4"), "窗口第一条应保留");
+    assert.ok(prompt.includes("历史回答 15"), "窗口最后一条应保留");
+    const lines = prompt.split("\n");
+    assert.ok(!lines.includes("历史问题 1"), "更早的对话不应进上下文");
+    assert.ok(!lines.includes("历史回答 3"), "更早的对话不应进上下文");
+  });
+});
+
+test("M5-02 子智能体上下文：goal+权限卡+父任务≤3条摘要；无 parent 则只有 goal+权限", async () => {
+  await withFixture(async (fixture) => {
+    const parent = insertTask(fixture.db, {
+      title: "父任务",
+      goal: "产出上游摘要",
+      workspace: fixture.workspace,
+    });
+    const child = insertTask(fixture.db, {
+      parentId: parent.id,
+      title: "子任务",
+      goal: "整理父任务产物",
+      permission: "read-only",
+      workspace: fixture.workspace,
+    });
+
+    for (let index = 1; index <= 4; index += 1) {
+      insertArtifact(fixture.db, {
+        taskId: parent.id,
+        kind: "note",
+        title: `父产物 ${index}`,
+        summary: `父摘要 ${index}`,
+      });
+    }
+
+    const upstream = gatherAgentContext(fixture.db, child);
+    assert.deepEqual(upstream, ["父摘要 4", "父摘要 3", "父摘要 2"]);
+
+    const childContext = buildAgentContext(child, { upstreamSummaries: upstream });
+    const childPrompt = childContext[0]?.content ?? "";
+    assert.match(childPrompt, /整理父任务产物/u, "缺少子任务 goal");
+    assert.match(childPrompt, /read-only（只读）/u, "缺少权限卡");
+    assert.match(childPrompt, /## 上游任务产物摘要/u);
+    for (const summary of upstream) {
+      assert.ok(childPrompt.includes(summary), `缺少上游摘要 ${summary}`);
+    }
+    assert.ok(!childPrompt.includes("父摘要 1"), "上游摘要硬上限为 3 条");
+
+    const orphan = insertTask(fixture.db, {
+      title: "独立任务",
+      goal: "没有父任务",
+      permission: "workspace-write",
+      workspace: fixture.workspace,
+    });
+    assert.deepEqual(gatherAgentContext(fixture.db, orphan), []);
+    const orphanPrompt = buildAgentContext(orphan, {
+      upstreamSummaries: gatherAgentContext(fixture.db, orphan),
+    })[0]?.content ?? "";
+    assert.match(orphanPrompt, /没有父任务/u);
+    assert.match(orphanPrompt, /workspace-write（读写）/u);
+    assert.doesNotMatch(orphanPrompt, /## 上游任务产物摘要/u);
+  });
+});
+
