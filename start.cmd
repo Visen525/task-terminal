@@ -1,9 +1,9 @@
 @echo off
-rem 任务终端 · Windows 一键启动（M14-01）
-rem 双击即用：已在跑则直接打开页面；dist 缺失时首次自动 install+build。
+rem task-terminal Windows launcher (M14-01)
+rem Double-click to run. ASCII-only on purpose: cmd parses batch files in the
+rem OEM codepage, so non-ASCII bytes in control flow break on Chinese systems.
 setlocal
-chcp 65001 >nul
-title 任务终端
+title task-terminal
 cd /d "%~dp0"
 
 set "PORT_NUM=4310"
@@ -11,52 +11,54 @@ set "APP_URL=http://127.0.0.1:%PORT_NUM%/"
 
 where node >nul 2>nul
 if errorlevel 1 (
-  echo [任务终端] 未检测到 Node.js（需要 24+）。请先安装：https://nodejs.org/
+  echo [task-terminal] Node.js not found. Install Node 24+ from https://nodejs.org/
   pause
   exit /b 1
 )
 
-rem 已在运行 → 直接打开页面，不重复起进程。
-powershell -NoProfile -Command "try { (New-Object Net.Sockets.TcpClient).ConnectAsync('127.0.0.1',%PORT_NUM%).Wait(300) | Out-Null; exit 0 } catch { exit 1 }" >nul 2>nul
+rem Already running: just open the page.
+rem NOTE: TcpClient.ConnectAsync's Task never completes under Windows PowerShell
+rem 5.1 (stays WaitingForActivation), so use the classic BeginConnect pattern.
+powershell -NoProfile -Command "$c = New-Object Net.Sockets.TcpClient; $ar = $c.BeginConnect('127.0.0.1',%PORT_NUM%,$null,$null); $ok = $ar.AsyncWaitHandle.WaitOne(400); if ($ok -and $c.Connected) { exit 0 } else { exit 1 }" >nul 2>nul
 if not errorlevel 1 (
-  echo [任务终端] 已在运行，打开页面…
+  echo [task-terminal] already running, opening %APP_URL%
   start "" "%APP_URL%"
   exit /b 0
 )
 
 if not exist "dist\index.html" (
-  echo [任务终端] 首次启动：安装依赖并构建前端（约 1-2 分钟）…
+  echo [task-terminal] first run: installing deps and building web ui...
   where pnpm >nul 2>nul
   if errorlevel 1 (
-    echo [任务终端] 未检测到 pnpm，先启用 corepack…
+    echo [task-terminal] pnpm not found, enabling corepack...
     call corepack enable
     if errorlevel 1 (
-      echo [任务终端] corepack 启用失败，请手动执行：npm install -g pnpm
+      echo [task-terminal] corepack failed. Run: npm install -g pnpm
       pause
       exit /b 1
     )
   )
   call pnpm install
   if errorlevel 1 (
-    echo [任务终端] 依赖安装失败，请检查网络后重试。
+    echo [task-terminal] pnpm install failed. Check network and retry.
     pause
     exit /b 1
   )
   call pnpm build
   if errorlevel 1 (
-    echo [任务终端] 前端构建失败。
+    echo [task-terminal] build failed.
     pause
     exit /b 1
   )
 )
 
-echo [任务终端] 启动中：%APP_URL%
-rem 延迟 2 秒再开浏览器，等后端完成监听。
+echo [task-terminal] starting at %APP_URL%
+rem Open the browser after the backend finishes listening (~2s).
 start "" cmd /c "timeout /t 2 /nobreak >nul & start %APP_URL%"
 node src\index.ts
 if errorlevel 1 (
   echo.
-  echo [任务终端] 异常退出。端口被占用时可改 .env 里的 PORT。
+  echo [task-terminal] exited with an error. Port busy? Change PORT in .env
   pause
 )
 endlocal
