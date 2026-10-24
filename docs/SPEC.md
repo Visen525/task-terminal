@@ -855,3 +855,5 @@ pnpm verify                  # 确认回到绿
 
 实测备注（2026-10-24）：`reasoning_effort` 参数当前 API 接受；`deepseek-reasoner` 已支持 function calling（附录 A 旧限制按"以实测为准"条款更新；reasoner 消耗更高 token，UI 需提示）。
 | M10-05 | 提示词编辑与模型预设 | 设置新增主线系统提示词（可编辑/恢复默认，≤8000 字，空=用内置默认；mainSystemPrompt）；模型预设补 deepseek-flash（chat/flash/reasoner/自定义） |
+| M11-01 | DeepSeek 官方联网工具 | 接入官方 `POST /v1/tools/search` 与 `/v1/tools/fetch`（实测可用；5元/千次成功请求、失败不计费；search 100QPS/fetch 25QPS）。子代理新增 `web_search(query,count?,needContent?)`（count≤20、摘要优先）与 `web_fetch(url)`（≤8192、正文经既有 200KB 截断）工具；apiKey 经 ToolContext 注入；baseUrl 可注入供测试 mock；**每 run 联网调用上限 30 次**（按次计费不在 token 预算内，需独立护栏）；子代理提示补联网规则；主线不加（动手归任务） |
+| M11-02 | 子代理预算放开与上限可调 | LoopLimits.maxTokens 改可选（缺省=无 token 上限）；task.budgetTokens 语义 0=不限（settings.subagent.budgetTokens 默认 0，可设 ≤2,000,000）；**日预算（token）保留为全局护栏不动**；settings.subagent 增 maxSteps（默认 120）与 wallMinutes（默认 60）；设置页三字段 + 模型预设补 deepseek-v4-pro |
