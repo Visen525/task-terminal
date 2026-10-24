@@ -220,3 +220,7 @@
 - 实测（api-notes 之外）：DeepSeek `/chat/completions` 接受 OpenAI 多模态 content 数组，64x64 纯红 PNG 被正确识别为"红色"（HTTP 200，in≈199 token）。据此 `LlmMessage.content` 扩展为 `string | readonly LlmContentPart[]`，向后兼容（原字符串路径不变）；新增 `llmContentText()` 提取纯文本。
 - `@ant-design/icons` 补入白名单：antd v5 的官方图标伴侣包（antd 自身依赖它，pnpm 严格模式下显式声明才可 import），MIT 纯 JS。
 - 历史轮图片折占位的成本策略：仅当前轮携带真实图片分片。
+
+## v1.1 补记（Manager 修复，2026-10-24）
+
+- **历史附件占位语义**：历史轮图片折叠为 `[图片 name：当轮已送达并被查看；历史回放不重发原图，基于它的回答有效]`，并在主线提示加规则 7。起因：实测发现模型会把"当前上下文没有图"误推为"当时也没收到图"，进而撤回自己基于真实图片的有效回答（干净会话双轮实测验证修复有效：发图答色 → 无图追问 → 模型确认"看到了，结论仍作数"）。

@@ -24,7 +24,7 @@ import {
 } from '../core/types.ts';
 import { searchArtifacts } from '../store/artifacts.ts';
 import { recallFacts, type Fact } from '../store/facts.ts';
-import { listRecentMessages, type Message } from '../store/messages.ts';
+import { listRecentMessages, type Message, type MessageAttachment } from '../store/messages.ts';
 import { getTask } from '../store/repo.ts';
 import { buildAgentPrompt } from './prompt.ts';
 
@@ -310,6 +310,24 @@ function formatRelated(related: readonly RelatedArtifactBrief[]): string {
 }
 
 /**
+ * 历史轮的附件折成文字占位：让模型知道"当时看到过图片/文件"，
+ * 避免把基于图片的旧回答误判为无依据（图片本体不重发，控 token）。
+ * 措辞必须明确"当时已送达查看"，否则模型会把占位当成"从未收到"的证据。
+ */
+function appendAttachmentMarks(
+  text: string,
+  attachments: readonly MessageAttachment[] | undefined,
+): string {
+  if (attachments === undefined || attachments.length === 0) return text;
+  const marks = attachments.map((attachment) =>
+    attachment.mime.startsWith('image/')
+      ? `[图片 ${attachment.name}：当轮已送达并被查看；历史回放不重发原图，基于它的回答有效]`
+      : `[附件 ${attachment.name}：当轮内容已内联处理；历史回放不重发原文]`,
+  );
+  return `${text}\n${marks.join(' ')}`;
+}
+
+/**
  * 纯组装：把采集好的块拼成 provider 入参。
  * 空块不输出任何标题，因此没有任何上下文时系统提示与 systemPrompt 逐字相同。
  *
@@ -346,7 +364,10 @@ export function buildMainContext(
   const messages: LlmMessage[] = [{ role: 'system', content: systemContent }];
   for (const message of input.history) {
     if (message.role === 'user' || message.role === 'assistant') {
-      messages.push({ role: message.role, content: message.content });
+      messages.push({
+        role: message.role,
+        content: appendAttachmentMarks(message.content, message.attachments),
+      });
     }
   }
   return messages;
