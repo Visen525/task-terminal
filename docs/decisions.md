@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M10-04 任务进度查看（2026-10-24）
+
+- **进度全部由 `buildTaskProgress` 从 tasks/runs/events 只读推导，不新增表或事件**：状态与预算取任务行，attempt 取最新 run，step/spentTokens 对全量任务事件扫一遍；分页沿用 listEvents 的 500 条一页，避免只看到最近一页而低估步数或 token。
+- **currentTool 用事件 seq 的「调用→结果」配对判定**：扫描到 agent.tool_call 就记为最近调用并把状态置为未收尾，之后出现任意 agent.tool_result 即视为已收尾；再遇到新的 tool_call 会重置，因此旧调用的结果不会误配给更新的未收尾调用。返回值沿用事件 payload 的 `{tool, args_preview}`，截断复用主线既有 clip 与 500 字符上限。
+- **elapsedMs 只认可解释的区间**：running 用注入的 now 减 startedAt；终态用 endedAt 减 startedAt；queued/刚创建/缺 startedAt 或 endedAt 一律 0，负值钳到 0，不拿 createdAt 冒充开始时间。
+- **get_task 只做增量，旧字段保留**：返回体继续带 task 与 recent_events（既有 M5 断言依赖），另加 progress（含 status/attempt/step/maxSteps/currentTool/elapsedMs/spentTokens/budgetTokens/recentEvents）；提示规则 8 要求模型只转述 progress 里的事实，避免把「正在执行」说成具体文件内容。
+- **测试只碰临时库与 FakeProvider**：单测直接构造 started→step→tool_call→tool_result→step→未收尾 tool_call 的事件序列，另覆盖空事件/无 run 的 created 任务与主线 get_task 回喂；不读 .env、不打真 API。
+
 ## M10-03 划选引用与选项 chips（2026-10-24）
 
 - **选区归属靠 assistant 气泡上的 `data-chat-role`，不靠 DOM 结构猜测**：`selectionchange` 与 `mouseup` 都只负责调度一次刷新，真正的判定是 `range.startContainer` 向上找最近气泡、再要求 `range.endContainer` 与 `commonAncestorContainer` 都在同一气泡内。跨气泡、选到用户消息或纯空白选区一律不浮按钮，因此 ReactMarkdown 的多层节点不会造成误判。

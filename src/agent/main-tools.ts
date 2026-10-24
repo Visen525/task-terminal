@@ -30,6 +30,7 @@ import { getTask, listTasks } from '../store/repo.ts';
 import { searchArtifactsRanked } from '../store/search.ts';
 import { getSettings } from '../store/settings.ts';
 import { readArtifactNoteContent } from './artifacts.ts';
+import { buildTaskProgress, clip } from './progress.ts';
 
 /** read_artifact 默认分页大小；M7-01 落正文前返回空串。 */
 export const DEFAULT_ARTIFACT_PAGE_CHARS = 2000;
@@ -74,7 +75,7 @@ export const MAIN_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: 'get_task',
-    description: '查看单个任务的状态，并附带最近 5 条事件摘要。',
+    description: '查任务状态与实时进度（当前步骤/正在执行的工具/耗时/token 预算）',
     parameters: {
       type: 'object',
       properties: {
@@ -235,12 +236,6 @@ interface TaskSummary {
   createdAt: number;
   startedAt: number | null;
   endedAt: number | null;
-}
-
-function clip(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  if (maxChars <= 1) return text.slice(0, maxChars);
-  return `${text.slice(0, maxChars - 1)}…`;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -569,6 +564,11 @@ export async function executeMainTool(
         }
         return success(tool, {
           task: taskSummary(task),
+          progress: buildTaskProgress(
+            options.db,
+            task.id,
+            options.now?.() ?? Date.now(),
+          ),
           recent_events: listRecentTaskEvents(options.db, task.id, RECENT_EVENT_LIMIT),
         });
       }

@@ -15,7 +15,9 @@ import { tmpdir } from "node:os";
 import { join, parse as parsePath } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
-import { runMainTurn } from "../../src/agent/main-loop.ts";
+import { runMainTurn, MAIN_SYSTEM_PROMPT } from "../../src/agent/main-loop.ts";
+import { DEFAULT_LOOP_LIMITS } from "../../src/agent/loop.ts";
+import { buildTaskProgress } from "../../src/agent/progress.ts";
 import { ContractError, ERROR_CODES } from "../../src/core/errors.ts";
 import type { PermissionMode } from "../../src/core/types.ts";
 import { DeepSeekProvider } from "../../src/providers/deepseek.ts";
@@ -26,9 +28,10 @@ import type { Scheduler } from "../../src/runtime/scheduler.ts";
 import { getLocalDayRange } from "../../src/runtime/watchdog.ts";
 import { createApp } from "../../src/server/index.ts";
 import { insertArtifact, searchArtifacts } from "../../src/store/artifacts.ts";
+import { appendEvent } from "../../src/store/events.ts";
 import { insertLlmCall } from "../../src/store/llm-calls.ts";
 import { openDatabase, migrate, SCHEMA_VERSION } from "../../src/store/migrate.ts";
-import { getTask, insertTask, listTasks } from "../../src/store/repo.ts";
+import { getTask, insertRun, insertTask, listTasks, updateTaskStatus } from "../../src/store/repo.ts";
 import {
   DEFAULT_SETTINGS,
   getSettings,
@@ -1099,4 +1102,295 @@ test("M10-03 构建：pnpm build 退出码 0 且 dist/index.html 存在", { time
     `预期 pnpm build 退出码 0，实际 ${String(buildResult.status)}（error=${buildResult.error?.message ?? "none"}）`,
   );
   assert.ok(existsSync(join(root, "dist", "index.html")), "预期 dist/index.html 存在");
+});
+
+// ════════════════════════════════════════════════════════════════
+// 验收 13：M10-04 buildTaskProgress 结构化进度
+// ════════════════════════════════════════════════════════════════
+
+test("M10-04 buildTaskProgress：事件序列推导步数/未收尾工具/token，终态耗时固定且工具清空", async () => {
+  await withDb((db) => {
+    const workspace = tempDir("task-terminal-m10-progress-ws-");
+    try {
+      const task = createTask(
+        db,
+        { title: "慢任务", goal: "验证结构化进度", workspace, now: 1_000 },
+        "main",
+      );
+      updateTaskStatus(db, task.id, "running", { now: 1_100 });
+      insertRun(db, { taskId: task.id, attempt: 1, now: 1_100 });
+
+      appendEvent(db, {
+        taskId: task.id,
+        type: "task.started",
+        actor: "system",
+        payload: { attempt: 1 },
+        ts: 1_100,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.step",
+        actor: "agent",
+        payload: { step_no: 1 },
+        ts: 1_200,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "llm.call",
+        actor: "system",
+        payload: { model: "deepseek-chat", in: 100, cached: 30, out: 20, ms: 10 },
+        ts: 1_250,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.tool_call",
+        actor: "agent",
+        payload: { tool: "read_file", args_preview: '{"path":"a.txt"}' },
+        ts: 1_300,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.tool_result",
+        actor: "system",
+        payload: { ok: true, preview: "读取成功", ms: 5 },
+        ts: 1_400,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "llm.call",
+        actor: "system",
+        payload: { model: "deepseek-chat", in: 50, cached: 0, out: 10, ms: 8 },
+        ts: 1_450,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.step",
+        actor: "agent",
+        payload: { step_no: 2 },
+        ts: 1_500,
+      });
+      const longArgs = "x".repeat(600);
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.tool_call",
+        actor: "agent",
+        payload: { tool: "run_command", args_preview: longArgs },
+        ts: 1_600,
+      });
+
+      const running = buildTaskProgress(db, task.id, 5_000);
+      assert.equal(running.status, "running");
+      assert.equal(running.attempt, 1, "预期 attempt 取最新 run");
+      assert.equal(running.step, 2, "预期 step 取最大 agent.step.step_no");
+      assert.equal(running.maxSteps, DEFAULT_LOOP_LIMITS.maxSteps);
+      assert.deepEqual(running.currentTool, {
+        tool: "run_command",
+        args_preview: `${"x".repeat(499)}…`,
+      }, "预期未收尾工具按 args_preview 截断后返回");
+      assert.equal(running.elapsedMs, 3_900, "预期 running 用 now - startedAt");
+      assert.equal(running.spentTokens, 180, "预期 llm.call 的 in+out 累计，cached 不重复计");
+      assert.equal(running.budgetTokens, 120_000);
+      assert.equal(running.recentEvents.length, 5, "预期只保留最近 5 条事件");
+      assert.equal(running.recentEvents.at(-1)?.type, "agent.tool_call");
+      assert.match(running.recentEvents.at(-1)?.summary ?? "", /run_command/u);
+
+      // 补上未收尾调用的结果并用终态收口：耗时固定为 endedAt-startedAt，工具清空。
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.tool_result",
+        actor: "system",
+        payload: { ok: true, preview: "命令完成", ms: 7_300 },
+        ts: 8_900,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "task.completed",
+        actor: "agent",
+        payload: { result_json: { summary: "完成" } },
+        ts: 9_000,
+      });
+      updateTaskStatus(db, task.id, "completed", { now: 9_000 });
+
+      const completed = buildTaskProgress(db, task.id, 99_999);
+      assert.equal(completed.status, "completed");
+      assert.equal(completed.elapsedMs, 7_900, "预期终态耗时不随 now 变化");
+      assert.equal(completed.currentTool, null, "预期最近调用已有结果时 currentTool=null");
+      assert.equal(completed.step, 2, "预期终态仍保留已执行步数");
+      assert.equal(completed.recentEvents.at(-1)?.type, "task.completed");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
+test("M10-04 buildTaskProgress：刚创建、无 run/过程事件的任务返回安全零值", async () => {
+  await withDb((db) => {
+    const workspace = tempDir("task-terminal-m10-progress-empty-ws-");
+    try {
+      const task = createTask(
+        db,
+        { title: "刚创建", goal: "验证空进度", workspace, now: 1_000 },
+        "main",
+      );
+
+      const progress = buildTaskProgress(db, task.id, 4_000);
+      assert.equal(progress.status, "queued");
+      assert.equal(progress.attempt, 0, "预期无 run 时 attempt=0");
+      assert.equal(progress.step, 0);
+      assert.equal(progress.currentTool, null);
+      assert.equal(progress.elapsedMs, 0);
+      assert.equal(progress.spentTokens, 0);
+      assert.equal(progress.budgetTokens, 120_000);
+      assert.deepEqual(
+        progress.recentEvents.map((event) => event.type),
+        ["task.created", "task.queued"],
+        "预期只摘要创建与入队事件，不抛错",
+      );
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
+test("M10-04 buildTaskProgress：取消时未收尾的 tool_call 不算「正在执行」", async () => {
+  await withDb((db) => {
+    const workspace = tempDir("task-terminal-m10-progress-cancel-ws-");
+    try {
+      const task = createTask(
+        db,
+        { title: "取消中的任务", goal: "验证终态门槛", workspace, now: 10_000 },
+        "main",
+      );
+      updateTaskStatus(db, task.id, "running", { now: 10_100 });
+      insertRun(db, { taskId: task.id, attempt: 1, now: 10_100 });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.step",
+        actor: "agent",
+        payload: { step_no: 1 },
+        ts: 10_200,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.tool_call",
+        actor: "agent",
+        payload: { tool: "run_command", args_preview: '{"argv":["node","-e","1"]}' },
+        ts: 10_300,
+      });
+      // 取消守卫会跳过 tool_result：事件流里这条调用永远没有配对结果。
+      appendEvent(db, {
+        taskId: task.id,
+        type: "task.cancelled",
+        actor: "user",
+        payload: { reason: "手测取消" },
+        ts: 12_000,
+      });
+      updateTaskStatus(db, task.id, "cancelled", { now: 12_000 });
+
+      const progress = buildTaskProgress(db, task.id, 20_000);
+      assert.equal(progress.status, "cancelled");
+      assert.equal(progress.currentTool, null, "预期终态即使有未配对调用也不算正在执行");
+      assert.equal(progress.elapsedMs, 1_900, "预期终态耗时固定");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
+test("M10-04 主线 get_task：假 provider 询问进度 → 工具被调且回喂 progress", async () => {
+  await withDb(async (db) => {
+    const workspace = tempDir("task-terminal-m10-progress-main-ws-");
+    try {
+      const task = createTask(
+        db,
+        { title: "后台慢任务", goal: "验证主线转述进度", workspace, now: 1_000 },
+        "main",
+      );
+      updateTaskStatus(db, task.id, "running", { now: 2_000 });
+      insertRun(db, { taskId: task.id, attempt: 1, now: 2_000 });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.step",
+        actor: "agent",
+        payload: { step_no: 1 },
+        ts: 2_100,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "agent.tool_call",
+        actor: "agent",
+        payload: {
+          tool: "run_command",
+          args_preview: '{"argv":["node","-e","setTimeout(()=>{},5000)"]}',
+        },
+        ts: 2_200,
+      });
+      appendEvent(db, {
+        taskId: task.id,
+        type: "llm.call",
+        actor: "system",
+        payload: { model: "deepseek-chat", in: 30, cached: 0, out: 10, ms: 12 },
+        ts: 2_300,
+      });
+
+      const provider = new FakeProvider([
+        toolStep("call_get_progress", "get_task", { task_id: task.id }),
+        {
+          content:
+            "那个任务正在第 1 步（共 30 步），正在执行 run_command，已耗时 8 秒，token 已用 40 / 120000。",
+        },
+      ]);
+      const result = await runMainTurn({
+        db,
+        provider,
+        userMessage: "那个任务现在怎么样了",
+        workspace,
+        now: () => 10_000,
+      });
+
+      const trace = result.toolTrace.find((entry) => entry.tool === "get_task");
+      assert.ok(trace !== undefined, "预期主线调用 get_task");
+      assert.equal(trace.ok, true);
+      const toolPayload = asRecord(JSON.parse(trace.output) as unknown, "get_task output");
+      const progress = asRecord(toolPayload.progress, "progress");
+      assert.equal(progress.status, "running");
+      assert.equal(progress.attempt, 1);
+      assert.equal(progress.step, 1);
+      assert.equal(progress.maxSteps, 30);
+      assert.deepEqual(progress.currentTool, {
+        tool: "run_command",
+        args_preview: '{"argv":["node","-e","setTimeout(()=>{},5000)"]}',
+      });
+      assert.equal(progress.elapsedMs, 8_000);
+      assert.equal(progress.spentTokens, 40);
+      assert.equal(progress.budgetTokens, 120_000);
+      assert.equal(asArray(progress.recentEvents, "progress.recentEvents").length, 5);
+
+      const toolMessage = provider.calls[1]?.messages.at(-1);
+      assert.equal(toolMessage?.role, "tool");
+      assert.match(String(toolMessage?.content ?? ""), /"progress"/u);
+      assert.match(result.reply, /第 1 步/u);
+      assert.match(result.reply, /run_command/u);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
+test("M10-04 主线提示：规则 8 要求询问进度时调用 get_task 并转述 progress", () => {
+  assert.ok(
+    MAIN_SYSTEM_PROMPT.includes(
+      "8. 用户询问任务进展/进度/执行到哪了时，调用 get_task 并向用户转述 progress",
+    ),
+    "预期系统提示包含规则 8",
+  );
+  for (const marker of [
+    "第几步/共几步",
+    "正在执行的工具",
+    "已耗时",
+    "token 消耗占预算",
+    "不要编造未在 progress 里的细节",
+  ]) {
+    assert.ok(MAIN_SYSTEM_PROMPT.includes(marker), `预期规则 8 包含 ${marker}`);
+  }
 });
