@@ -2,6 +2,15 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M6-02 执行时间线（2026-10-26）
+
+- **SSE 用命名事件 + `addEventListener`，不是只写 `onmessage`**：M4-02 的帧是 `event: <type>` + `data: <payload>`，浏览器不会把命名事件派发给 `onmessage`；因此对 SPEC §4.4 的 15 种类型逐个注册监听，同时保留 `onmessage` 兜底未命名帧。线上帧不含 `actor`/`ts`，增量事件按类型推导 actor、时间戳取接收时刻；首屏历史来自 `GET /tasks/:id`，字段完整。
+- **`GET /tasks/:id` 只给最近 20 条，刷新后靠“历史回填流”补齐**：首次 GET 后从 `after=0` 再开一条 EventSource，按 seq 去重地把更早历史灌入同一缓冲，到达首屏最大 seq 后关闭；实时流仍按任务卡要求从 `after=<maxSeq>` 开始。这样 100+ 事件刷新页面仍完整，且不必改后端分页契约。
+- **合批用 24ms `setTimeout` + Map 缓冲，每 flush 只一次 `setState`**：SSE 回调只做解析与 `enqueueEvent`；pending 达到 1000 条时同步强刷，避免后台标签页定时器停摆造成无限堆积。选定时器而不是 rAF，是因为后台标签页中 rAF 会暂停而 SSE 仍可能到达。
+- **断线重连先 GET、再从“断线前游标”重开流**：GET 补任务状态与最近事件；重开 URL 用断线前记录的 SSE 游标（`resumeAfter`），而不是 GET 返回的最近最大 seq——后者在断线超过 20 条事件时会造成中间空洞。重放区间靠 seq 去重，做到不丢不重；GET 合并只改 UI，不推进游标。
+- **虚拟列表用 `useVirtualizer` + `measureElement` 动态测高**：Markdown、工具预览、折叠 payload 的行高差异大，固定行高会截断；`overscan: 8` 下 100+ 事件只挂载可视行与少量缓冲行。自动跟随以“距底部 ≤48px”判定，用户上翻后新事件不再抢滚动，重新打开开关或手动回底才恢复。
+- **取消/重试放在新的 `taskActions.ts`，不改 M6-01 的 `api.ts`**：详情页专属动作独立成文件，继续只用相对路径；`react-markdown` 不启用 raw HTML，避免事件 payload 里的内容变成可执行 HTML。
+
 ## M6-01 前端骨架与任务看板（2026-10-25）
 
 - **Vite root 固定在 `src/web`，并给 `src/web` 独立 tsconfig**：根 tsconfig 的 `include` 是后端/脚本的 `src/**/*.ts`，若 web 的 `.tsx` 落进来，后端类型检查会因缺 JSX/DOM 配置而红。根 tsconfig 用 `"exclude": ["src/web", "node_modules", "dist"]` 隔离；web tsconfig 单独启用 `jsx: react-jsx`、DOM lib、Bundler 解析和 `noEmit`，`typecheck` 串行跑两份配置。Vite 配置用 `import.meta.url` 定位自身目录，避免写死本机路径；CLI 加 `--configLoader native`，由 Node 24 直接执行 TS 配置，跳过 Rolldown 再打包配置（受限 Windows 环境下那一步会触发 `spawn EPERM`，也与“Node 24 原生跑 TS”的仓库风格一致）。

@@ -80,6 +80,8 @@ test("M6-01 依赖：dependencies/devDependencies 逐项限定在白名单内", 
     "react-dom",
     "antd",
     "@tanstack/react-query",
+    "@tanstack/react-virtual",
+    "react-markdown",
   ]);
   const allowedDevDependencies = new Set([
     "@types/node",
@@ -190,7 +192,7 @@ test("M6-01 scripts：dev/dev:web/build/typecheck/verify:m6 注册正确", () =>
 
 // ── 6. 构建 ─────────────────────────────────────────────────────
 
-test("M6-01 构建：pnpm build 退出码 0 且 dist/index.html 存在", { timeout: 240_000 }, () => {
+test("M6-01/M6-02 构建：pnpm build 退出码 0 且 dist/index.html 存在", { timeout: 240_000 }, () => {
   const buildResult =
     process.platform === "win32"
       ? spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "pnpm build"], {
@@ -210,4 +212,120 @@ test("M6-01 构建：pnpm build 退出码 0 且 dist/index.html 存在", { timeo
     `预期 pnpm build 退出码 0，实际 ${String(buildResult.status)}（error=${buildResult.error?.message ?? "none"}）`,
   );
   assert.ok(existsSync(join(root, "dist", "index.html")), "预期 dist/index.html 存在");
+});
+
+// ── 7. M6-02 新增依赖 ───────────────────────────────────────────
+
+test("M6-02 依赖：仅新增 @tanstack/react-virtual 与 react-markdown，lockfile 已同步", () => {
+  const pkg = readJson("package.json");
+  const dependencies = asRecord(pkg.dependencies, "package.json dependencies");
+
+  for (const name of ["@tanstack/react-virtual", "react-markdown"]) {
+    assert.ok(
+      name in dependencies,
+      `预期 dependencies 包含 ${name}，实际 ${JSON.stringify(Object.keys(dependencies))}`,
+    );
+    const version = requireString(dependencies, name, "package.json dependencies");
+    assert.ok(version.length > 0, `预期 ${name} 有版本号，实际空字符串`);
+  }
+
+  const lock = read("pnpm-lock.yaml");
+  assert.ok(lock.includes("react-markdown@"), "预期 pnpm-lock.yaml 含 react-markdown 解析记录");
+  assert.ok(
+    lock.includes("@tanstack/react-virtual@"),
+    "预期 pnpm-lock.yaml 含 @tanstack/react-virtual 解析记录",
+  );
+});
+
+// ── 8. M6-02 文件与虚拟列表 ─────────────────────────────────────
+
+test("M6-02 文件：useTaskEvents / EventTimeline / TaskHeader 拆包存在", () => {
+  for (const path of [
+    "src/web/src/hooks/useTaskEvents.ts",
+    "src/web/src/components/EventTimeline.tsx",
+    "src/web/src/components/TaskHeader.tsx",
+    "src/web/src/taskActions.ts",
+  ]) {
+    assert.ok(existsSync(join(root, path)), `预期文件存在：${path}`);
+  }
+
+  const timeline = read("src/web/src/components/EventTimeline.tsx");
+  assert.ok(
+    timeline.includes("useVirtualizer"),
+    "预期 EventTimeline 使用 @tanstack/react-virtual 的 useVirtualizer",
+  );
+  assert.ok(
+    timeline.includes("measureElement"),
+    "预期 EventTimeline 用 measureElement 支持动态行高",
+  );
+  assert.ok(
+    timeline.includes("getVirtualItems"),
+    "预期 EventTimeline 只渲染 virtualItems（真实虚拟化）",
+  );
+  for (const marker of ["agent.message", "agent.tool_call", "agent.tool_result", "llm.call"]) {
+    assert.ok(timeline.includes(marker), `预期 EventTimeline 渲染 ${marker}`);
+  }
+  assert.ok(timeline.includes("ReactMarkdown"), "预期 agent.message 用 react-markdown 渲染");
+  assert.ok(timeline.includes("<details"), "预期 payload JSON 用 details 折叠");
+  assert.ok(timeline.includes("缓存命中"), "预期 llm.call 对缓存命中做绿色标注");
+
+  const detail = read("src/web/src/pages/TaskDetail.tsx");
+  assert.ok(detail.includes("useTaskEvents"), "预期 TaskDetail 接入 useTaskEvents");
+  assert.ok(detail.includes("EventTimeline"), "预期 TaskDetail 渲染 EventTimeline");
+  assert.ok(detail.includes("TaskHeader"), "预期 TaskDetail 渲染 TaskHeader");
+  assert.ok(detail.includes("cancelTask"), "预期 TaskDetail 接入取消动作");
+  assert.ok(detail.includes("retryTask"), "预期 TaskDetail 接入重试动作");
+  assert.ok(!detail.includes("JSON.stringify"), "预期详情页不再直出 JSON 占位");
+});
+
+// ── 9. M6-02 SSE 缓冲与断线重连 ─────────────────────────────────
+
+test("M6-02 useTaskEvents：SSE onmessage 只入缓冲，24ms flush 一次 setState（上限 1000）", () => {
+  const source = read("src/web/src/hooks/useTaskEvents.ts");
+
+  assert.ok(source.includes("new EventSource("), "预期使用 EventSource 接收增量事件");
+  assert.ok(source.includes("addEventListener"), "预期注册 SPEC 事件名的命名事件监听");
+  assert.ok(source.includes("SSE_EVENT_TYPES"), "预期维护事件类型白名单");
+  assert.match(source, /FLUSH_INTERVAL_MS\s*=\s*24/, "预期合批窗口为 24ms（16–32ms 之间）");
+  assert.match(source, /MAX_BUFFERED_EVENTS\s*=\s*1000/, "预期缓冲上限 1000 条后强制 flush");
+  assert.ok(
+    source.includes("FLUSH_INTERVAL_MS") && source.includes("setTimeout"),
+    "预期用 setTimeout 触发 flush，而不是每条事件立即渲染",
+  );
+
+  const onMessageStart = source.indexOf("source.onmessage");
+  assert.ok(onMessageStart >= 0, "预期存在 source.onmessage 处理器");
+  const onMessageEnd = source.indexOf("};", onMessageStart);
+  assert.ok(onMessageEnd > onMessageStart, "预期能定位 onmessage 代码块");
+  const onMessageBlock = source.slice(onMessageStart, onMessageEnd + 2);
+  assert.ok(
+    onMessageBlock.includes("enqueueEvent"),
+    `预期 onmessage 把事件放入缓冲（enqueueEvent），实际：${onMessageBlock}`,
+  );
+  assert.ok(
+    !onMessageBlock.includes("setEvents"),
+    `预期 onmessage 不直接 setEvents，实际：${onMessageBlock}`,
+  );
+
+  const flushStart = source.indexOf("const flushBuffer");
+  assert.ok(flushStart >= 0, "预期存在 flushBuffer");
+  const flushEnd = source.indexOf("}, []);", flushStart);
+  assert.ok(flushEnd > flushStart, "预期能定位 flushBuffer 代码块");
+  const flushBlock = source.slice(flushStart, flushEnd);
+  const setEventsCalls = flushBlock.match(/setEvents\(/g) ?? [];
+  assert.equal(
+    setEventsCalls.length,
+    1,
+    `预期每次 flush 只调用一次 setEvents，实际 ${setEventsCalls.length} 次`,
+  );
+
+  assert.match(source, /\/events\?after=\$\{/, "预期 EventSource URL 携带 after 游标");
+  assert.ok(source.includes("taskId=${encodeURIComponent(taskId)}"), "预期 SSE URL 带 taskId 过滤");
+  assert.ok(source.includes("cursorRef"), "预期用游标记录最大 seq");
+  assert.ok(source.includes("getTaskDetail(taskId)"), "预期断线重连前先 GET 补漏");
+  assert.ok(
+    source.includes("source.close()") || source.includes("liveSource?.close()"),
+    "预期卸载/重连时关闭 EventSource",
+  );
+  assert.ok(source.includes("scheduleReconnect"), "预期 onerror 触发自定义重连流程");
 });
