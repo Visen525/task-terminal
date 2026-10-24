@@ -854,3 +854,4 @@ pnpm verify                  # 确认回到绿
 | M10-04 | 任务进度查看 | 主线 get_task 返回结构化进度（当前步/正在执行的工具/耗时/token 对预算/attempt/最近事件）+ 提示规则：询问进度时调用并转述 |
 
 实测备注（2026-10-24）：`reasoning_effort` 参数当前 API 接受；`deepseek-reasoner` 已支持 function calling（附录 A 旧限制按"以实测为准"条款更新；reasoner 消耗更高 token，UI 需提示）。
+| M10-05 | 提示词编辑与模型预设 | 设置新增主线系统提示词（可编辑/恢复默认，≤8000 字，空=用内置默认；mainSystemPrompt）；模型预设补 deepseek-flash（chat/flash/reasoner/自定义） |
