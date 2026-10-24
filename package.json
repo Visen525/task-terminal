@@ -9,22 +9,34 @@
     "node": ">=24"
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json",
-    "verify": "pnpm run typecheck && node --test --test-isolation=none scripts/verify/m0.test.ts scripts/verify/m1.test.ts scripts/verify/m2.test.ts scripts/verify/m3.test.ts scripts/verify/m4.test.ts scripts/verify/m5.test.ts",
+    "dev": "node scripts/dev.ts",
+    "dev:web": "vite --config src/web/vite.config.ts --configLoader native",
+    "build": "vite build --config src/web/vite.config.ts --configLoader native",
+    "typecheck": "tsc -p tsconfig.json && tsc -p src/web/tsconfig.json",
+    "verify": "pnpm run typecheck && node --test --test-isolation=none scripts/verify/m0.test.ts scripts/verify/m1.test.ts scripts/verify/m2.test.ts scripts/verify/m3.test.ts scripts/verify/m4.test.ts scripts/verify/m5.test.ts scripts/verify/m6.test.ts",
     "verify:m0": "node --test --test-isolation=none scripts/verify/m0.test.ts",
     "verify:m1": "node --test --test-isolation=none scripts/verify/m1.test.ts",
     "verify:m2": "node --test --test-isolation=none scripts/verify/m2.test.ts",
     "verify:m3": "node --test --test-isolation=none scripts/verify/m3.test.ts",
     "verify:m4": "node --test --test-isolation=none scripts/verify/m4.test.ts",
     "verify:m5": "node --test --test-isolation=none scripts/verify/m5.test.ts",
+    "verify:m6": "node --test --test-isolation=none scripts/verify/m6.test.ts",
     "format": "prettier --write ."
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^6.1.2",
     "prettier": "^3.3.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vite": "^8.3.5"
   },
   "dependencies": {
-    "fastify": "^5.12.7"
+    "@tanstack/react-query": "^5.104.5",
+    "antd": "^6.6.7",
+    "fastify": "^5.12.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   }
 }

@@ -33,3 +33,6 @@ Thumbs.db
 AI-GUIDE.md
 .dsh-zcode-bridge/
 .zcode-dsh-bridge/
+
+# pnpm 本地存储（DSH 沙箱环境产生，防误入库）
+.pnpm-store/

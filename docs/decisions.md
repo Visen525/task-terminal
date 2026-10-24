@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M6-01 前端骨架与任务看板（2026-10-25）
+
+- **Vite root 固定在 `src/web`，并给 `src/web` 独立 tsconfig**：根 tsconfig 的 `include` 是后端/脚本的 `src/**/*.ts`，若 web 的 `.tsx` 落进来，后端类型检查会因缺 JSX/DOM 配置而红。根 tsconfig 用 `"exclude": ["src/web", "node_modules", "dist"]` 隔离；web tsconfig 单独启用 `jsx: react-jsx`、DOM lib、Bundler 解析和 `noEmit`，`typecheck` 串行跑两份配置。Vite 配置用 `import.meta.url` 定位自身目录，避免写死本机路径；CLI 加 `--configLoader native`，由 Node 24 直接执行 TS 配置，跳过 Rolldown 再打包配置（受限 Windows 环境下那一步会触发 `spawn EPERM`，也与“Node 24 原生跑 TS”的仓库风格一致）。
+- **React 固定 18.x（含 `@types/react` 18）**：任务卡要求 React 18 `createRoot`，也避开 antd 6 在 React 19 下的新行为；antd 6 的 peer 只要求 `>=18`。依赖只新增任务白名单里的 8 个包，`@types/react`/`@types/react-dom` 与运行时同主版本，避免类型漂移。
+- **不引 react-router，用两个 state 做极简路由**：看板/详情只需“当前视图 + 选中任务 id”，M6-03 再评估是否值得引入路由；菜单里的「产物库/对话」保留占位，避免提前扩大依赖面。详情页先直接展示 `GET /tasks/:id` 的 JSON，M6-02 换成时间线。
+- **看板用 TanStack Query 每 2 秒轮询，新建成功后主动 invalidate**：轮询满足“其他入口插入的任务 2 秒内出现”，mutation 成功后再立即失效一次，不必依赖下一次 tick。任务卡说“产物数（如接口有）”，当前 `GET /tasks` 的 Task 没有产物计数字段，因此不展示该列，也不额外拉 `/artifacts` 拼凑不准确的计数。
+- **`pnpm dev` 用 `scripts/dev.ts` 而非 concurrently**：Node 24 原生 `spawn` 同时起 `node src/index.ts` 与 `pnpm dev:web`，`stdio: inherit` 不依赖管道；Ctrl-C/SIGTERM 先 `taskkill /PID <pid> /T /F` 树杀（POSIX 先 SIGTERM，2 秒后 SIGKILL），任一子进程异常退出也会收掉另一个，避免 Windows 留下 cmd/vite 孤儿。前端只走相对路径 `/tasks` 等，代理目标固定为本机 `127.0.0.1:4310`，不读也不碰 `.env`。
+
 ## M5-02 上下文组装与记忆注入（2026-10-25）
 
 - **组装与采集分离**：`gatherMainContext` 只读库（facts / board / related / history），`buildMainContext` 纯拼接 provider 入参；`main-loop.ts` 只把原来的「系统提示 + 最近历史」两段替换为这两个调用，循环、工具分发、记账、终态收口一行未改，M5-01 的 m5 用例零改动全绿作为行为不变证明。空上下文时系统提示与 `MAIN_SYSTEM_PROMPT` 逐字相同，避免改变既有提示契约。
