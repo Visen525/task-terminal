@@ -1,11 +1,20 @@
-# 复制为 config.yaml 后按需修改。config.yaml 不入库（见 .gitignore）。
-# 密钥只走环境变量，不写在这里。
+# 当前版本（v1.0.0）不读取 config.yaml：启动配置来自 .env / 进程环境变量。
+# 实际生效的变量：DEEPSEEK_API_KEY（必填）、PORT、WORKSPACE_DIR、DATA_DIR，
+# 以及可选的 DB_PATH、DEEPSEEK_BASE_URL、DEEPSEEK_MODEL。
+# 等价的 .env 示例（实际入口，相对路径以启动目录为准）：
+#   DEEPSEEK_API_KEY=<your-key>
+#   PORT=4310
+#   WORKSPACE_DIR=./workspace
+#   DATA_DIR=./data
+# 下面保留计划中的 YAML 配置形状；每节标注「计划中，当前未生效」。
+# 复制为 config.yaml 也不会被当前版本读取；config.yaml 不入库（见 .gitignore）。
+# 密钥只走环境变量，不要写在这个文件里。
 
-server:
+server: # 计划中，当前未生效；实际固定监听 127.0.0.1，端口用 PORT（默认 4310）
   host: 127.0.0.1
-  port: 4317
+  port: 4310 # 与 PORT 的默认值一致
 
-model:
+model: # 计划中，当前未生效；实际用 DEEPSEEK_BASE_URL / DEEPSEEK_MODEL，适配器固定为 deepseek
   provider: deepseek
   base_url: https://api.deepseek.com
   chat_model: deepseek-chat
@@ -15,16 +24,16 @@ model:
   first_token_timeout_ms: 30000
 
 # 每百万 token 单价（人民币），按官网价格表更新
-prices:
+prices: # 计划中，当前未生效；当前只记录 usage，不按价格折算金额
   input_per_m: 2.0
   cached_input_per_m: 0.5
   output_per_m: 8.0
 
-workspace:
+workspace: # 计划中，当前未生效；实际默认工作区用 WORKSPACE_DIR（默认 <仓库根>/workspace）
   roots:
     - ./workspace
 
-limits:
+limits: # 计划中，当前未生效；当前为代码内固定值，下列数值与默认值一致
   max_steps_per_task: 30
   max_tokens_per_task: 120000
   max_wall_ms_per_task: 1200000
@@ -33,5 +42,5 @@ limits:
   lease_seconds: 60
   lease_renew_seconds: 15
 
-data:
+data: # 计划中，当前未生效；实际数据目录用 DATA_DIR（默认 <仓库根>/data），数据库路径可用 DB_PATH 覆盖
   dir: ./data

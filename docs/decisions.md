@@ -2,6 +2,13 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M8-01 开源收尾（2026-10-30）
+
+- **README 的快速开始以实际装配为准，而不是照抄 SPEC 的占位值**：端口取 `src/index.ts` 的 `DEFAULT_PORT = 4310` 与 `src/web/vite.config.ts` 的 `5173`；命令名逐条核对 `package.json` 的 `dev` / `verify` / `build`。`pnpm verify` 目前是 156 条测试，全部走假 provider，不要求真实 Key。
+- **`config.example.yaml` 只做核对性修正，不删除既有段落**：启动装配当前只读 `.env` / 进程环境，完全不解析 `config.yaml`；因此不能把示例写成“可用配置”。文件保留 `server` / `model` / `prices` / `workspace` / `limits` / `data` 的 YAML 形状，每节标注「计划中，当前未生效」，并把端口从 4317 修正为实际默认 4310，同时用注释列出实际支持的环境变量（`PORT` / `WORKSPACE_DIR` / `DATA_DIR` 等）。保留段落也避免破坏 M0-01 对关键段落的既有断言。
+- **不新增“配置加载器”来消除文档与实现的落差**：M8-01 的允许范围是文档与配置示例，新增加载器会扩大范围并改变启动契约；把落差写清楚，留给后续任务卡决定是否接线。README 明确 `DATA_DIR` 当前作用于 SQLite 与工具输出，note 产物默认目录仍是启动目录下的 `data/artifacts`。
+- **开源四件套按“可核对”标准写**：LICENSE 用标准 MIT 全文与 `Copyright (c) 2026 Visen525`；CHANGELOG 按 Keep a Changelog 分 1.0.0 / 0.2.0 / 0.1.0；CONTRIBUTING 只保留三条硬要求（附 `pnpm verify` 输出、先读 SPEC/decisions、绝不提交密钥或个人数据）。发布 checklist 与打 tag 留给 Manager。
+
 ## M7-02 长期事实与回访链路（2026-10-29）
 
 - **来源任务同时进搜索与读正文的结构化结果**：`search_artifacts` 每项新增 `source_task_id`（保留既有 `task_id`），`read_artifact` 的 `data` 新增 `source_task_id` 并固定返回 `kind` / `sha256`；note 的 `output` 仍是正文分页，不把元数据混进正文，模型从 `search_artifacts` 结果拿到来源 ID 后再按提示规则引用。主线提示追加第 6 条硬规则：引用产物结论必须带 `source_task_id`，未读原文要注明“根据摘要”。
