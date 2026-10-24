@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "task-terminal:result.schema.json",
+  "title": "submit_result 参数契约（SPEC §4.6 / §4.5 不变量 5 / 附录 B）",
+  "description": "子智能体结束时必须调用 submit_result 且参数通过本 schema 校验，否则任务按 result_invalid 失败。校验通过的整个对象存入 tasks.result_json，并作为 task.completed 事件的 result_json 载荷。",
+  "type": "object",
+  "required": ["summary", "findings", "artifacts"],
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "description": "执行总结。做不到时也必须提交并在 summary 里说明原因（附录 B 规则 3），不许假装完成。"
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 50,
+      "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+      "description": "关键结论列表，每条一句话。"
+    },
+    "artifacts": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["kind", "title", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": ["file", "note", "dataset", "patch"],
+            "description": "产物类型，与 artifacts.kind 列一致（SPEC §4.2）。"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "工作区相对路径；kind=note 可省略（纯结论无文件）。M7-01 据此落盘并算 sha256。"
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "description": "1-3 句产物摘要，只作检索线索，不作事实来源（SPEC §4.2）。"
+          },
+          "tags": {
+            "type": "array",
+            "maxItems": 10,
+            "items": { "type": "string", "minLength": 1, "maxLength": 40 }
+          }
+        }
+      }
+    }
+  }
+}

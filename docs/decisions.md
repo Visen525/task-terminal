@@ -68,3 +68,10 @@
 - **不引 eslint**：`tsc --noEmit` + 验收脚本已覆盖主要问题，少一个配置面就少一处故障。
 - **导入路径一律带 `.ts` 后缀**：这是 Node 原生运行 TypeScript 的要求，也让路径可点击跳转。
 - **只用可擦除语法**：不用 `enum` / `namespace` / 构造器参数属性，否则 Node 无法直接运行。
+
+## 契约 · result.schema.json（2026-10-24，随 M3-03 前置起草）
+
+- **字段只取 SPEC 明确要求的三个**：`summary` / `findings` / `artifacts`（附录 B 子智能体提示规则 2），不发明 status/success 之类字段——"做不到"按附录 B 规则 3 用 summary 表达；真正的失败（异常/超时）走 task.failed 路径，二者不混。
+- **长度上限是防滥用约束**：summary≤4000、findings≤50 条、artifacts≤20 项（kind/title/summary 必填，path 仅 note 可省，tags≤10）。数值为工程默认，无 SPEC 依据，调整需 [contract] 提交。
+- **artifacts.kind 与 tasks 表 §4.2 的四值一致**（file|note|dataset|patch）；path 为工作区相对路径，M7-01 落盘与 sha256 以它为准。
+- **校验实现**：M3-03 用针对本 schema 的专用结构校验器（约百行），不引入 zod、不实现通用 JSON Schema 引擎——契约层保持零依赖哲学（与 node:sqlite/自研 ULID 同一决策线）。
