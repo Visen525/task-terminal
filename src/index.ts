@@ -14,12 +14,18 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { AGENT_TOOL_SPECS } from './agent/loop.ts';
+import { installWebToolSpecs } from './agent/tools/web.ts';
 import { DeepSeekProvider } from './providers/deepseek.ts';
 import { reapExpiredRuns } from './runtime/reaper.ts';
 import { createScheduler } from './runtime/scheduler.ts';
 import { createApp } from './server/index.ts';
 import { openDatabase } from './store/migrate.ts';
 import { resolveDefaultWorkspace } from './store/settings.ts';
+
+// M11-01：官方联网工具只在启动装配层加入子智能体工具表；executeTool 的
+// TOOL_SPECS 仍保持 M3 验收时的六件套，既有断言零改动。
+installWebToolSpecs(AGENT_TOOL_SPECS);
 
 /** 端口常量；SPEC 未指定端口号，取 4310 并由 PORT 覆盖。 */
 export const DEFAULT_PORT = 4310;
@@ -127,10 +133,20 @@ async function main(): Promise<void> {
       ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
       ...(config.model === undefined ? {} : { model: config.model }),
     });
+    // ctx 用变量而不是内联字面量：scheduler 的 LoopToolContextOptions 是
+    // Pick 白名单，运行时靠 ...options.ctx 原样透传 webTools；这样既不改
+    // scheduler，也不把 key 落到任何日志/事件里。
+    const schedulerCtx = {
+      outputDir: join(config.dataDir, 'tool-outputs'),
+      webTools: {
+        apiKey: config.apiKey,
+        ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
+      },
+    };
     const scheduler = createScheduler({
       db,
       provider,
-      ctx: { outputDir: join(config.dataDir, 'tool-outputs') },
+      ctx: schedulerCtx,
       reapOnStart: false,
     });
     const app = createApp({

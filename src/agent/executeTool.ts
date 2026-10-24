@@ -77,6 +77,12 @@ const SECRET_KEY_RE = /api[-_]?key|token|secret|password|authorization/i;
 
 export type PathAccess = "read" | "write";
 
+/** DeepSeek 官方联网工具凭据；由装配层注入，不读环境变量、不写日志。 */
+export interface WebToolsContextOptions {
+  apiKey: string;
+  baseUrl?: string;
+}
+
 export interface ToolContext {
   /** 工作区根；由 createToolContext 在启动时 realpath 一次。 */
   workspace: string;
@@ -99,6 +105,8 @@ export interface ToolContext {
    * 注入空数组 = 拒绝所有命令。
    */
   allowedCommands?: readonly string[];
+  /** M11-01：联网工具凭据；缺省时 web_search / web_fetch 返回 E_PROVIDER_AUTH。 */
+  webTools?: WebToolsContextOptions;
 }
 
 export interface CreateToolContextOptions {
@@ -113,6 +121,8 @@ export interface CreateToolContextOptions {
   maxOutputBytes?: number;
   env?: NodeJS.ProcessEnv;
   allowedCommands?: readonly string[];
+  /** M11-01：联网工具凭据；仅由启动装配注入（测试可传 mock baseUrl）。 */
+  webTools?: WebToolsContextOptions;
 }
 
 export interface ToolResult {
@@ -318,6 +328,7 @@ export function createToolContext(options: CreateToolContextOptions): ToolContex
     maxOutputBytes: options.maxOutputBytes,
     env: options.env,
     allowedCommands: normalizeAllowedCommands(options.allowedCommands),
+    webTools: options.webTools,
   };
   rootCache.set(ctx, root);
   return ctx;

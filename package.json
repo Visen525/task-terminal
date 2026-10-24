@@ -13,7 +13,7 @@
     "dev:web": "vite --config src/web/vite.config.ts --configLoader native",
     "build": "vite build --config src/web/vite.config.ts --configLoader native",
     "typecheck": "tsc -p tsconfig.json && tsc -p src/web/tsconfig.json",
-    "verify": "pnpm run typecheck && node --test --test-isolation=none scripts/verify/m0.test.ts scripts/verify/m1.test.ts scripts/verify/m2.test.ts scripts/verify/m3.test.ts scripts/verify/m4.test.ts scripts/verify/m5.test.ts scripts/verify/m6.test.ts scripts/verify/m7.test.ts scripts/verify/m9.test.ts scripts/verify/m10.test.ts",
+    "verify": "pnpm run typecheck && node --test --test-isolation=none scripts/verify/m0.test.ts scripts/verify/m1.test.ts scripts/verify/m2.test.ts scripts/verify/m3.test.ts scripts/verify/m4.test.ts scripts/verify/m5.test.ts scripts/verify/m6.test.ts scripts/verify/m7.test.ts scripts/verify/m9.test.ts scripts/verify/m10.test.ts scripts/verify/m11.test.ts",
     "verify:m0": "node --test --test-isolation=none scripts/verify/m0.test.ts",
     "verify:m1": "node --test --test-isolation=none scripts/verify/m1.test.ts",
     "verify:m2": "node --test --test-isolation=none scripts/verify/m2.test.ts",
@@ -24,6 +24,7 @@
     "verify:m7": "node --test --test-isolation=none scripts/verify/m7.test.ts",
     "verify:m9": "node --test --test-isolation=none scripts/verify/m9.test.ts",
     "verify:m10": "node --test --test-isolation=none scripts/verify/m10.test.ts",
+    "verify:m11": "node --test --test-isolation=none scripts/verify/m11.test.ts",
     "format": "prettier --write ."
   },
   "devDependencies": {

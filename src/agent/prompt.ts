@@ -53,6 +53,9 @@ export function buildAgentPrompt(task: AgentPromptTask, permission?: PermissionM
   lines.push('2. 结束时必须调用 submit_result，包含 summary / findings / artifacts。');
   lines.push('3. 做不到就调用 submit_result 并在 summary 里说明原因，不要假装完成。');
   lines.push('4. 不要做任务目标之外的事情。');
+  lines.push(
+    '5. 需要联网信息时用 web_search 检索、web_fetch 读原文；优先用 summary；引用来源 URL；联网调用每任务最多 30 次，规划好检索词。',
+  );
 
   return lines.join('\n');
 }

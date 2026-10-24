@@ -271,3 +271,12 @@
 - app_settings 采用单行 JSON（key='app'）而非多行 KV：原子读写、避免部分保存的中间态；迁移 v2 只追加表。
 - 权限两级：mainTaskDefaultPermission（主线 create_task 缺省时的默认）与 subagentPermissionCap（上限，create_task 钳制 min(请求,上限)）。
 - /fs/browse 仅返回目录名列表（本地单用户工具；不返回文件与内容）。
+
+## M11-01 DeepSeek 官方联网工具（2026-10-24）
+
+- **联网客户端单独放 `src/providers/web-tools.ts`，不碰 `deepseek.ts` / `types.ts`**：只封装两个付费端点，默认 20s 超时（`timeoutMs` 仅测试注入 50ms 用）、401→`E_PROVIDER_AUTH`、429→`E_PROVIDER_RATE_LIMIT`、其余 4xx/5xx→`E_PROVIDER_HTTP`（错误体截 300 字符），错误消息统一移除 apiKey / Bearer 值。search 的 count 在客户端再钳到 1-20；fetch 在客户端校验 http/https、host、≤8192、禁 userinfo；参数错误一律不发网络。
+- **每 run 30 次计数用 `web.ts` 内部 `WeakMap<ToolContext, number>`，不新增 executeTool 计数字段**：loop 每次 `runGuardedLoop` 都新建 `ToolContext`，所以 ctx 天然是 run 作用域，WeakMap 的键就是 run；search 与 fetch 共享同一计数。计数发生在参数/凭据校验之后、真正发网络之前——参数错误不扣次数，已发起的 429/5xx 会计次，防止用失败调用刷额度。第 31 次直接返回 `{ok:false, code:E_BUDGET_EXCEEDED}`（走 executeTool 结构化结果，仍补齐事件对），不发请求。
+- **工具声明不进 `TOOL_SPECS`，由启动装配追加到 `AGENT_TOOL_SPECS`**：M3 既有验收明确断言 `TOOL_SPECS` 恰好六件套，且既有测试禁止修改；因此 `web.ts` 只导出 `WEB_TOOL_SPECS` 并在 `src/index.ts` 用 `installWebToolSpecs(AGENT_TOOL_SPECS)` 追加。`loop.ts` / `scheduler.ts` 零改动；scheduler 的 `ctx` 类型仍是 Pick 白名单，但运行时 `...options.ctx` 原样透传，`src/index.ts` 用变量承载 `webTools` 以避开内联对象的 excess property 检查。handler 仍通过 `executeTool` 的唯一注册表分发（`web.ts` 在模块求值时登记，它与 executeTool 无反向依赖，不存在 M3-02 的 TDZ 循环）。
+- **web 输出在工具内按 `ctx.maxOutputBytes` 截断**：executeTool 现有 200KB 截断只内建在 read_file / run_command 的 handler 里，不是通用后处理；为不改既有防线，web.ts 复用同样的“头尾保留 + 标记”算法，search 的每条 content 另限 20KB，fetch 的 title+content 整体受 maxOutputBytes 约束。全量正文未落盘（联网内容可按 URL 重取，避免把网页正文复制进 data/）。
+- **web 工具走结构化失败、abort 继续上抛**：参数/鉴权/限流/HTTP/超时都返回 `{ok:false, code}`，让模型看到失败原因并调整；只有调用方 AbortSignal（任务取消/墙钟）保留 AbortError 上抛，交给 loop 的既有 interrupted 路径收尾。
+

@@ -42,3 +42,87 @@
 - **四项主路径全部通过，M2-01 适配器与真实 API 行为一致，无需改代码。**
 - 唯一修正记录：金额字段为字符串（§4），当前实现已兼容。
 - 后续观察项（不阻塞）：缓存命中 token 的真实出现场景、并行 tool_calls、429 的 Retry-After 行为——在 M4/M5 联调时顺带记录。
+
+## 7. 官方联网工具 `POST /v1/tools/search` / `POST /v1/tools/fetch`（M11-01）
+
+> 状态：**Manager 已实测可用**（2026-10-24，华北直连；本卡验收用 127.0.0.1 mock server 复验，不打真 API）。
+> 安全：示例中的 key 一律用 `$DEEPSEEK_API_KEY` 占位；任何日志/错误/事件都不得出现真实 key 或 Authorization 头。
+
+### 7.1 搜索 `POST /v1/tools/search` ✅
+
+请求：
+
+```bash
+curl -sS https://api.deepseek.com/v1/tools/search \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"DeepSeek 官方联网工具","count":8,"need_content":false}'
+```
+
+字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `query` | string | 必填，1-128 字符 |
+| `count` | number | 1-50，默认 10；本客户端再钳到 **1-20**（成本护栏） |
+| `ori_question` | string? | 可选，原始问题（本卡未使用） |
+| `need_content` | boolean | 默认 false；false 时返回的 `content` 恒为空 |
+
+响应：
+
+```json
+{
+  "results": [
+    {
+      "rerank_score": 0.97,
+      "title": "标题",
+      "url": "https://example.com/",
+      "snippet": "摘要片段",
+      "summary": "600-800 字、为模型阅读设计的摘要",
+      "content": "",
+      "site_name": "站点名",
+      "date": "2026-10-24",
+      "authority": "official"
+    }
+  ]
+}
+```
+
+- `summary` 按 600-800 字为模型阅读设计，**优先读 summary，不要默认拉正文**。
+- `need_content=true` 时 `content` 才有值；本卡每条正文最多回给模型 20KB，超长截断。
+- `results` 为空数组是合法响应（不计费）。
+
+### 7.2 读原文 `POST /v1/tools/fetch` ✅
+
+请求：
+
+```bash
+curl -sS https://api.deepseek.com/v1/tools/fetch \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://api-docs.deepseek.com/"}'
+```
+
+字段/响应：
+
+- `url`：必填，http/https，最长 8192 字符，**禁止 userinfo**（`https://user:pass@host/` 会被拒）。
+- 返回 `{ "title": "...", "content": "..." }`；正文交给工具输出上限（默认 200KB）截断。
+
+### 7.3 计费、限速与错误映射
+
+- **计费：5 元/千次成功请求；失败请求、无结果请求不计费。**
+- 限速：search 100 QPS、fetch 25 QPS；超限返回 429。
+- 本卡客户端（`src/providers/web-tools.ts`）的映射：
+  - 401 → `E_PROVIDER_AUTH`
+  - 429 → `E_PROVIDER_RATE_LIMIT`
+  - 4xx/5xx → `E_PROVIDER_HTTP`（错误体截断到 300 字符并脱敏）
+  - 20s 超时 → `E_PROVIDER_TIMEOUT`；调用方 AbortSignal → `AbortError`
+  - 参数错误（query 长度、count 类型、url 协议/host/长度/userinfo）→ `E_INVALID_ARGUMENT`，不发网络
+- 错误消息会移除 apiKey 与 Bearer 值；`apiKey` 只经 `ctx.webTools` 注入，不落事件/日志。
+
+### 7.4 子代理使用护栏
+
+- `web_search` 默认 `count=8`，最多 20；`need_content` 默认 false。
+- `web_search` / `web_fetch` 每个 run 共享 **30 次**联网调用上限；第 31 次返回结构化 `E_BUDGET_EXCEEDED` 并提示改用已有结果。
+- 提示词要求：优先 summary、引用来源 URL、规划好检索词。
+
