@@ -110,6 +110,8 @@ export default defineConfig({
       "/artifacts": { target: backendTarget, changeOrigin: true },
       "/messages": { target: backendTarget, changeOrigin: true },
       "/chat": { target: backendTarget, changeOrigin: true },
+      "/facts": { target: backendTarget, changeOrigin: true },
+      "/settings": { target: backendTarget, changeOrigin: true },
     },
   },
 });

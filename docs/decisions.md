@@ -2,6 +2,14 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M9-02 设置面板与记忆管理（2026-10-24）
+
+- **事实列表与删除放在 `store/facts.ts` 的两个新函数里，路由只做整形**：`listFacts` 默认 `superseded_by IS NULL`，开关打开时返回全部，并固定按 `scope/key` 排序，界面不依赖 `recallFacts` 的 confidence 排序；`deleteFact` 返回真实删除行数，`0` 由路由映射为 404。事实 id 统一为 `f_` + 26 位 ULID，非法格式在进入 SQL 前直接 400，错误文案不回显输入。
+- **删除的悬挂清理与删除在同一事务内完成**：先 `UPDATE ... SET superseded_by = NULL WHERE superseded_by = ?`，再 `DELETE`，保证不会留下指向已删除 id 的引用。删除当前版本时上一版会重新成为有效记录（这是清链的自然结果）；代价是更长的链被删中间版本时可能出现多个候选当前行，但任务卡明确要求置 NULL 而非重接前驱/后继，故不擅自扩展语义。
+- **事实删除不写事件**：`EVENT_TYPES` 是冻结清单且没有事实删除类型，`memory_facts` 也不是事件源表；硬删除只改表，设置页的统计随 COUNT 立即变化。删除接口不返回被删内容，避免把记忆正文带进日志/响应。
+- **概览的四数字在 server 层做一次聚合查询，counts 各用一条 COUNT**：`getDailyUsage` 仍负责日预算的 `total`（input+output，cached 是 input 子集），另查 input/cached/output 三个 SUM；`counts.facts` 取 `memory_facts` 全表行数，因此历史版本也计入“事实”总数。`src/store/llm-calls.ts` 与 `facts.ts` 的追加边界保持不动。
+- **设置做成内容区整页而非 Drawer，入口仍是侧边栏齿轮**：整页更便于“来源任务”跳转后保留极简路由，且与 M9-01 的 PageHeader/卡片/空态一致；切换“显示被取代的历史版本”才请求 `includeSuperseded=true`，避免默认把历史记录带进首屏。为了让 `pnpm dev` 的 Vite 代理能转发新路由，`vite.config.ts` 仅追加 `/facts`、`/settings` 两条代理，不新增依赖，也不改任何请求/构建行为。
+
 ## M9-01 前端视觉重构（2026-10-24）
 
 - **主题 token 集中在 `src/web/src/theme.ts`，页面局部样式集中在 `styles.css`**：主色 `#4F46E5`、`borderRadius: 10`、`fontSize: 14`、冷灰中性色与系统字体栈只走 ConfigProvider；页面用 `--tt-*` CSS 变量复用同一套色阶，避免每个组件各写一份十六进制。重阴影全部换成 1px `#E5E7EB` 边框 + 极浅底色。

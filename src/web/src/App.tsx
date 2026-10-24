@@ -13,12 +13,13 @@ import EmptyState from "./components/EmptyState";
 import PageHeader from "./components/PageHeader";
 import Artifacts from "./pages/Artifacts";
 import Chat from "./pages/Chat";
+import Settings from "./pages/Settings";
 import TaskBoard from "./pages/TaskBoard";
 import TaskDetail from "./pages/TaskDetail";
 
 const { Content, Sider } = Layout;
 
-type ViewKey = "board" | "detail" | "artifacts" | "chat";
+type ViewKey = "board" | "detail" | "artifacts" | "chat" | "settings";
 
 const MENU_ITEMS = [
   { key: "board", icon: <AppstoreOutlined />, label: "任务看板" },
@@ -71,6 +72,8 @@ export default function App() {
       );
   } else if (activeKey === "artifacts") {
     content = <Artifacts onOpenTask={openTask} />;
+  } else if (activeKey === "settings") {
+    content = <Settings onOpenTask={openTask} />;
   } else {
     content = <Chat />;
   }
@@ -89,7 +92,7 @@ export default function App() {
         </div>
         <Menu
           mode="inline"
-          selectedKeys={[activeKey]}
+          selectedKeys={activeKey === "settings" ? [] : [activeKey]}
           items={MENU_ITEMS}
           onClick={({ key }) => {
             setActiveKey(key as ViewKey);
@@ -98,8 +101,17 @@ export default function App() {
         />
         <div className="app-sider-footer">
           <span>v1.1.0</span>
-          <Tooltip title="设置（M9-02 开放）" placement="top">
-            <Button type="text" size="small" icon={<SettingOutlined />} aria-label="设置" />
+          <Tooltip title="设置" placement="top">
+            <Button
+              type={activeKey === "settings" ? "primary" : "text"}
+              size="small"
+              icon={<SettingOutlined />}
+              aria-label="设置"
+              aria-pressed={activeKey === "settings"}
+              onClick={() => {
+                setActiveKey("settings");
+              }}
+            />
           </Tooltip>
         </div>
       </Sider>

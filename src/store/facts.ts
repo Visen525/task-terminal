@@ -298,3 +298,58 @@ export function recallFacts(
     .all(...params, limit) as unknown as FactRow[];
   return rows.map(mapFact);
 }
+
+interface ListedFact {
+  id: string;
+  key: string;
+  value: string;
+  confidence: number;
+  scope: string;
+  source_task_id: string | null;
+  created_at: number;
+  updated_at: number;
+  superseded_by: string | null;
+}
+
+/**
+ * 管理面板用的事实列表（M9-02）。
+ *
+ * 默认只返回当前有效记录（superseded_by IS NULL）；includeSuperseded 为 true
+ * 时连同历史版本一起返回。排序固定为 scope、key，同键内新版本在前。
+ * 与 recallFacts 不同，这里不做 query/scope 过滤，也不截断条数。
+ */
+export function listFacts(
+  db: DatabaseSync,
+  options: { includeSuperseded?: boolean } = {},
+): ListedFact[] {
+  const where = options.includeSuperseded === true ? '' : 'WHERE superseded_by IS NULL';
+  return db
+    .prepare(
+      `SELECT id, key, value, confidence, scope, source_task_id,
+              created_at, updated_at, superseded_by
+         FROM memory_facts
+         ${where}
+         ORDER BY scope ASC, key ASC, updated_at DESC, created_at DESC, rowid DESC`,
+    )
+    .all() as unknown as ListedFact[];
+}
+
+/**
+ * 硬删除一条事实（M9-02），返回删除行数。
+ *
+ * 同一事务内先把指向该行的 superseded_by 置 NULL，再删除本行：删除当前版本时
+ * 上一版会重新成为有效记录，且不会留下指向已删除 id 的悬挂引用。
+ * 事实不是事件源表，删除不写事件（EVENT_TYPES 无对应类型）。
+ */
+export function deleteFact(db: DatabaseSync, id: string): number {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('UPDATE memory_facts SET superseded_by = NULL WHERE superseded_by = ?').run(id);
+    const result = db.prepare('DELETE FROM memory_facts WHERE id = ?').run(id);
+    db.exec('COMMIT');
+    return Number(result.changes);
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}

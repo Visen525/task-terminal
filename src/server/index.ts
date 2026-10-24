@@ -26,10 +26,17 @@ import { runMainTurn } from '../agent/main-loop.ts';
 import type { LlmProvider } from '../providers/types.ts';
 import { cancelTask, createTask, retryTask } from '../runtime/ops.ts';
 import type { Scheduler } from '../runtime/scheduler.ts';
+import {
+  DEFAULT_DAILY_BUDGET_TOKENS,
+  getLocalDayRange,
+} from '../runtime/watchdog.ts';
 import { getArtifact, searchArtifacts } from '../store/artifacts.ts';
+import { deleteFact, listFacts } from '../store/facts.ts';
 import { listEvents, type ListEventsOptions } from '../store/events.ts';
+import { getDailyUsage } from '../store/llm-calls.ts';
 import { listRecentMessages } from '../store/messages.ts';
 import { getTask, listTasks } from '../store/repo.ts';
+import { isUlid } from '../store/ulid.ts';
 
 export interface SseOptions {
   /** 轮询 events 表间隔；默认 150ms。 */
@@ -63,6 +70,8 @@ const DEFAULT_SSE_PAGE_SIZE = 500;
 const DEFAULT_MESSAGES_LIMIT = 50;
 const RECENT_EVENT_LIMIT = 20;
 const EVENT_PAGE_SIZE = 500;
+/** 设置概览展示的主线模型；模型名由 provider 默认值固定，不在本卡做成可配置。 */
+const SETTINGS_MODEL = 'deepseek-chat';
 
 interface ErrorBody {
   error: { code: string; message: string };
@@ -158,6 +167,23 @@ function parseOptionalStatus(raw: unknown): Task['status'] | undefined {
     invalid(`status 必须是 ${TASK_STATUSES.join('|')} 之一`);
   }
   return raw as Task['status'];
+}
+
+/** 布尔 query 参数：空串/true/1 为真，false/0 为假；其余一律 400。 */
+function parseOptionalBoolean(raw: unknown, name: string): boolean {
+  if (raw === undefined) return false;
+  if (typeof raw !== 'string') invalid(`${name} 必须是 true 或 false`);
+  if (raw === '' || raw === 'true' || raw === '1') return true;
+  if (raw === 'false' || raw === '0') return false;
+  invalid(`${name} 必须是 true 或 false`);
+}
+
+/** 事实 id：f_ + 26 位 ULID；错误信息不回显用户输入。 */
+function parseFactId(raw: unknown): string {
+  if (typeof raw !== 'string' || !raw.startsWith('f_') || !isUlid(raw.slice(2))) {
+    invalid('事实 id 格式不合法');
+  }
+  return raw;
 }
 
 function positiveOr(value: number | undefined, fallback: number): number {
@@ -388,6 +414,63 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     const artifact = getArtifact(db, id);
     if (artifact === null) notFound(`产物不存在: ${id}`);
     reply.send(artifact);
+  });
+
+  // ── 长期记忆与设置概览（M9-02） ───────────────────────────────
+
+  app.get('/facts', async (request) => {
+    const query = readQuery(request);
+    const includeSuperseded = parseOptionalBoolean(query.includeSuperseded, 'includeSuperseded');
+    return listFacts(db, { includeSuperseded });
+  });
+
+  app.delete('/facts/:id', async (request, reply) => {
+    const params = asRecord(request.params) ?? {};
+    const id = parseFactId(params.id);
+    const deleted = deleteFact(db, id);
+    if (deleted === 0) notFound('事实不存在');
+    reply.send({ deleted });
+  });
+
+  app.get('/settings/overview', async () => {
+    const { startMs, endMs } = getLocalDayRange(clock());
+    const usage = db
+      .prepare(
+        `SELECT COALESCE(SUM(input_tokens), 0) AS input,
+                COALESCE(SUM(cached_tokens), 0) AS cached,
+                COALESCE(SUM(output_tokens), 0) AS output
+           FROM llm_calls
+          WHERE ts >= ? AND ts < ?`,
+      )
+      .get(startMs, endMs) as unknown as
+      | { input: number | bigint; cached: number | bigint; output: number | bigint }
+      | undefined;
+
+    const taskRow = db.prepare('SELECT COUNT(*) AS count FROM tasks').get() as unknown as
+      | { count: number | bigint }
+      | undefined;
+    const artifactRow = db.prepare('SELECT COUNT(*) AS count FROM artifacts').get() as unknown as
+      | { count: number | bigint }
+      | undefined;
+    const factRow = db
+      .prepare('SELECT COUNT(*) AS count FROM memory_facts')
+      .get() as unknown as { count: number | bigint } | undefined;
+
+    return {
+      model: SETTINGS_MODEL,
+      dailyBudgetTokens: DEFAULT_DAILY_BUDGET_TOKENS,
+      todayUsage: {
+        input: Number(usage?.input ?? 0),
+        cached: Number(usage?.cached ?? 0),
+        output: Number(usage?.output ?? 0),
+        total: getDailyUsage(db, startMs, endMs),
+      },
+      counts: {
+        tasks: Number(taskRow?.count ?? 0),
+        artifacts: Number(artifactRow?.count ?? 0),
+        facts: Number(factRow?.count ?? 0),
+      },
+    };
   });
 
   // ── 主线对话 ───────────────────────────────────────────────────
