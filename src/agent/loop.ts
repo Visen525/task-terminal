@@ -5,16 +5,25 @@
  * 五条不变量在本文件的落点：
  *   1. 每步先写 agent.step，再写 llm.call；工具调用与结果由 executeTool 成对写入，
  *      submit_result / ask_user 这两个控制流工具由 loop 自己成对写入。
- *   2. 所有失败路径（上限、异常、结果非法）都写 task.failed{reason} 后返回，不抛出。
+ *   2. 所有失败路径（上限、异常、结果非法）都写 task.failed{reason} 后返回，不抛出；
+ *      任务已终态时只返回失败结局，不再补事件（见下方终态守卫）。
  *   3. 一切副作用只经 executeTool(name, args, ctx) 执行；本文件不 import 任何 IO 模块。
  *   4. 步数 / token / 墙钟三重上限，任一触发即终止。
  *   5. 只有通过 result schema 校验的 submit_result 才算 completed。
  *
  * tool_call 只在 done 事件之后才被解析和执行；done 之前的 tool_call_delta 一律忽略。
+ *
+ * 终态守卫（M4-02 修订）：任务表进入终态（completed / cancelled）意味着事件流
+ * 已经关闭，loop 不得再追加任何事件。取消路由会在 loop 等待 provider/工具时
+ * 先写 task.cancelled 并改表，loop 恢复后写下的活动事件/失败事件会让
+ * foldEvents 抛非法转移，因此所有事件写入前都必须过 isTaskClosed。
+ * 不变量：isTaskClosed 的读取与其后的 appendEvent 之间没有 await，
+ * 单线程事件循环下取消路由无法插进“检查→写入”之间，守卫不存在竞态。
  */
 import type { DatabaseSync } from 'node:sqlite';
 
 import { ContractError, ERROR_CODES } from '../core/errors.ts';
+import { isTerminalTaskStatus } from '../core/state.ts';
 import type {
   JsonValue,
   LlmMessage,
@@ -32,6 +41,7 @@ import {
   type LlmStreamEvent,
 } from '../providers/types.ts';
 import { appendEvent } from '../store/events.ts';
+import { getTask } from '../store/repo.ts';
 import {
   TOOL_SPECS,
   createToolContext,
@@ -259,6 +269,20 @@ function extractQuestion(value: unknown): string | null {
   return question;
 }
 
+/**
+ * 任务终态守卫：getTask 后 status ∈ {completed, cancelled} 表示事件流已关闭。
+ * 取消路由会在 loop 等待外部 IO 时把任务写成 cancelled；loop 随后恢复运行，
+ * 只能收尾、不能再写任何事件。
+ *
+ * 不变量：本函数与紧随其后的 appendEvent 之间没有 await。单线程事件循环下
+ * 取消路由只可能在 loop 的 await 处插入，因此“检查→写入”是原子的；
+ * loop 内所有守卫都紧贴各自的 append 调用，不跨 await。
+ */
+function isTaskClosed(db: DatabaseSync, taskId: string): boolean {
+  const task = getTask(db, taskId);
+  return task !== null && isTerminalTaskStatus(task.status);
+}
+
 /** 只取 done 事件；增量事件只是分片，绝不在此解析或执行。 */
 async function collectStream(
   provider: LlmProvider,
@@ -336,11 +360,15 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopOutcome> {
   };
 
   const fail = (reason: TaskFailedReason, error?: LoopError): LoopFailed => {
-    appendTaskEvent('task.failed', {
-      reason,
-      attempt: options.attempt ?? 1,
-      ...(error === undefined ? {} : { error_code: error.code }),
-    });
+    // 任务已终态（取消路由先写了 task.cancelled）：事件流已关闭，不再补失败事件；
+    // reason 保持原样返回，调度器的终态防御只收 run，不覆盖任务表。
+    if (!isTaskClosed(options.db, task.id)) {
+      appendTaskEvent('task.failed', {
+        reason,
+        attempt: options.attempt ?? 1,
+        ...(error === undefined ? {} : { error_code: error.code }),
+      });
+    }
     return {
       status: 'failed',
       reason,
@@ -356,6 +384,8 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopOutcome> {
   };
 
   const appendLlmCall = (measured: TokenUsage, ms: number): void => {
+    // 守卫放在函数内：正常响应与 catch 分支的零 usage 记账两条路径都覆盖。
+    if (isTaskClosed(options.db, task.id)) return;
     appendEvent(options.db, {
       taskId: task.id,
       runId: options.runId ?? null,
@@ -442,6 +472,12 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopOutcome> {
         return fail('max_tokens');
       }
 
+      // 终态守卫：取消已发生（任务表 cancelled）时不得再写 agent.step，
+      // 直接以 interrupted 收尾；fail() 的守卫保证也不会写 task.failed。
+      if (isTaskClosed(options.db, task.id)) {
+        return fail('interrupted');
+      }
+
       steps += 1;
       appendEvent(options.db, {
         taskId: task.id,
@@ -490,7 +526,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopOutcome> {
       }
 
       const text = response.content ?? '';
-      if (text.length > 0) {
+      if (text.length > 0 && !isTaskClosed(options.db, task.id)) {
         appendEvent(options.db, {
           taskId: task.id,
           runId: options.runId ?? null,

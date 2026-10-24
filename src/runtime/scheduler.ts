@@ -21,6 +21,7 @@ import type { LlmProvider } from '../providers/types.ts';
 import { appendEvent } from '../store/events.ts';
 import {
   finishRun,
+  getTask,
   insertRun,
   listRuns,
   listTasks,
@@ -89,6 +90,11 @@ export interface Scheduler {
   runAll(): Promise<SchedulerTickResult[]>;
   /** 停止接新任务，并等待在跑任务结束。 */
   shutdown(options?: ShutdownOptions): Promise<void>;
+  /**
+   * 中止正在跑的任务；taskId 不是当前任务（或当前没有任务在跑）时返回 false。
+   * 表状态/事件由调用方负责，本方法只 abort 内部 controller。
+   */
+  cancel(taskId: string): boolean;
 }
 
 function positiveOr(value: number | undefined, fallback: number): number {
@@ -121,6 +127,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
   let busy = false;
   let currentRun: Promise<void> | null = null;
   let currentAbort: AbortController | null = null;
+  let currentTaskId: string | null = null;
 
   async function executeTask(task: Task): Promise<{ runId: string; outcome: LoopOutcome }> {
     const attempt = listRuns(db, task.id).length + 1;
@@ -149,6 +156,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     // 外部 signal 与 shutdown 共用同一个内部 controller。
     const controller = new AbortController();
     currentAbort = controller;
+    currentTaskId = task.id;
     const onExternalAbort = (): void => {
       controller.abort(externalSignal?.reason);
     };
@@ -188,11 +196,21 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       if (leaseTimer !== undefined) clearInterval(leaseTimer);
       leaseTimer = undefined;
       currentAbort = null;
+      currentTaskId = null;
       externalSignal?.removeEventListener('abort', onExternalAbort);
     }
 
     // loop 已写好终态事件；这里只推进表 + 收 run。
     const endedAt = clock();
+
+    // M4-02 终态防御：取消路由已把任务写成 cancelled 并 abort，loop 返回的
+    // interrupted 不能覆盖任务表；只把本次 run 收 cancelled，不再写任何事件。
+    const latest = getTask(db, task.id);
+    if (latest?.status === 'cancelled') {
+      finishRun(db, run.id, 'cancelled', { now: endedAt, steps: outcome.steps });
+      return { runId: run.id, outcome };
+    }
+
     if (outcome.status === 'completed') {
       updateTaskStatus(db, task.id, 'completed', {
         now: endedAt,
@@ -265,5 +283,12 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     if (pending !== null) await pending;
   }
 
-  return { tick, runAll, shutdown };
+  /** M4-02：只 abort 当前在跑任务的内部 controller，不改表/不写事件。 */
+  function cancel(taskId: string): boolean {
+    if (currentAbort === null || currentTaskId !== taskId) return false;
+    currentAbort.abort(new Error('task cancelled'));
+    return true;
+  }
+
+  return { tick, runAll, shutdown, cancel };
 }

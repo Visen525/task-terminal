@@ -2,6 +2,22 @@
 
 每个里程碑追加 3–5 行：为什么这么做。给未来的自己（和贡献者）看。
 
+## M4-02 REST + SSE（2026-10-24）
+
+- **直接依赖只新增 `fastify`，日志用 `console` 结构化 JSON 而不是 pino**：服务层是薄层，只做参数校验、调 store/runtime、JSON 编解码；Fastify 自带类型，因此不装 `@types/fastify`。pino 只作为 Fastify 的传递依赖存在，没有进入 `dependencies`，也没有自定义日志器。
+- **SSE 实时源选 `events` 表轮询（默认 150ms）+ 15s 心跳，不引 ws**：单用户量级下轮询足够，实时性与“事件是唯一真相源”一致；断点续传只依赖全局单调 `seq`。连接建立时先按 `pageSize=500` 分页补齐 `after` 之后的历史，再进入轮询；`req close` 清理轮询/心跳定时器，Fastify `preClose` 主动 end 全部 SSE 连接，避免 `app.close()` 被长连接拖住。
+- **cancel 对 queued/waiting_input 返回 409 是契约行为**：M0-02 冻结的 `TASK_TRANSITIONS` 只有 `running→cancelled`，没有 `queued→cancelled` / `waiting_input→cancelled`；路由按任务卡顺序先写 `task.cancelled{reason}`、再 `updateTaskStatus(running→cancelled)`、最后 `scheduler.cancel` abort 在跑 loop。若该任务不是当前在跑任务，`cancel()` 返回 false，路由只走纯表路径。注意：loop 的中断收尾按 agent 层既有行为仍会写一条 `task.failed{interrupted}`，服务层与调度器都不再重复写终态事件；事件流里“取消后紧跟一条 interrupted 失败”是当前 agent/调度器边界，若要改变须 [contract] 提交。
+- **`scheduler.ts` 严格只追加**：新增 `cancel(taskId)` 与 `currentTaskId` 跟踪，只在 loop 正常返回后的收尾处加“任务表已 cancelled 时 `finishRun(cancelled)` 并直接返回”的终态防御；`tick/runAll/shutdown`、派任务顺序、租约续约、waiting_input 收尾等既有路径一行未改。
+- **启动端口取 4310，仅监听 127.0.0.1**：SPEC 未指定端口，取不常见的 4310 减少与本机其他服务冲突，可用 `PORT` 覆盖；默认工作区 `<repo>/workspace`、数据目录 `<repo>/data`，分别用 `WORKSPACE_DIR` / `DATA_DIR` / `DB_PATH` 覆盖。`.env` 手写解析、进程环境优先，任何日志/错误都不回显 key 值。
+
+## M4-02 修订 · loop 终态守卫（2026-10-24）
+
+- **取消路径的问题在“事件流写侧”，不是 fold 过严**：取消路由先写 `task.cancelled`、改任务表、再 abort；loop 恢复后在 catch 里仍补 `llm.call`（零 usage）与 `task.failed`，`foldEvents` 在 cancelled 之后拒绝活动事件，整条事件流作废。修法是在 `loop.ts` 每次写事件前查任务表终态（completed / cancelled），而不是放宽 `foldEvents`——脏数据必须继续暴露，只是正常路径不再生产它。
+- **三处守卫 + 一处顺手**：`agent.step` 前（已终态直接返回 `interrupted` 结局，不写事件）；`appendLlmCall` 内（正常响应与 catch 分支的零 usage 记账两条路径都跳过）；`fail()` 内（终态不写 `task.failed`，reason 原样返回）；`agent.message` 同模式跳过。守卫紧贴 append，`isTaskClosed` 读取与写入之间没有 `await`：单线程事件循环下取消路由只能在 loop 的 `await` 处插入，因此不存在“检查后被取消”的竞态。
+- **与调度器终态防御配合**：loop 返回 `failed{interrupted}` 但不写事件；`executeTask` 发现任务表已 cancelled 时只 `finishRun(cancelled)`，不覆盖任务表、不再写事件。最终任务表 / run / 事件流三者都停在 cancelled。
+- **上一节关于“取消后仍写一条 task.failed”的边界说明作废**：本节取代该说明；取消现在以 `task.cancelled` 收尾、可被 `foldEvents` 折出 cancelled，`m4.test.ts` 的“取消后事件流仍可折叠”回归用例锁住该序列。
+- **工具执行中取消的残留边界已修（同一轮追加）**：`executeTool.ts` 现在也持有同款 `isTaskClosed(db, taskId)`，`appendToolCall` / `appendToolResult` 写入前先查任务表终态（completed / cancelled），已终态则整条跳过事件写入，执行、中止与返回结构完全不变（`taskId` 为 null 时视为未关闭，行为不变）。取消落在长工具调用（如 `run_command`）时，abort 杀树后不再补 `agent.tool_result`，事件流稳定以 `task.cancelled` 收尾；`m4.test.ts` 的“工具执行中取消”回归用例锁住该序列（`tool_result` 缺失是预期，输出中注明），并验证命令进程确实已被杀。检查与 append 之间无 `await` 的不变量与 loop 侧一致。
+
 ## M4-01 调度器与恢复（2026-10-24）
 
 - **并发 1 用“busy 标志 + 当前执行 promise”而不是锁**：`tick()` 在第一次 `await` 之前同步置 busy，并发调用只会拿到 `{started:false, reason:'busy'}`；`shutdown()` 等待同一个 promise，单进程模型下无需队列锁/工作线程。

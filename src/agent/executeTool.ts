@@ -6,7 +6,8 @@
  *   - 命令硬拒绝：argv 级检查，拒绝逻辑先于任何 spawn
  *   - 超时：到点杀进程树，抛 E_TOOL_TIMEOUT
  *   - 输出截断：返回头尾，全量原文落盘
- *   - 事件：执行前后各一条，成功失败都成对
+ *   - 事件：执行前后各一条，成功失败都成对；但任务已终态（completed /
+ *     cancelled）时一条都不写——事件流在终态处关闭（见 isTaskClosed）
  *
  * 本卡只内建 read_file / run_command 两个示范工具；M3-02 的其余工具
  * 必须继续复用本文件的路径校验与执行原语。
@@ -27,8 +28,10 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
 import { ContractError, ERROR_CODES, type ErrorCode } from "../core/errors.ts";
+import { isTerminalTaskStatus } from "../core/state.ts";
 import type { PermissionMode, ToolSpec } from "../core/types.ts";
 import { appendEvent } from "../store/events.ts";
+import { getTask } from "../store/repo.ts";
 import { registerFsTools } from "./tools/fs.ts";
 import { DEFAULT_ALLOWED_COMMANDS, registerShellTools } from "./tools/shell.ts";
 
@@ -755,7 +758,26 @@ function eventTaskFields(ctx: ToolContext): { taskId: string | null; runId: stri
   return { taskId: ctx.taskId ?? null, runId: ctx.runId ?? null };
 }
 
+/**
+ * 任务终态守卫（M4-02 修订）：tasks.status ∈ {completed, cancelled} 表示事件流
+ * 已经关闭，executeTool 不得再追加 agent.tool_call / agent.tool_result。
+ * 取消路由会在工具执行期间先写 task.cancelled 并改表，abort 之后工具若照常
+ * 补结果事件，就会把活动事件写进终态之后，让 foldEvents 抛非法转移。
+ *
+ * taskId 为 null（没有任务上下文的直接调用）时视为未关闭，行为与原先一致。
+ * 不变量：isTaskClosed 的读取与紧随其后的 appendEvent 之间没有 await；单线程
+ * 事件循环下取消路由只可能在 await 处插入，"检查→写入" 是原子的。
+ * executeTool 内所有守卫都紧贴各自的 append 调用，不跨 await。
+ */
+function isTaskClosed(db: DatabaseSync, taskId: string | null): boolean {
+  if (taskId === null) return false;
+  const task = getTask(db, taskId);
+  return task !== null && isTerminalTaskStatus(task.status);
+}
+
 function appendToolCall(ctx: ToolContext, tool: string, args: unknown): void {
+  // 取消已发生（任务表终态）时跳过事件写入；执行/返回行为不变。
+  if (isTaskClosed(ctx.db, ctx.taskId)) return;
   appendEvent(ctx.db, {
     ...eventTaskFields(ctx),
     type: "agent.tool_call",
@@ -765,6 +787,8 @@ function appendToolCall(ctx: ToolContext, tool: string, args: unknown): void {
 }
 
 function appendToolResult(ctx: ToolContext, result: ToolResult): void {
+  // 与 appendToolCall 同一守卫：abort/超时路径补的结果事件同样不得越过终态。
+  if (isTaskClosed(ctx.db, ctx.taskId)) return;
   appendEvent(ctx.db, {
     ...eventTaskFields(ctx),
     type: "agent.tool_result",
